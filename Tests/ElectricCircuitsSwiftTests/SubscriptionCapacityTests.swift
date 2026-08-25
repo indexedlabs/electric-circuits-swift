@@ -567,7 +567,7 @@ struct SubscriptionCapacityTests {
 
     _ = try await terminal.start()
     guard case .reseedRequired = await terminalState.value else {
-      Issue.record("terminal stream did not publish reseedRequired", severity: .error)
+      Issue.record("terminal stream did not publish reseedRequired")
       return
     }
     #expect(

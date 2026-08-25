@@ -3,19 +3,20 @@ import Testing
 
 @testable import ElectricCircuitsSwift
 
-private actor NativeAuthRequestRecorder {
+private final class NativeAuthRequestRecorder: @unchecked Sendable {
+  private let lock = NSLock()
   private var requests: [URLRequest] = []
 
   func reset() {
-    requests.removeAll()
+    lock.withLock { requests.removeAll() }
   }
 
   func record(_ request: URLRequest) {
-    requests.append(request)
+    lock.withLock { requests.append(request) }
   }
 
   func first() -> URLRequest? {
-    requests.first
+    lock.withLock { requests.first }
   }
 }
 
@@ -32,7 +33,7 @@ private final class NativeAuthURLProtocol: URLProtocol, @unchecked Sendable {
 
   override func startLoading() {
     let request = request
-    Task { await Self.recorder.record(request) }
+    Self.recorder.record(request)
     guard let client, let url = request.url else { return }
     client.urlProtocol(
       self,
@@ -45,21 +46,14 @@ private final class NativeAuthURLProtocol: URLProtocol, @unchecked Sendable {
   override func stopLoading() {}
 }
 
-private func waitForAuthenticatedRequest() async throws -> URLRequest {
-  for _ in 0..<10_000 {
-    if let request = await NativeAuthURLProtocol.recorder.first() { return request }
-    await Task.yield()
-  }
-  throw CancellationError()
-}
-
 @Suite("Native gateway authentication forwarding", .serialized)
 struct NativeGatewayAuthenticationTests {
   @Test func transportForwardsCallerAndConfiguredCredentialsToTheNativeGateway() async throws {
-    await NativeAuthURLProtocol.recorder.reset()
+    NativeAuthURLProtocol.recorder.reset()
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [NativeAuthURLProtocol.self]
     let session = URLSession(configuration: configuration)
+    defer { session.invalidateAndCancel() }
     let cookie = try #require(
       HTTPCookie(properties: [
         .domain: "engine.test", .path: "/", .name: "session", .value: "cookie-token",
@@ -74,7 +68,7 @@ struct NativeGatewayAuthenticationTests {
     request.setValue("caller", forHTTPHeaderField: "X-Principal")
 
     _ = try await transport.send(request)
-    let forwarded = try await waitForAuthenticatedRequest()
+    let forwarded = try #require(NativeAuthURLProtocol.recorder.first())
     #expect(forwarded.value(forHTTPHeaderField: "Authorization") == "Bearer gateway-token")
     #expect(forwarded.value(forHTTPHeaderField: "X-Principal") == "caller")
     #expect(forwarded.value(forHTTPHeaderField: "Cookie")?.contains("session=cookie-token") == true)
