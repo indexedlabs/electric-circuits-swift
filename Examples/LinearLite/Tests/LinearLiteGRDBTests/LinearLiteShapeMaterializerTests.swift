@@ -94,7 +94,7 @@ struct LinearLiteShapeMaterializerTests {
     }
     #expect(tables.contains("issues"))
     #expect(tables.contains("shape_cursors"))
-    let issueColumns = try db.read { db in
+    let issueColumns: [Row] = try db.read { db -> [Row] in
       try Row.fetchAll(db, sql: "PRAGMA table_info(issues)")
     }
     #expect(issueColumns.first?["name"] as String? == "principal_id")
