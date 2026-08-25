@@ -16,26 +16,5 @@ fi
 cd "$(dirname "$0")/.."
 printf 'subscription capacity: starting isolated suite (deadline=%ss); receipts identify the last completed scale\n' "$deadline_seconds"
 
-exec perl -MPOSIX=setsid -e '
-  my $deadline = shift @ARGV;
-  my $pid = fork();
-  die "fork failed: $!\n" unless defined $pid;
-  if ($pid == 0) {
-    setsid() or die "setsid failed: $!\n";
-    exec @ARGV or die "exec failed: $!\n";
-  }
-  $SIG{ALRM} = sub {
-    warn "subscription capacity: deadline (${deadline}s) exceeded; terminating process group $pid\n";
-    kill "TERM", -$pid;
-    sleep 2;
-    kill "KILL", -$pid;
-    waitpid $pid, 0;
-    exit 124;
-  };
-  alarm $deadline;
-  waitpid $pid, 0;
-  my $status = $?;
-  alarm 0;
-  if ($status & 127) { exit 128 + ($status & 127); }
-  exit $status >> 8;
-' "$deadline_seconds" swift test --no-parallel --filter SubscriptionCapacityTests "$@"
+exec perl Scripts/subscription-capacity-supervisor.pl "$deadline_seconds" \
+  swift test --no-parallel --filter SubscriptionCapacityTests "$@"
