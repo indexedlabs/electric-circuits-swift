@@ -132,10 +132,60 @@ run_pre_ready_alarm_case() {
   printf 'subscription supervisor: pre-ready alarm forwarding passed\n'
 }
 
+run_ready_before_go_alarm_case() {
+  pid_file="$work_dir/ready-before-go.pid"
+  observed_file="$work_dir/ready-before-go.observed"
+  gate_file="$work_dir/ready-before-go.gate"
+  exec_marker="$work_dir/ready-before-go.executed"
+  CAPACITY_SUPERVISOR_TEST_PRE_READY_PID_FILE="$pid_file" \
+    CAPACITY_SUPERVISOR_TEST_READY_OBSERVED_FILE="$observed_file" \
+    CAPACITY_SUPERVISOR_TEST_PARENT_READY_GATE="$gate_file" \
+    CAPACITY_TEST_EXEC_MARKER="$exec_marker" \
+    perl "$supervisor" 1 sh -c '
+      echo executed > "$CAPACITY_TEST_EXEC_MARKER"
+      while :; do sleep 1; done
+    ' &
+  supervisor_pid=$!
+  wait_for_file "$pid_file"
+  wait_for_file "$observed_file"
+  child_pid=$(cat "$pid_file")
+  if wait "$supervisor_pid"; then status=0; else status=$?; fi
+
+  [ "$status" -eq 124 ]
+  [ ! -e "$exec_marker" ]
+  assert_reaped "$child_pid"
+  printf 'subscription supervisor: ready-before-go alarm forwarding passed\n'
+}
+
+run_ready_before_go_signal_case() {
+  pid_file="$work_dir/ready-before-go-signal.pid"
+  observed_file="$work_dir/ready-before-go-signal.observed"
+  gate_file="$work_dir/ready-before-go-signal.gate"
+  CAPACITY_SUPERVISOR_TEST_PRE_READY_PID_FILE="$pid_file" \
+    CAPACITY_SUPERVISOR_TEST_READY_OBSERVED_FILE="$observed_file" \
+    CAPACITY_SUPERVISOR_TEST_PARENT_READY_GATE="$gate_file" \
+    perl "$supervisor" 30 sh -c 'while :; do sleep 1; done' &
+  supervisor_pid=$!
+  wait_for_file "$pid_file"
+  wait_for_file "$observed_file"
+  child_pid=$(cat "$pid_file")
+
+  # TERM remains pending while the parent has observed readiness but not authorized execution.
+  kill -TERM "$supervisor_pid"
+  : > "$gate_file"
+  if wait "$supervisor_pid"; then status=0; else status=$?; fi
+
+  [ "$status" -eq 143 ]
+  assert_reaped "$child_pid"
+  printf 'subscription supervisor: ready-before-go TERM forwarding passed\n'
+}
+
 run_external_signal_case TERM 143
 run_external_signal_case INT 130
 run_external_signal_case HUP 129
 run_external_escalation_case
 run_pre_ready_signal_case
 run_pre_ready_alarm_case
+run_ready_before_go_alarm_case
+run_ready_before_go_signal_case
 run_alarm_case
