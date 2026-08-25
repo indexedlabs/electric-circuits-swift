@@ -397,7 +397,7 @@ struct NativeScriptedTopTenContractTests {
 
     #expect(session.issues.map(\.id) == Array((1...10).reversed()).map(Int64.init))
     #expect(await transport.requestsFor(method: "POST", path: "/v1/subsets/query").count == 3)
-    let cursor = try database.read { db in
+    let cursor: Row? = try database.read { db -> Row? in
       try Row.fetchOne(
         db, sql: "SELECT offset, lsn FROM shape_cursors WHERE shape_id = ?",
         arguments: ["recent-subset-top-ten"])
@@ -442,7 +442,7 @@ struct NativeScriptedTopTenContractTests {
     }
 
     #expect(session.issues.map(\.id) == Array((2...11).reversed()).map(Int64.init))
-    let cursor = try database.read { db in
+    let cursor: Row? = try database.read { db -> Row? in
       try Row.fetchOne(
         db, sql: "SELECT offset, lsn FROM shape_cursors WHERE shape_id = ?",
         arguments: ["recent-subset-top-ten"])
@@ -500,7 +500,7 @@ struct NativeScriptedTopTenContractTests {
 
     #expect(session.issues.map(\.id) == Array((2...11).reversed()).map(Int64.init))
     #expect(await transport.requestsFor(method: "POST", path: "/v1/subsets/query").count == 2)
-    let cursor = try database.read { db in
+    let cursor: Row? = try database.read { db -> Row? in
       try Row.fetchOne(
         db, sql: "SELECT offset, lsn FROM shape_cursors WHERE shape_id = ?",
         arguments: ["recent-subset-top-ten"])

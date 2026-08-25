@@ -412,7 +412,7 @@ struct LinearLiteSessionTests {
     #expect(requests.contains { $0.httpMethod == "HEAD" })
     #expect(requests.filter { $0.url?.path == "/v1/subsets/query" }.count == 2)
     #expect(requests.contains { $0.httpMethod == "GET" })
-    let cursor = try database.read { db in
+    let cursor: Row? = try database.read { db -> Row? in
       try Row.fetchOne(
         db,
         sql: "SELECT offset, lsn FROM shape_cursors WHERE shape_id = ?",
