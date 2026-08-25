@@ -7,8 +7,10 @@ fixture=$(mktemp -d "${TMPDIR:-/tmp}/electric-circuits-package-quality-fixture.X
 trap 'rm -rf "$fixture"' EXIT
 
 mkdir -p "$fixture/Sources/ElectricCircuitsSwift" "$fixture/Examples/LinearLite/iOS/LinearLiteHost.xcodeproj"
-mkdir -p "$fixture/.github/workflows"
+mkdir -p "$fixture/.github/workflows" "$fixture/Docs"
 cp "$root/Package.swift" "$fixture/Package.swift"
+cp "$root/CHANGELOG.md" "$fixture/CHANGELOG.md"
+cp "$root/Docs/RELEASING.md" "$fixture/Docs/RELEASING.md"
 ditto "$root/Sources/ElectricCircuitsSwift/ElectricCircuitsSwift.docc" \
   "$fixture/Sources/ElectricCircuitsSwift/ElectricCircuitsSwift.docc"
 ditto "$root/Policies" "$fixture/Policies"

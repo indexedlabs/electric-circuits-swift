@@ -13,7 +13,8 @@ swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
 # The capacity qualification owns up to 1,000 cancellation-aware stream tasks. Keep it in a
 # dedicated serial run so unrelated URLSession suites cannot overlap its process-wide lifecycle.
 swift test --skip SubscriptionCapacityTests -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
-swift test --no-parallel --filter SubscriptionCapacityTests \
+Scripts/test-subscription-capacity-supervisor.sh
+Scripts/qualify-subscription-capacity.sh \
   -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
 swift package show-dependencies
 
@@ -39,6 +40,10 @@ xcrun docc convert Sources/ElectricCircuitsSwift/ElectricCircuitsSwift.docc \
   --warnings-as-errors
 
 Scripts/generate-linear-lite-host-project.sh
+
+# This is release-consumer qualification, not the normal development dependency path. It proves
+# that the actual host can resolve the core from an exact source-control version in isolation.
+Scripts/qualify-versioned-linearlite-host.sh
 
 xcodebuild -project Examples/LinearLite/iOS/LinearLiteHost.xcodeproj -scheme LinearLiteHost \
   -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -configuration Debug \

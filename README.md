@@ -130,6 +130,18 @@ wire contract, public API, and provider-schema release rules are explicit in
 [Policies/SUPPORT.md](Policies/SUPPORT.md) and [Policies/SEMVER.md](Policies/SEMVER.md). The DocC
 catalog begins at `ElectricCircuitsSwift` in Xcode's documentation viewer.
 
+## Install 0.1.0
+
+```swift
+dependencies: [
+  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.1.0"),
+]
+```
+
+Add the `ElectricCircuitsSwift` product to the target that uses the client. The optional LinearLite
+GRDB provider remains a separate example package. See [the release guide](Docs/RELEASING.md) for the
+release contract and versioned-source-control consumer qualification.
+
 ## Local package-quality gate
 
 On macOS with Xcode installed, run:
@@ -140,8 +152,9 @@ Scripts/quality.sh
 
 This runs strict-concurrency/warnings-as-errors SwiftPM builds and tests for the root and LinearLite
 packages, dependency inspection, formatter lint, a warnings-as-errors DocC conversion, isolated
-XcodeGen regeneration comparison, and an unsigned generic iOS Simulator host build. To use the exact
-checked XcodeGen release rather than an installed binary:
+XcodeGen regeneration comparison, a temporary exact-version source-control consumer proof, and an
+unsigned generic iOS Simulator host build. To use the exact checked XcodeGen release rather than an
+installed binary:
 
 ```sh
 Scripts/install-xcodegen.sh --bin-dir /tmp/electric-circuits-xcodegen

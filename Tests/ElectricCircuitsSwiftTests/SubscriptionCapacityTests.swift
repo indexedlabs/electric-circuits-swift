@@ -10,6 +10,13 @@ private actor CapacityTransport: HTTPTransport {
   private var streamWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
   private var nextStreamID = 0
   private var streamContinuations: [Int: CheckedContinuation<Void, Never>] = [:]
+  private var holdNextStreamRegistration = false
+  private var streamRegistrationEntered = false
+  private var streamRegistrationGate: CheckedContinuation<Void, Never>?
+  private var streamRegistrationWaiters: [CheckedContinuation<Void, Never>] = []
+  private var pendingStreamCancellations: Set<Int> = []
+  private var streamCancellationCount = 0
+  private var streamCancellationWaiters: [CheckedContinuation<Void, Never>] = []
 
   func send(_ request: URLRequest) async throws -> HTTPResponse {
     switch request.httpMethod {
@@ -24,7 +31,14 @@ private actor CapacityTransport: HTTPTransport {
       await withTaskCancellationHandler(
         operation: {
           guard !Task.isCancelled else { return }
-          await withCheckedContinuation { streamContinuations[streamID] = $0 }
+          await waitForStreamRegistrationPermission()
+          await withCheckedContinuation { continuation in
+            if pendingStreamCancellations.remove(streamID) != nil {
+              continuation.resume()
+            } else {
+              streamContinuations[streamID] = continuation
+            }
+          }
         },
         onCancel: { Task { await self.releaseStream(id: streamID) } })
       try Task.checkCancellation()
@@ -42,6 +56,27 @@ private actor CapacityTransport: HTTPTransport {
     await withCheckedContinuation { streamWaiters.append((count, $0)) }
   }
 
+  func holdNextStreamRegistrationForTesting() {
+    holdNextStreamRegistration = true
+  }
+
+  func waitForStreamRegistrationForTesting() async {
+    guard !streamRegistrationEntered else { return }
+    await withCheckedContinuation { streamRegistrationWaiters.append($0) }
+  }
+
+  func releaseStreamRegistrationForTesting() {
+    streamRegistrationGate?.resume()
+    streamRegistrationGate = nil
+  }
+
+  func waitForStreamCancellationForTesting() async {
+    guard streamCancellationCount == 0 else { return }
+    await withCheckedContinuation { streamCancellationWaiters.append($0) }
+  }
+
+  func pendingStreamCancellationCountForTesting() -> Int { pendingStreamCancellations.count }
+
   private func resumeStreamWaiters() {
     let ready = streamWaiters.filter { streamRequests >= $0.count }
     streamWaiters.removeAll { streamRequests >= $0.count }
@@ -49,7 +84,25 @@ private actor CapacityTransport: HTTPTransport {
   }
 
   private func releaseStream(id: Int) {
-    streamContinuations.removeValue(forKey: id)?.resume()
+    if let continuation = streamContinuations.removeValue(forKey: id) {
+      continuation.resume()
+    } else {
+      pendingStreamCancellations.insert(id)
+    }
+    streamCancellationCount += 1
+    let waiters = streamCancellationWaiters
+    streamCancellationWaiters.removeAll()
+    for waiter in waiters { waiter.resume() }
+  }
+
+  private func waitForStreamRegistrationPermission() async {
+    guard holdNextStreamRegistration else { return }
+    holdNextStreamRegistration = false
+    streamRegistrationEntered = true
+    let waiters = streamRegistrationWaiters
+    streamRegistrationWaiters.removeAll()
+    for waiter in waiters { waiter.resume() }
+    await withCheckedContinuation { streamRegistrationGate = $0 }
   }
 }
 
@@ -603,6 +656,27 @@ struct SubscriptionCapacityTests {
       #expect(receipt.activeAfterCleanup == 0)
       print("subscription-capacity-qualification \(receipt)")
     }
+  }
+
+  @Test func cancellationBeforeStreamContinuationRegistrationIsNotLost() async throws {
+    let transport = CapacityTransport()
+    await transport.holdNextStreamRegistrationForTesting()
+    let capacity = ShapeSubscriptionCapacity(maximumActiveSubscriptions: 1)
+    let coordinator = capacityCoordinator(
+      transport: transport, materializer: InMemoryShapeMaterializer(), capacity: capacity,
+      subscription: "registration-race")
+
+    _ = try await coordinator.start()
+    await transport.waitForStreamRegistrationForTesting()
+    let stop = Task { try await coordinator.stop() }
+    await transport.waitForStreamCancellationForTesting()
+
+    // Cancellation may race with continuation installation, but it must be retained until the
+    // stream task has somewhere to observe it.
+    #expect(await transport.pendingStreamCancellationCountForTesting() == 1)
+
+    await transport.releaseStreamRegistrationForTesting()
+    try await stop.value
   }
 }
 
