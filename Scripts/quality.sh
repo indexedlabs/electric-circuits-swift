@@ -13,7 +13,7 @@ swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
 # The capacity qualification owns up to 1,000 cancellation-aware stream tasks. Keep it in a
 # dedicated serial run so unrelated URLSession suites cannot overlap its process-wide lifecycle.
 swift test --skip SubscriptionCapacityTests -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
-swift test --no-parallel --filter SubscriptionCapacityTests \
+Scripts/qualify-subscription-capacity.sh \
   -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
 swift package show-dependencies
 
