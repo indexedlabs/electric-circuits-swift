@@ -1,0 +1,1138 @@
+{
+  "status": "pass",
+  "manifest": {
+    "scenario": "SWF-P0-8-real-top10",
+    "profile": "NATIVE_CORE_LAYER_B_PG18_4",
+    "identity": {
+      "server": {
+        "root": "/Users/bozilabs/labs/electric-circuits",
+        "head": "e53cf40afc0a0a400736d43e9ec63b98c755bf9b",
+        "tree": "40d3dd9ab997e52fb33854fcc87880b3158fb1c7",
+        "statusPorcelainV1": "M .agents/skills/electric-circuits-testing/SKILL.md\n M .agents/skills/electric-circuits-testing/references/tier-selection-and-commands.md\n M .github/workflows/ci.yml\n M AGENTS.md\n M README.md\n M apps/engine/src/electric.rs\n M apps/engine/src/engine/lifecycle.rs\n M apps/engine/src/engine/mod.rs\n M apps/engine/tests/create_cancel.rs\n M apps/engine/tests/live_poll_deadline.rs\n M docs/deployment-postgres.md\n M docs/getting-started.md\n M docs/live-queries-guide.md\n M electric-conformance/README.md\n M electric-conformance/electric_circuits_oracle_test.exs\n M electric-conformance/run.sh\n M examples/linearlite/README.md\n M examples/linearlite/package.json\n M examples/linearlite/src/schema.ts\n M examples/linearlite/start.ts\n M examples/web/README.md\n M examples/web/start.ts\n M notes/17-validation-baseline.md\n M notes/README.md\n M package.json\n M packages/bench/src/electric-adapter.ts\n M packages/bench/src/shape-mem-matrix.ts\n M packages/bench/src/shape-mem-scale.ts\n M packages/conformance/README.md\n M packages/conformance/src/conformance-retention.test.ts\n M packages/loadgen/src/infra.ts\n M scripts/postgres-image-version.test.ts\n M tutorials/compose.yaml\n M vitest.config.ts\n M vitest.global-setup.ts\n?? .claude/worktrees/native-api-hardening/\n?? .claude/worktrees/native-api-review/\n?? .claude/worktrees/swift-client-native-api/\n?? DONE-LINEARLITE-TASK-SEEDER.md\n?? REVIEWED-IOS-SYNC-UI-SOL.md\n?? REVIEWED-LINEARLITE-TASK-SEEDER-SOL.md\n?? electric-conformance/vendor/electric-oracle-harness/LICENSE\n?? electric-conformance/vendor/electric-oracle-harness/PROVENANCE.md\n?? electric-conformance/vendor/electric-oracle-harness/SHA256SUMS\n?? electric-conformance/vendor/electric-oracle-harness/packages/sync-service/test/support/oracle_harness.ex\n?? electric-conformance/vendor/electric-oracle-harness/packages/sync-service/test/support/oracle_harness/shape_checker.ex\n?? examples/linearlite/seed-tasks.test.ts\n?? examples/linearlite/seed-tasks.ts\n?? notes/26-swift-transport-auth-cache-boundary.md\n?? notes/27-ios-top10-live-architecture.md\n?? notes/28-swift-library-production-readiness-punchlist.md\n?? packages/conformance/src/conformance-pg18-promotion.test.ts\n?? scripts/postgres18.ts",
+        "completeRuntimeSourceManifestSha256": "f47c3146ffca92a94b49d216c85ea8847496c1e57a68884abd3c3cb4306050dc"
+      },
+      "swiftCandidate": {
+        "root": "/private/tmp/electric-circuits-swift-native-v1-corpus-v1",
+        "completeRuntimeInputManifestSha256": "661c56da4fcc34da63fe17fd688db6b346348c7b86b792ff955df52eaba24387"
+      },
+      "runtimeExecutables": {
+        "engine": {
+          "path": "/Users/bozilabs/labs/electric-circuits/target/debug/electric-circuits-engine",
+          "sha256": "de675552b3ca8a605b97089711cd68cadcda42d6837365bf234f213fdecf1945"
+        },
+        "durableStreams": {
+          "path": "/Users/bozilabs/.cargo/bin/durable-streams-server",
+          "sha256": "38a15e2772257b2bf0783db9831cc7c955a7342206ea359b5421eb3aeb6bfdd9"
+        },
+        "postgres18": {
+          "initdb": {
+            "path": "/opt/homebrew/opt/postgresql@18/bin/initdb",
+            "version": "initdb (PostgreSQL) 18.4 (Homebrew)",
+            "sha256": "fe96cd8f89ac3e1bea69893bb34e720461a2e3737e496d54826f48941f3e404c"
+          },
+          "pgCtl": {
+            "path": "/opt/homebrew/opt/postgresql@18/bin/pg_ctl",
+            "version": "pg_ctl (PostgreSQL) 18.4 (Homebrew)",
+            "sha256": "2f508410e1cf462a7988ac614dbea8ce8e1adbb8429051a156d5cef219da2980"
+          }
+        }
+      },
+      "toolchain": {
+        "node": "v25.2.1",
+        "swift": "Apple Swift version 6.3.3 (swiftlang-6.3.3.1.3 clang-2100.1.1.101)",
+        "pnpm": "10.15.1"
+      }
+    },
+    "endpoints": {
+      "engine": "http://127.0.0.1:50331",
+      "durableStreams": "http://127.0.0.1:50327"
+    },
+    "phaseDirectory": "/var/folders/7g/py9fl9n53_178p_8g20fvr740000gn/T/electric-circuits-swift-real-top10-v1-2685Fa/phase"
+  },
+  "result": {
+    "phaseEvidence": [
+      {
+        "name": "newest-insert",
+        "sourceCommitID": 3,
+        "oracle": [
+          {
+            "id": 101,
+            "modified": 3000,
+            "title": "newest"
+          },
+          {
+            "id": 100,
+            "modified": 2000,
+            "title": "boundary-newest"
+          },
+          {
+            "id": 15,
+            "modified": 1500,
+            "title": "seed-15"
+          },
+          {
+            "id": 14,
+            "modified": 1400,
+            "title": "seed-14"
+          },
+          {
+            "id": 13,
+            "modified": 1300,
+            "title": "seed-13"
+          },
+          {
+            "id": 12,
+            "modified": 1200,
+            "title": "seed-12"
+          },
+          {
+            "id": 11,
+            "modified": 1100,
+            "title": "seed-11"
+          },
+          {
+            "id": 10,
+            "modified": 1000,
+            "title": "seed-10"
+          },
+          {
+            "id": 9,
+            "modified": 900,
+            "title": "seed-9"
+          },
+          {
+            "id": 8,
+            "modified": 800,
+            "title": "seed-8"
+          }
+        ]
+      },
+      {
+        "name": "outside-update",
+        "sourceCommitID": 4,
+        "oracle": [
+          {
+            "id": 5,
+            "modified": 4000,
+            "title": "outside-now-newest"
+          },
+          {
+            "id": 101,
+            "modified": 3000,
+            "title": "newest"
+          },
+          {
+            "id": 100,
+            "modified": 2000,
+            "title": "boundary-newest"
+          },
+          {
+            "id": 15,
+            "modified": 1500,
+            "title": "seed-15"
+          },
+          {
+            "id": 14,
+            "modified": 1400,
+            "title": "seed-14"
+          },
+          {
+            "id": 13,
+            "modified": 1300,
+            "title": "seed-13"
+          },
+          {
+            "id": 12,
+            "modified": 1200,
+            "title": "seed-12"
+          },
+          {
+            "id": 11,
+            "modified": 1100,
+            "title": "seed-11"
+          },
+          {
+            "id": 10,
+            "modified": 1000,
+            "title": "seed-10"
+          },
+          {
+            "id": 9,
+            "modified": 900,
+            "title": "seed-9"
+          }
+        ]
+      },
+      {
+        "name": "move-below-boundary",
+        "sourceCommitID": 5,
+        "oracle": [
+          {
+            "id": 5,
+            "modified": 4000,
+            "title": "outside-now-newest"
+          },
+          {
+            "id": 101,
+            "modified": 3000,
+            "title": "newest"
+          },
+          {
+            "id": 15,
+            "modified": 1500,
+            "title": "seed-15"
+          },
+          {
+            "id": 14,
+            "modified": 1400,
+            "title": "seed-14"
+          },
+          {
+            "id": 13,
+            "modified": 1300,
+            "title": "seed-13"
+          },
+          {
+            "id": 12,
+            "modified": 1200,
+            "title": "seed-12"
+          },
+          {
+            "id": 11,
+            "modified": 1100,
+            "title": "seed-11"
+          },
+          {
+            "id": 10,
+            "modified": 1000,
+            "title": "seed-10"
+          },
+          {
+            "id": 9,
+            "modified": 900,
+            "title": "seed-9"
+          },
+          {
+            "id": 8,
+            "modified": 800,
+            "title": "seed-8"
+          }
+        ]
+      },
+      {
+        "name": "delete-promotes",
+        "sourceCommitID": 6,
+        "oracle": [
+          {
+            "id": 101,
+            "modified": 3000,
+            "title": "newest"
+          },
+          {
+            "id": 15,
+            "modified": 1500,
+            "title": "seed-15"
+          },
+          {
+            "id": 14,
+            "modified": 1400,
+            "title": "seed-14"
+          },
+          {
+            "id": 13,
+            "modified": 1300,
+            "title": "seed-13"
+          },
+          {
+            "id": 12,
+            "modified": 1200,
+            "title": "seed-12"
+          },
+          {
+            "id": 11,
+            "modified": 1100,
+            "title": "seed-11"
+          },
+          {
+            "id": 10,
+            "modified": 1000,
+            "title": "seed-10"
+          },
+          {
+            "id": 9,
+            "modified": 900,
+            "title": "seed-9"
+          },
+          {
+            "id": 8,
+            "modified": 800,
+            "title": "seed-8"
+          },
+          {
+            "id": 7,
+            "modified": 700,
+            "title": "seed-7"
+          }
+        ]
+      }
+    ],
+    "finalOracle": [
+      {
+        "id": 101,
+        "modified": 3000,
+        "title": "newest"
+      },
+      {
+        "id": 15,
+        "modified": 1500,
+        "title": "seed-15"
+      },
+      {
+        "id": 14,
+        "modified": 1400,
+        "title": "seed-14"
+      },
+      {
+        "id": 13,
+        "modified": 1300,
+        "title": "seed-13"
+      },
+      {
+        "id": 12,
+        "modified": 1200,
+        "title": "seed-12"
+      },
+      {
+        "id": 11,
+        "modified": 1100,
+        "title": "seed-11"
+      },
+      {
+        "id": 10,
+        "modified": 1000,
+        "title": "seed-10"
+      },
+      {
+        "id": 9,
+        "modified": 900,
+        "title": "seed-9"
+      },
+      {
+        "id": 8,
+        "modified": 800,
+        "title": "seed-8"
+      },
+      {
+        "id": 7,
+        "modified": 700,
+        "title": "seed-7"
+      }
+    ],
+    "swift": {
+      "baseline": {
+        "cursor": {
+          "lsn": "0/1BF0340",
+          "offset": "0000000000000000_0000000000000000"
+        },
+        "grdbRows": [
+          {
+            "id": 100,
+            "modified": 2000,
+            "title": "boundary-newest"
+          },
+          {
+            "id": 15,
+            "modified": 1500,
+            "title": "seed-15"
+          },
+          {
+            "id": 14,
+            "modified": 1400,
+            "title": "seed-14"
+          },
+          {
+            "id": 13,
+            "modified": 1300,
+            "title": "seed-13"
+          },
+          {
+            "id": 12,
+            "modified": 1200,
+            "title": "seed-12"
+          },
+          {
+            "id": 11,
+            "modified": 1100,
+            "title": "seed-11"
+          },
+          {
+            "id": 10,
+            "modified": 1000,
+            "title": "seed-10"
+          },
+          {
+            "id": 9,
+            "modified": 900,
+            "title": "seed-9"
+          },
+          {
+            "id": 8,
+            "modified": 800,
+            "title": "seed-8"
+          },
+          {
+            "id": 7,
+            "modified": 700,
+            "title": "seed-7"
+          }
+        ],
+        "liveBatchCount": 0,
+        "membershipCount": 10,
+        "name": "snapshot-boundary",
+        "sessionRows": [
+          {
+            "id": 100,
+            "modified": 2000,
+            "title": "boundary-newest"
+          },
+          {
+            "id": 15,
+            "modified": 1500,
+            "title": "seed-15"
+          },
+          {
+            "id": 14,
+            "modified": 1400,
+            "title": "seed-14"
+          },
+          {
+            "id": 13,
+            "modified": 1300,
+            "title": "seed-13"
+          },
+          {
+            "id": 12,
+            "modified": 1200,
+            "title": "seed-12"
+          },
+          {
+            "id": 11,
+            "modified": 1100,
+            "title": "seed-11"
+          },
+          {
+            "id": 10,
+            "modified": 1000,
+            "title": "seed-10"
+          },
+          {
+            "id": 9,
+            "modified": 900,
+            "title": "seed-9"
+          },
+          {
+            "id": 8,
+            "modified": 800,
+            "title": "seed-8"
+          },
+          {
+            "id": 7,
+            "modified": 700,
+            "title": "seed-7"
+          }
+        ]
+      },
+      "headers": {
+        "durableStream": true,
+        "nativeControl": true,
+        "release": true,
+        "subsetQuery": true
+      },
+      "phases": [
+        {
+          "cursor": {
+            "lsn": "0/1BF0558",
+            "offset": "0000000000000000_0000000000000709"
+          },
+          "grdbRows": [
+            {
+              "id": 101,
+              "modified": 3000,
+              "title": "newest"
+            },
+            {
+              "id": 100,
+              "modified": 2000,
+              "title": "boundary-newest"
+            },
+            {
+              "id": 15,
+              "modified": 1500,
+              "title": "seed-15"
+            },
+            {
+              "id": 14,
+              "modified": 1400,
+              "title": "seed-14"
+            },
+            {
+              "id": 13,
+              "modified": 1300,
+              "title": "seed-13"
+            },
+            {
+              "id": 12,
+              "modified": 1200,
+              "title": "seed-12"
+            },
+            {
+              "id": 11,
+              "modified": 1100,
+              "title": "seed-11"
+            },
+            {
+              "id": 10,
+              "modified": 1000,
+              "title": "seed-10"
+            },
+            {
+              "id": 9,
+              "modified": 900,
+              "title": "seed-9"
+            },
+            {
+              "id": 8,
+              "modified": 800,
+              "title": "seed-8"
+            }
+          ],
+          "liveBatchCount": 2,
+          "membershipCount": 10,
+          "name": "newest-insert",
+          "sessionRows": [
+            {
+              "id": 101,
+              "modified": 3000,
+              "title": "newest"
+            },
+            {
+              "id": 100,
+              "modified": 2000,
+              "title": "boundary-newest"
+            },
+            {
+              "id": 15,
+              "modified": 1500,
+              "title": "seed-15"
+            },
+            {
+              "id": 14,
+              "modified": 1400,
+              "title": "seed-14"
+            },
+            {
+              "id": 13,
+              "modified": 1300,
+              "title": "seed-13"
+            },
+            {
+              "id": 12,
+              "modified": 1200,
+              "title": "seed-12"
+            },
+            {
+              "id": 11,
+              "modified": 1100,
+              "title": "seed-11"
+            },
+            {
+              "id": 10,
+              "modified": 1000,
+              "title": "seed-10"
+            },
+            {
+              "id": 9,
+              "modified": 900,
+              "title": "seed-9"
+            },
+            {
+              "id": 8,
+              "modified": 800,
+              "title": "seed-8"
+            }
+          ]
+        },
+        {
+          "cursor": {
+            "lsn": "0/1BF07A0",
+            "offset": "0000000000000000_0000000000001047"
+          },
+          "grdbRows": [
+            {
+              "id": 5,
+              "modified": 4000,
+              "title": "outside-now-newest"
+            },
+            {
+              "id": 101,
+              "modified": 3000,
+              "title": "newest"
+            },
+            {
+              "id": 100,
+              "modified": 2000,
+              "title": "boundary-newest"
+            },
+            {
+              "id": 15,
+              "modified": 1500,
+              "title": "seed-15"
+            },
+            {
+              "id": 14,
+              "modified": 1400,
+              "title": "seed-14"
+            },
+            {
+              "id": 13,
+              "modified": 1300,
+              "title": "seed-13"
+            },
+            {
+              "id": 12,
+              "modified": 1200,
+              "title": "seed-12"
+            },
+            {
+              "id": 11,
+              "modified": 1100,
+              "title": "seed-11"
+            },
+            {
+              "id": 10,
+              "modified": 1000,
+              "title": "seed-10"
+            },
+            {
+              "id": 9,
+              "modified": 900,
+              "title": "seed-9"
+            }
+          ],
+          "liveBatchCount": 3,
+          "membershipCount": 10,
+          "name": "outside-update",
+          "sessionRows": [
+            {
+              "id": 5,
+              "modified": 4000,
+              "title": "outside-now-newest"
+            },
+            {
+              "id": 101,
+              "modified": 3000,
+              "title": "newest"
+            },
+            {
+              "id": 100,
+              "modified": 2000,
+              "title": "boundary-newest"
+            },
+            {
+              "id": 15,
+              "modified": 1500,
+              "title": "seed-15"
+            },
+            {
+              "id": 14,
+              "modified": 1400,
+              "title": "seed-14"
+            },
+            {
+              "id": 13,
+              "modified": 1300,
+              "title": "seed-13"
+            },
+            {
+              "id": 12,
+              "modified": 1200,
+              "title": "seed-12"
+            },
+            {
+              "id": 11,
+              "modified": 1100,
+              "title": "seed-11"
+            },
+            {
+              "id": 10,
+              "modified": 1000,
+              "title": "seed-10"
+            },
+            {
+              "id": 9,
+              "modified": 900,
+              "title": "seed-9"
+            }
+          ]
+        },
+        {
+          "cursor": {
+            "lsn": "0/1BF0A08",
+            "offset": "0000000000000000_0000000000001398"
+          },
+          "grdbRows": [
+            {
+              "id": 5,
+              "modified": 4000,
+              "title": "outside-now-newest"
+            },
+            {
+              "id": 101,
+              "modified": 3000,
+              "title": "newest"
+            },
+            {
+              "id": 15,
+              "modified": 1500,
+              "title": "seed-15"
+            },
+            {
+              "id": 14,
+              "modified": 1400,
+              "title": "seed-14"
+            },
+            {
+              "id": 13,
+              "modified": 1300,
+              "title": "seed-13"
+            },
+            {
+              "id": 12,
+              "modified": 1200,
+              "title": "seed-12"
+            },
+            {
+              "id": 11,
+              "modified": 1100,
+              "title": "seed-11"
+            },
+            {
+              "id": 10,
+              "modified": 1000,
+              "title": "seed-10"
+            },
+            {
+              "id": 9,
+              "modified": 900,
+              "title": "seed-9"
+            },
+            {
+              "id": 8,
+              "modified": 800,
+              "title": "seed-8"
+            }
+          ],
+          "liveBatchCount": 4,
+          "membershipCount": 10,
+          "name": "move-below-boundary",
+          "sessionRows": [
+            {
+              "id": 5,
+              "modified": 4000,
+              "title": "outside-now-newest"
+            },
+            {
+              "id": 101,
+              "modified": 3000,
+              "title": "newest"
+            },
+            {
+              "id": 15,
+              "modified": 1500,
+              "title": "seed-15"
+            },
+            {
+              "id": 14,
+              "modified": 1400,
+              "title": "seed-14"
+            },
+            {
+              "id": 13,
+              "modified": 1300,
+              "title": "seed-13"
+            },
+            {
+              "id": 12,
+              "modified": 1200,
+              "title": "seed-12"
+            },
+            {
+              "id": 11,
+              "modified": 1100,
+              "title": "seed-11"
+            },
+            {
+              "id": 10,
+              "modified": 1000,
+              "title": "seed-10"
+            },
+            {
+              "id": 9,
+              "modified": 900,
+              "title": "seed-9"
+            },
+            {
+              "id": 8,
+              "modified": 800,
+              "title": "seed-8"
+            }
+          ]
+        },
+        {
+          "cursor": {
+            "lsn": "0/1BF0BE0",
+            "offset": "0000000000000000_0000000000001497"
+          },
+          "grdbRows": [
+            {
+              "id": 101,
+              "modified": 3000,
+              "title": "newest"
+            },
+            {
+              "id": 15,
+              "modified": 1500,
+              "title": "seed-15"
+            },
+            {
+              "id": 14,
+              "modified": 1400,
+              "title": "seed-14"
+            },
+            {
+              "id": 13,
+              "modified": 1300,
+              "title": "seed-13"
+            },
+            {
+              "id": 12,
+              "modified": 1200,
+              "title": "seed-12"
+            },
+            {
+              "id": 11,
+              "modified": 1100,
+              "title": "seed-11"
+            },
+            {
+              "id": 10,
+              "modified": 1000,
+              "title": "seed-10"
+            },
+            {
+              "id": 9,
+              "modified": 900,
+              "title": "seed-9"
+            },
+            {
+              "id": 8,
+              "modified": 800,
+              "title": "seed-8"
+            },
+            {
+              "id": 7,
+              "modified": 700,
+              "title": "seed-7"
+            }
+          ],
+          "liveBatchCount": 5,
+          "membershipCount": 10,
+          "name": "delete-promotes",
+          "sessionRows": [
+            {
+              "id": 101,
+              "modified": 3000,
+              "title": "newest"
+            },
+            {
+              "id": 15,
+              "modified": 1500,
+              "title": "seed-15"
+            },
+            {
+              "id": 14,
+              "modified": 1400,
+              "title": "seed-14"
+            },
+            {
+              "id": 13,
+              "modified": 1300,
+              "title": "seed-13"
+            },
+            {
+              "id": 12,
+              "modified": 1200,
+              "title": "seed-12"
+            },
+            {
+              "id": 11,
+              "modified": 1100,
+              "title": "seed-11"
+            },
+            {
+              "id": 10,
+              "modified": 1000,
+              "title": "seed-10"
+            },
+            {
+              "id": 9,
+              "modified": 900,
+              "title": "seed-9"
+            },
+            {
+              "id": 8,
+              "modified": 800,
+              "title": "seed-8"
+            },
+            {
+              "id": 7,
+              "modified": 700,
+              "title": "seed-7"
+            }
+          ]
+        }
+      ],
+      "reopenedCursor": {
+        "lsn": "0/1BF0BE0",
+        "offset": "0000000000000000_0000000000001497"
+      },
+      "reopenedMembershipCount": 10,
+      "reopenedRows": [
+        {
+          "id": 101,
+          "modified": 3000,
+          "title": "newest"
+        },
+        {
+          "id": 15,
+          "modified": 1500,
+          "title": "seed-15"
+        },
+        {
+          "id": 14,
+          "modified": 1400,
+          "title": "seed-14"
+        },
+        {
+          "id": 13,
+          "modified": 1300,
+          "title": "seed-13"
+        },
+        {
+          "id": 12,
+          "modified": 1200,
+          "title": "seed-12"
+        },
+        {
+          "id": 11,
+          "modified": 1100,
+          "title": "seed-11"
+        },
+        {
+          "id": 10,
+          "modified": 1000,
+          "title": "seed-10"
+        },
+        {
+          "id": 9,
+          "modified": 900,
+          "title": "seed-9"
+        },
+        {
+          "id": 8,
+          "modified": 800,
+          "title": "seed-8"
+        },
+        {
+          "id": 7,
+          "modified": 700,
+          "title": "seed-7"
+        }
+      ]
+    }
+  },
+  "phaseDebug": {},
+  "fanoutState": {
+    "newest-insert": {
+      "feed": {
+        "id": "s1",
+        "streamPath": "shape/s1"
+      },
+      "tableOffset": {
+        "status": 200,
+        "body": {
+          "offset": "0000000000000000_0000000000006311",
+          "path": "changes/0",
+          "segment": 0
+        }
+      },
+      "replication": {
+        "status": 200,
+        "body": {
+          "changes": {
+            "offset": "0000000000000000_0000000000006311",
+            "path": "changes/0",
+            "segment": 0
+          },
+          "epoch": {
+            "boundAt": "2026-08-24T20:44:35.201Z",
+            "reason": null,
+            "slot": "slot_el_33424_mt7pfhuh_1",
+            "state": "ok",
+            "systemIdentifier": "7677701892764193497",
+            "timelineId": 1
+          },
+          "flipFailures": 0,
+          "lsn": "0/1BF0528",
+          "pendingFlips": 0,
+          "sync": 3
+        }
+      },
+      "durableShapeHead": {
+        "status": 200,
+        "nextOffset": "0000000000000000_0000000000000709",
+        "closed": null
+      }
+    },
+    "outside-update": {
+      "feed": {
+        "id": "s1",
+        "streamPath": "shape/s1"
+      },
+      "tableOffset": {
+        "status": 200,
+        "body": {
+          "offset": "0000000000000000_0000000000007062",
+          "path": "changes/0",
+          "segment": 0
+        }
+      },
+      "replication": {
+        "status": 200,
+        "body": {
+          "changes": {
+            "offset": "0000000000000000_0000000000007062",
+            "path": "changes/0",
+            "segment": 0
+          },
+          "epoch": {
+            "boundAt": "2026-08-24T20:44:35.201Z",
+            "reason": null,
+            "slot": "slot_el_33424_mt7pfhuh_1",
+            "state": "ok",
+            "systemIdentifier": "7677701892764193497",
+            "timelineId": 1
+          },
+          "flipFailures": 0,
+          "lsn": "0/1BF0770",
+          "pendingFlips": 0,
+          "sync": 4
+        }
+      },
+      "durableShapeHead": {
+        "status": 200,
+        "nextOffset": "0000000000000000_0000000000001047",
+        "closed": null
+      }
+    },
+    "move-below-boundary": {
+      "feed": {
+        "id": "s1",
+        "streamPath": "shape/s1"
+      },
+      "tableOffset": {
+        "status": 200,
+        "body": {
+          "offset": "0000000000000000_0000000000007857",
+          "path": "changes/0",
+          "segment": 0
+        }
+      },
+      "replication": {
+        "status": 200,
+        "body": {
+          "changes": {
+            "offset": "0000000000000000_0000000000007857",
+            "path": "changes/0",
+            "segment": 0
+          },
+          "epoch": {
+            "boundAt": "2026-08-24T20:44:35.201Z",
+            "reason": null,
+            "slot": "slot_el_33424_mt7pfhuh_1",
+            "state": "ok",
+            "systemIdentifier": "7677701892764193497",
+            "timelineId": 1
+          },
+          "flipFailures": 0,
+          "lsn": "0/1BF09D8",
+          "pendingFlips": 0,
+          "sync": 5
+        }
+      },
+      "durableShapeHead": {
+        "status": 200,
+        "nextOffset": "0000000000000000_0000000000001398",
+        "closed": null
+      }
+    },
+    "delete-promotes": {
+      "feed": {
+        "id": "s1",
+        "streamPath": "shape/s1"
+      },
+      "tableOffset": {
+        "status": 200,
+        "body": {
+          "offset": "0000000000000000_0000000000008382",
+          "path": "changes/0",
+          "segment": 0
+        }
+      },
+      "replication": {
+        "status": 200,
+        "body": {
+          "changes": {
+            "offset": "0000000000000000_0000000000008382",
+            "path": "changes/0",
+            "segment": 0
+          },
+          "epoch": {
+            "boundAt": "2026-08-24T20:44:35.201Z",
+            "reason": null,
+            "slot": "slot_el_33424_mt7pfhuh_1",
+            "state": "ok",
+            "systemIdentifier": "7677701892764193497",
+            "timelineId": 1
+          },
+          "flipFailures": 0,
+          "lsn": "0/1BF0BB0",
+          "pendingFlips": 0,
+          "sync": 6
+        }
+      },
+      "durableShapeHead": {
+        "status": 200,
+        "nextOffset": "0000000000000000_0000000000001497",
+        "closed": null
+      }
+    }
+  },
+  "swiftLog": "Fetching https://github.com/groue/GRDB.swift.git from cache\nFetched https://github.com/groue/GRDB.swift.git from cache (0.56s)\nComputing version for https://github.com/groue/GRDB.swift.git\nComputed https://github.com/groue/GRDB.swift.git at 7.11.1 (1.14s)\nComputed https://github.com/groue/GRDB.swift.git at 7.11.1 (0.00s)\nCreating working copy for https://github.com/groue/GRDB.swift.git\nWorking copy of https://github.com/groue/GRDB.swift.git resolved at 7.11.1\nBuilding for debugging...\n[0/12] Write sources\n[2/12] Write LinearLiteRealTopTen-entitlement.plist\n[2/12] Write sources\n[2/12] Copying Info.plist\n[2/12] Write sources\n[3/12] Copying PrivacyInfo.xcprivacy\n[8/12] Write swift-version-3CD7052B146186F2.txt\n[10/170] Compiling GRDB FTS3Pattern.swift\n[11/170] Compiling GRDB FTS3TokenizerDescriptor.swift\n[12/170] Compiling GRDB FTS4.swift\n[13/170] Compiling GRDB FTS5.swift\n[14/170] Compiling GRDB FTS5CustomTokenizer.swift\n[15/170] Compiling GRDB FTS5Pattern.swift\n[16/170] Compiling GRDB FTS5Tokenizer.swift\n[17/170] Compiling GRDB FTS5TokenizerDescriptor.swift\n[18/170] Compiling GRDB FTS5WrapperTokenizer.swift\n[19/170] Compiling GRDB Fixits.swift\n[20/170] Compiling GRDB JSONColumn.swift\n[21/170] Compiling GRDB SQLJSONExpressible.swift\n[22/170] Compiling GRDB SQLJSONFunctions.swift\n[23/170] Compiling GRDB DatabaseMigrator.swift\n[24/170] Compiling GRDB Migration.swift\n[25/170] Compiling GRDB FTS3+QueryInterface.swift\n[26/170] Compiling GRDB FTS5+QueryInterface.swift\n[27/186] Compiling ElectricCircuitsSwift ShapeSubscriptionCoordinator.swift\n[28/186] Compiling ElectricCircuitsSwift StreamMaterialization.swift\n[29/186] Compiling ElectricCircuitsSwift Telemetry.swift\n[30/186] Compiling ElectricCircuitsSwift ElectricCircuitsSwift.swift\n[31/186] Emitting module ElectricCircuitsSwift\n[32/186] Emitting module GRDB\n[33/186] Compiling GRDB ForeignKey.swift\n[34/186] Compiling GRDB Association.swift\n[35/186] Compiling GRDB AssociationAggregate.swift\n[36/186] Compiling GRDB BelongsToAssociation.swift\n[37/186] Compiling GRDB HasManyAssociation.swift\n[38/186] Compiling GRDB HasManyThroughAssociation.swift\n[39/186] Compiling GRDB HasOneAssociation.swift\n[40/186] Compiling GRDB HasOneThroughAssociation.swift\n[41/186] Compiling GRDB JoinAssociation.swift\n[42/186] Compiling GRDB CommonTableExpression.swift\n[43/186] Compiling GRDB QueryInterfaceRequest.swift\n[44/186] Compiling GRDB RequestProtocols.swift\n[45/186] Compiling GRDB Column.swift\n[46/186] Compiling GRDB DatabasePromise.swift\n[47/186] Compiling GRDB SQLAssociation.swift\n[48/186] Compiling GRDB SQLCollection.swift\n[49/186] Compiling GRDB SQLExpression.swift\n[50/186] Compiling GRDB MutablePersistableRecord+Update.swift\n[51/186] Compiling GRDB MutablePersistableRecord+Upsert.swift\n[52/186] Compiling GRDB MutablePersistableRecord.swift\n[53/186] Compiling GRDB PersistableRecord+Insert.swift\n[54/186] Compiling GRDB PersistableRecord+Save.swift\n[55/186] Compiling GRDB PersistableRecord+Upsert.swift\n[56/186] Compiling GRDB PersistableRecord.swift\n[57/186] Compiling GRDB Record.swift\n[58/186] Compiling GRDB TableRecord.swift\n[59/186] Compiling GRDB CaseInsensitiveIdentifier.swift\n[60/186] Compiling GRDB Inflections+English.swift\n[61/186] Compiling GRDB Inflections.swift\n[62/186] Compiling GRDB Mutex.swift\n[63/186] Compiling GRDB OnDemandFuture.swift\n[64/186] Compiling GRDB OrderedDictionary.swift\n[65/186] Compiling GRDB Pool.swift\n[66/186] Compiling GRDB DatabaseSchemaSource.swift\n[67/186] Compiling GRDB DatabaseSnapshot.swift\n[68/186] Compiling GRDB DatabaseSnapshotPool.swift\n[69/186] Compiling GRDB DatabaseValue.swift\n[70/186] Compiling GRDB DatabaseValueConvertible.swift\n[71/186] Compiling GRDB DatabaseWriter.swift\n[72/186] Compiling GRDB DispatchQueueActor.swift\n[73/186] Compiling GRDB FetchRequest.swift\n[74/186] Compiling GRDB Row.swift\n[75/186] Compiling GRDB RowAdapter.swift\n[76/186] Compiling GRDB RowDecodingError.swift\n[77/186] Compiling GRDB SQL.swift\n[78/186] Compiling GRDB SQLInterpolation.swift\n[79/186] Compiling GRDB SQLRequest.swift\n[80/186] Compiling GRDB SchedulingWatchdog.swift\n[81/186] Compiling GRDB SerializedDatabase.swift\n[82/186] Compiling GRDB Statement.swift\n[83/186] Compiling GRDB ReadWriteLock.swift\n[84/186] Compiling GRDB ReceiveValuesOn.swift\n[85/186] Compiling GRDB Refinable.swift\n[86/186] Compiling GRDB Utils.swift\n[87/186] Compiling GRDB DatabaseCancellable.swift\n[88/186] Compiling GRDB ValueConcurrentObserver.swift\n[89/186] Compiling GRDB ValueWriteOnlyObserver.swift\n[90/186] Compiling GRDB Fetch.swift\n[91/186] Compiling GRDB Map.swift\n[92/186] Compiling GRDB RemoveDuplicates.swift\n[93/186] Compiling GRDB Trace.swift\n[94/186] Compiling GRDB ValueReducer.swift\n[95/186] Compiling GRDB SharedValueObservation.swift\n[96/186] Compiling GRDB ValueObservation.swift\n[97/186] Compiling GRDB ValueObservationScheduler.swift\n[98/186] Compiling GRDB resource_bundle_accessor.swift\n[99/186] Compiling GRDB StatementAuthorizer.swift\n[100/186] Compiling GRDB StatementColumnConvertible.swift\n[101/186] Compiling GRDB CGFloat.swift\n[102/186] Compiling GRDB Data.swift\n[103/186] Compiling GRDB DatabaseDateComponents.swift\n[104/186] Compiling GRDB DatabaseValueConvertible+ReferenceConvertible.swift\n[105/186] Compiling GRDB Date.swift\n[106/186] Compiling GRDB Decimal.swift\n[107/186] Compiling GRDB NSData.swift\n[108/186] Compiling GRDB NSNull.swift\n[109/186] Compiling GRDB NSNumber.swift\n[110/186] Compiling GRDB NSString.swift\n[111/186] Compiling GRDB SQLiteDateParser.swift\n[112/186] Compiling GRDB URL.swift\n[113/186] Compiling GRDB UUID.swift\n[114/186] Compiling GRDB DatabaseValueConvertible+Decodable.swift\n[115/186] Compiling GRDB DatabaseValueConvertible+Encodable.swift\n[116/186] Compiling GRDB Database+SchemaDefinition.swift\n[117/186] Compiling GRDB ForeignKeyDefinition.swift\n[118/186] Compiling GRDB IndexDefinition.swift\n[119/186] Compiling GRDB TableAlteration.swift\n[120/186] Compiling GRDB TableDefinition.swift\n[121/186] Compiling GRDB VirtualTableModule.swift\n[122/186] Compiling GRDB TableRecord+Association.swift\n[123/186] Compiling GRDB TableRecord+QueryInterfaceRequest.swift\n[124/186] Compiling GRDB EncodableRecord+Encodable.swift\n[125/186] Compiling GRDB EncodableRecord.swift\n[126/186] Compiling GRDB FetchableRecord+Decodable.swift\n[127/186] Compiling GRDB FetchableRecord+TableRecord.swift\n[128/186] Compiling GRDB FetchableRecord.swift\n[129/186] Compiling GRDB MutablePersistableRecord+DAO.swift\n[130/186] Compiling GRDB MutablePersistableRecord+Delete.swift\n[131/186] Compiling GRDB MutablePersistableRecord+Insert.swift\n[132/186] Compiling GRDB MutablePersistableRecord+Save.swift\n[133/186] Compiling GRDB SQLForeignKeyRequest.swift\n[134/186] Compiling GRDB SQLFunctions.swift\n[135/186] Compiling GRDB SQLOperators.swift\n[136/186] Compiling GRDB SQLOrdering.swift\n[137/186] Compiling GRDB SQLRelation.swift\n[138/186] Compiling GRDB SQLSelection.swift\n[139/186] Compiling GRDB SQLSubquery.swift\n[140/186] Compiling GRDB Table.swift\n[141/186] Compiling GRDB SQLColumnGenerator.swift\n[142/186] Compiling GRDB SQLGenerationContext.swift\n[143/186] Compiling GRDB SQLIndexGenerator.swift\n[144/186] Compiling GRDB SQLQueryGenerator.swift\n[145/186] Compiling GRDB SQLTableAlterationGenerator.swift\n[146/186] Compiling GRDB SQLTableGenerator.swift\n[147/186] Compiling GRDB TableAlias.swift\n[148/186] Compiling GRDB SQLInterpolation+QueryInterface.swift\n[149/186] Compiling GRDB ColumnDefinition.swift\n[150/186] Compiling GRDB DatabaseValueConvertible+RawRepresentable.swift\n[151/186] Compiling GRDB JSONRequiredEncoder.swift\n[152/186] Compiling GRDB Optional.swift\n[153/186] Compiling GRDB StandardLibrary.swift\n[154/186] Compiling GRDB TransactionClock.swift\n[155/186] Compiling GRDB TransactionObserver.swift\n[156/186] Compiling GRDB WALSnapshot.swift\n[157/186] Compiling GRDB WALSnapshotTransaction.swift\n[158/186] Compiling GRDB Database+Dump.swift\n[159/186] Compiling GRDB DatabaseReader+dump.swift\n[160/186] Compiling GRDB DumpFormat.swift\n[161/186] Compiling GRDB DebugDumpFormat.swift\n[162/186] Compiling GRDB JSONDumpFormat.swift\n[163/186] Compiling GRDB LineDumpFormat.swift\n[164/186] Compiling GRDB ListDumpFormat.swift\n[165/186] Compiling GRDB QuoteDumpFormat.swift\n[166/186] Compiling GRDB FTS3.swift\n[167/186] Compiling GRDB Configuration.swift\n[168/186] Compiling GRDB Cursor.swift\n[169/186] Compiling GRDB Database+SQLCipher.swift\n[170/186] Compiling GRDB Database+Schema.swift\n[171/186] Compiling GRDB Database+Statements.swift\n[172/186] Compiling GRDB Database.swift\n[173/186] Compiling GRDB DatabaseBackupProgress.swift\n[174/186] Compiling GRDB DatabaseCollation.swift\n[175/186] Compiling GRDB DatabaseError.swift\n[176/186] Compiling GRDB DatabaseFunction.swift\n[177/186] Compiling GRDB DatabasePool.swift\n[178/186] Compiling GRDB DatabasePublishers.swift\n[179/186] Compiling GRDB DatabaseQueue.swift\n[180/186] Compiling GRDB DatabaseReader.swift\n[181/186] Compiling GRDB DatabaseRegion.swift\n[182/186] Compiling GRDB DatabaseRegionObservation.swift\n[183/186] Compiling GRDB DatabaseSchemaCache.swift\n[184/188] Emitting module LinearLiteGRDB\n[185/188] Compiling LinearLiteGRDB LinearLiteShapeMaterializer.swift\n[186/194] Compiling LinearLiteApp LinearLiteSession.swift\n[187/194] Emitting module LinearLiteApp\n[188/194] Compiling LinearLiteApp LinearLiteIssuesView.swift\n[189/194] Compiling LinearLiteApp LinearLiteRecentSubsetWindow.swift\n[190/194] Compiling LinearLiteApp LinearLiteRootView.swift\n[191/194] Compiling LinearLiteApp LinearLiteHostConfiguration.swift\n[192/196] Compiling LinearLiteRealTopTen main.swift\n[193/196] Emitting module LinearLiteRealTopTen\n[193/196] Write Objects.LinkFileList\n[194/196] Linking LinearLiteRealTopTen\n[195/196] Applying LinearLiteRealTopTen\nBuild of product 'LinearLiteRealTopTen' complete! (12.43s)\n",
+  "cleanup": {
+    "engine": "gone",
+    "durableStreams": "gone",
+    "postgres": "gone",
+    "pgDataRemoved": true
+  }
+}

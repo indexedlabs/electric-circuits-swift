@@ -1,0 +1,19 @@
+[
+  {
+    "type": "public.issues",
+    "key": "42",
+    "value": {
+      "id": 42,
+      "title": "From JSON",
+      "description": "Decoded from the provider fixture",
+      "status": "backlog",
+      "priority": "high",
+      "username": "ada",
+      "project_id": 7,
+      "created": 100,
+      "modified": 101,
+      "kanbanorder": 2.25
+    },
+    "headers": { "operation": "upsert" }
+  }
+]

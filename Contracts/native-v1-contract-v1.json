@@ -1,0 +1,53 @@
+{
+  "contract": "electric-circuits-native-v1",
+  "contractVersion": 1,
+  "rustOpenAPI": {
+    "openapi": "3.0.3",
+    "infoVersion": "0.1.0"
+  },
+  "paths": [
+    {
+      "path": "/v1/shapes",
+      "method": "post",
+      "request": "OpenApiShapeRequest",
+      "responses": { "200": "OpenApiShapeResponse", "400": "OpenApiError", "409": "OpenApiError", "503": "OpenApiError" }
+    },
+    {
+      "path": "/v1/shapes/{id}",
+      "method": "get",
+      "responses": { "200": "OpenApiShapeResponse", "404": "OpenApiError" }
+    },
+    {
+      "path": "/v1/shapes/{id}",
+      "method": "delete",
+      "responses": { "200": null, "404": "OpenApiError" }
+    },
+    {
+      "path": "/v1/subsets/query",
+      "method": "post",
+      "request": "OpenApiSubsetQuery",
+      "responses": { "200": "OpenApiSubsetResponse", "400": "OpenApiError" }
+    },
+    {
+      "path": "/v1/subset-feeds",
+      "method": "post",
+      "request": "OpenApiShapeRequest",
+      "responses": { "200": "OpenApiShapeResponse", "400": "OpenApiError" }
+    },
+    {
+      "path": "/v1/aggregates",
+      "method": "post",
+      "request": "OpenApiAggregateRequest",
+      "responses": { "200": "OpenApiShapeResponse", "400": "OpenApiError" }
+    }
+  ],
+  "schemas": {
+    "OpenApiShapeRequest": ["table", "where", "columns", "changesOnly", "subscription"],
+    "OpenApiShapeResponse": ["shapeId", "table", "streamPath", "streamUrl", "subscription", "leaseSeconds"],
+    "OpenApiSubsetQuery": ["table", "where", "columns", "orderBy", "limit", "offset"],
+    "OpenApiSubsetResponse": ["rows", "lsn"],
+    "OpenApiAggregateRequest": ["table", "where", "fn", "col", "subscription"],
+    "OpenApiError": ["error"],
+    "OpenApiPredicate": ["oneOf"]
+  }
+}

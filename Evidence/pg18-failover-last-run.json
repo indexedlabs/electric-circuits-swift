@@ -1,0 +1,177 @@
+{
+  "status": "pass",
+  "manifest": {
+    "scenario": "SWF-P1-1",
+    "profile": "PG18_4_UNSYNCHRONIZED_SLOT",
+    "runtime": {
+      "server": {
+        "root": "/Users/bozilabs/labs/electric-circuits",
+        "head": "e53cf40afc0a0a400736d43e9ec63b98c755bf9b",
+        "tree": "40d3dd9ab997e52fb33854fcc87880b3158fb1c7",
+        "statusSha256": "c0a74398874cb5fe8a1da015534235c909c23e5474853a33e20d0bc3ca6fd857",
+        "runtimeSourceManifestSha256": "f47c3146ffca92a94b49d216c85ea8847496c1e57a68884abd3c3cb4306050dc"
+      },
+      "swiftCandidate": {
+        "root": "/private/tmp/electric-circuits-swift-pg18-failover-v1",
+        "runtimeInputManifestSha256": "67a4f8ce77645e6066cfc0a0c8c9f97c7dc0f6e0d2769bbd947f0d8ff0e87a9c"
+      },
+      "executables": {
+        "engine": {
+          "path": "/Users/bozilabs/labs/electric-circuits/target/debug/electric-circuits-engine",
+          "sha256": "de675552b3ca8a605b97089711cd68cadcda42d6837365bf234f213fdecf1945"
+        },
+        "durableStreams": {
+          "path": "/Users/bozilabs/.cargo/bin/durable-streams-server",
+          "sha256": "38a15e2772257b2bf0783db9831cc7c955a7342206ea359b5421eb3aeb6bfdd9"
+        },
+        "postgres18": {
+          "initdb": {
+            "path": "/opt/homebrew/opt/postgresql@18/bin/initdb",
+            "version": "initdb (PostgreSQL) 18.4 (Homebrew)",
+            "sha256": "fe96cd8f89ac3e1bea69893bb34e720461a2e3737e496d54826f48941f3e404c"
+          },
+          "pgCtl": {
+            "path": "/opt/homebrew/opt/postgresql@18/bin/pg_ctl",
+            "version": "pg_ctl (PostgreSQL) 18.4 (Homebrew)",
+            "sha256": "2f508410e1cf462a7988ac614dbea8ce8e1adbb8429051a156d5cef219da2980"
+          },
+          "pgBasebackup": {
+            "path": "/opt/homebrew/opt/postgresql@18/bin/pg_basebackup",
+            "version": "pg_basebackup (PostgreSQL) 18.4 (Homebrew)",
+            "sha256": "5e0a0413c1459bd46b6874f9371c31d39664b84558e14380ccfd5140a838c2c1"
+          }
+        }
+      },
+      "toolchain": {
+        "node": "v25.2.1",
+        "swift": "Apple Swift version 6.3.3 (swiftlang-6.3.3.1.3 clang-2100.1.1.101)",
+        "pnpm": "10.28.0"
+      }
+    },
+    "stableEngineURL": "http://127.0.0.1:49612",
+    "ports": {
+      "primaryPort": 49610,
+      "standbyPort": 49611,
+      "enginePort": 49612,
+      "dsPort": 49621
+    },
+    "slot": "swift_p1_slot_27592_mt7p8na6"
+  },
+  "result": {
+    "phases": [
+      "baseline_source_commit",
+      "baseline_server_receipt",
+      "baseline_client_receipt",
+      "standby_caught_up",
+      "primary_isolated",
+      "standby_promoted",
+      "engine_repointed",
+      "old_terminal",
+      "promoted_source_commit",
+      "promoted_server_receipt",
+      "recovery_complete"
+    ],
+    "baselineMarker": 1,
+    "promotedMarker": 2,
+    "oracle": [
+      {
+        "id": 1,
+        "title": "after"
+      },
+      {
+        "id": 3,
+        "title": "promoted"
+      }
+    ],
+    "swift": {
+      "baseline": [
+        {
+          "id": 1,
+          "title": "before"
+        },
+        {
+          "id": 2,
+          "title": "delete-me"
+        }
+      ],
+      "headers": {
+        "control": true,
+        "stream": true,
+        "successfulReleases": 2
+      },
+      "newHandle": "s2",
+      "newScope": "13:qualification|5:items|23:swift-pg18-failover-new|8:promoted",
+      "newSubscription": "swift-pg18-failover-new",
+      "oldAfterPromotion": [
+        {
+          "id": 1,
+          "title": "before"
+        },
+        {
+          "id": 2,
+          "title": "delete-me"
+        }
+      ],
+      "oldCursor": {
+        "offset": "0000000000000000_0000000000000205"
+      },
+      "oldHandle": "s1",
+      "oldScope": "13:qualification|5:items|23:swift-pg18-failover-old|3:old",
+      "oldSubscription": "swift-pg18-failover-old",
+      "recovered": [
+        {
+          "id": 1,
+          "title": "after"
+        },
+        {
+          "id": 3,
+          "title": "promoted"
+        }
+      ],
+      "reopened": [
+        {
+          "id": 1,
+          "title": "after"
+        },
+        {
+          "id": 3,
+          "title": "promoted"
+        }
+      ],
+      "reopenedCursor": {
+        "offset": "0000000000000000_0000000000000203"
+      },
+      "visibleObservations": [
+        {
+          "rows": [
+            {
+              "id": 1,
+              "title": "before"
+            },
+            {
+              "id": 2,
+              "title": "delete-me"
+            }
+          ],
+          "scope": "13:qualification|5:items|23:swift-pg18-failover-old|3:old",
+          "stage": "old_complete_before_activation"
+        },
+        {
+          "rows": [
+            {
+              "id": 1,
+              "title": "after"
+            },
+            {
+              "id": 3,
+              "title": "promoted"
+            }
+          ],
+          "scope": "13:qualification|5:items|23:swift-pg18-failover-new|8:promoted",
+          "stage": "new_complete_after_activation"
+        }
+      ]
+    }
+  },
+  "swiftLog": "Fetching https://github.com/groue/GRDB.swift.git from cache\nFetched https://github.com/groue/GRDB.swift.git from cache (0.67s)\nComputing version for https://github.com/groue/GRDB.swift.git\nComputed https://github.com/groue/GRDB.swift.git at 7.11.1 (2.13s)\nComputed https://github.com/groue/GRDB.swift.git at 7.11.1 (0.00s)\nCreating working copy for https://github.com/groue/GRDB.swift.git\nWorking copy of https://github.com/groue/GRDB.swift.git resolved at 7.11.1\nBuilding for debugging...\n[0/10] Write sources\n[1/10] Copying Info.plist\n[1/10] Write sources\n[3/10] Copying PrivacyInfo.xcprivacy\n[4/10] Write sources\n[4/10] Write LinearLitePG18Failover-entitlement.plist\n[6/10] Write swift-version-3CD7052B146186F2.txt\n[8/168] Compiling ElectricCircuitsSwift StreamMaterialization.swift\n[9/168] Compiling ElectricCircuitsSwift Telemetry.swift\n[10/168] Emitting module ElectricCircuitsSwift\n[11/168] Compiling ElectricCircuitsSwift ElectricCircuitsSwift.swift\n[12/168] Compiling ElectricCircuitsSwift ShapeSubscriptionCoordinator.swift\n[13/168] Compiling GRDB StatementAuthorizer.swift\n[14/168] Compiling GRDB StatementColumnConvertible.swift\n[15/168] Compiling GRDB CGFloat.swift\n[16/168] Compiling GRDB Data.swift\n[17/168] Compiling GRDB DatabaseDateComponents.swift\n[18/168] Compiling GRDB DatabaseValueConvertible+ReferenceConvertible.swift\n[19/168] Compiling GRDB Date.swift\n[20/168] Compiling GRDB Decimal.swift\n[21/168] Compiling GRDB NSData.swift\n[22/168] Compiling GRDB NSNull.swift\n[23/168] Compiling GRDB NSNumber.swift\n[24/168] Compiling GRDB NSString.swift\n[25/168] Compiling GRDB SQLiteDateParser.swift\n[26/168] Compiling GRDB URL.swift\n[27/168] Compiling GRDB UUID.swift\n[28/168] Compiling GRDB DatabaseValueConvertible+Decodable.swift\n[29/168] Compiling GRDB DatabaseValueConvertible+Encodable.swift\n[30/168] Compiling GRDB FTS3Pattern.swift\n[31/168] Compiling GRDB FTS3TokenizerDescriptor.swift\n[32/168] Compiling GRDB FTS4.swift\n[33/168] Compiling GRDB FTS5.swift\n[34/168] Compiling GRDB FTS5CustomTokenizer.swift\n[35/168] Compiling GRDB FTS5Pattern.swift\n[36/168] Compiling GRDB FTS5Tokenizer.swift\n[37/168] Compiling GRDB FTS5TokenizerDescriptor.swift\n[38/168] Compiling GRDB FTS5WrapperTokenizer.swift\n[39/168] Compiling GRDB Fixits.swift\n[40/168] Compiling GRDB JSONColumn.swift\n[41/168] Compiling GRDB SQLJSONExpressible.swift\n[42/168] Compiling GRDB SQLJSONFunctions.swift\n[43/168] Compiling GRDB DatabaseMigrator.swift\n[44/168] Compiling GRDB Migration.swift\n[45/168] Compiling GRDB FTS3+QueryInterface.swift\n[46/168] Compiling GRDB FTS5+QueryInterface.swift\n[47/168] Compiling GRDB Database+SchemaDefinition.swift\n[48/168] Compiling GRDB ForeignKeyDefinition.swift\n[49/168] Compiling GRDB IndexDefinition.swift\n[50/168] Compiling GRDB TableAlteration.swift\n[51/168] Compiling GRDB TableDefinition.swift\n[52/168] Compiling GRDB VirtualTableModule.swift\n[53/168] Compiling GRDB TableRecord+Association.swift\n[54/168] Compiling GRDB TableRecord+QueryInterfaceRequest.swift\n[55/168] Compiling GRDB EncodableRecord+Encodable.swift\n[56/168] Compiling GRDB EncodableRecord.swift\n[57/168] Compiling GRDB FetchableRecord+Decodable.swift\n[58/168] Compiling GRDB FetchableRecord+TableRecord.swift\n[59/168] Compiling GRDB FetchableRecord.swift\n[60/168] Compiling GRDB MutablePersistableRecord+DAO.swift\n[61/168] Compiling GRDB MutablePersistableRecord+Delete.swift\n[62/168] Compiling GRDB MutablePersistableRecord+Insert.swift\n[63/168] Compiling GRDB MutablePersistableRecord+Save.swift\n[64/168] Compiling GRDB SQLForeignKeyRequest.swift\n[65/168] Compiling GRDB SQLFunctions.swift\n[66/168] Compiling GRDB SQLOperators.swift\n[67/168] Compiling GRDB SQLOrdering.swift\n[68/168] Compiling GRDB SQLRelation.swift\n[69/168] Compiling GRDB SQLSelection.swift\n[70/168] Compiling GRDB SQLSubquery.swift\n[71/168] Compiling GRDB Table.swift\n[72/168] Compiling GRDB SQLColumnGenerator.swift\n[73/168] Compiling GRDB SQLGenerationContext.swift\n[74/168] Compiling GRDB SQLIndexGenerator.swift\n[75/168] Compiling GRDB SQLQueryGenerator.swift\n[76/168] Compiling GRDB SQLTableAlterationGenerator.swift\n[77/168] Compiling GRDB SQLTableGenerator.swift\n[78/168] Compiling GRDB TableAlias.swift\n[79/168] Compiling GRDB SQLInterpolation+QueryInterface.swift\n[80/168] Compiling GRDB ColumnDefinition.swift\n[81/168] Compiling GRDB ForeignKey.swift\n[82/168] Compiling GRDB Association.swift\n[83/168] Compiling GRDB AssociationAggregate.swift\n[84/168] Compiling GRDB BelongsToAssociation.swift\n[85/168] Compiling GRDB HasManyAssociation.swift\n[86/168] Compiling GRDB HasManyThroughAssociation.swift\n[87/168] Compiling GRDB HasOneAssociation.swift\n[88/168] Compiling GRDB HasOneThroughAssociation.swift\n[89/168] Compiling GRDB JoinAssociation.swift\n[90/168] Compiling GRDB CommonTableExpression.swift\n[91/168] Compiling GRDB QueryInterfaceRequest.swift\n[92/168] Compiling GRDB RequestProtocols.swift\n[93/168] Compiling GRDB Column.swift\n[94/168] Compiling GRDB DatabasePromise.swift\n[95/168] Compiling GRDB SQLAssociation.swift\n[96/168] Compiling GRDB SQLCollection.swift\n[97/168] Compiling GRDB SQLExpression.swift\n[98/168] Compiling GRDB DatabaseSchemaSource.swift\n[99/168] Compiling GRDB DatabaseSnapshot.swift\n[100/168] Compiling GRDB DatabaseSnapshotPool.swift\n[101/168] Compiling GRDB DatabaseValue.swift\n[102/168] Compiling GRDB DatabaseValueConvertible.swift\n[103/168] Compiling GRDB DatabaseWriter.swift\n[104/168] Compiling GRDB DispatchQueueActor.swift\n[105/168] Compiling GRDB FetchRequest.swift\n[106/168] Compiling GRDB Row.swift\n[107/168] Compiling GRDB RowAdapter.swift\n[108/168] Compiling GRDB RowDecodingError.swift\n[109/168] Compiling GRDB SQL.swift\n[110/168] Compiling GRDB SQLInterpolation.swift\n[111/168] Compiling GRDB SQLRequest.swift\n[112/168] Compiling GRDB SchedulingWatchdog.swift\n[113/168] Compiling GRDB SerializedDatabase.swift\n[114/168] Compiling GRDB Statement.swift\n[115/168] Compiling GRDB MutablePersistableRecord+Update.swift\n[116/168] Compiling GRDB MutablePersistableRecord+Upsert.swift\n[117/168] Compiling GRDB MutablePersistableRecord.swift\n[118/168] Compiling GRDB PersistableRecord+Insert.swift\n[119/168] Compiling GRDB PersistableRecord+Save.swift\n[120/168] Compiling GRDB PersistableRecord+Upsert.swift\n[121/168] Compiling GRDB PersistableRecord.swift\n[122/168] Compiling GRDB Record.swift\n[123/168] Compiling GRDB TableRecord.swift\n[124/168] Compiling GRDB CaseInsensitiveIdentifier.swift\n[125/168] Compiling GRDB Inflections+English.swift\n[126/168] Compiling GRDB Inflections.swift\n[127/168] Compiling GRDB Mutex.swift\n[128/168] Compiling GRDB OnDemandFuture.swift\n[129/168] Compiling GRDB OrderedDictionary.swift\n[130/168] Compiling GRDB Pool.swift\n[131/168] Compiling GRDB Configuration.swift\n[132/168] Compiling GRDB Cursor.swift\n[133/168] Compiling GRDB Database+SQLCipher.swift\n[134/168] Compiling GRDB Database+Schema.swift\n[135/168] Compiling GRDB Database+Statements.swift\n[136/168] Compiling GRDB Database.swift\n[137/168] Compiling GRDB DatabaseBackupProgress.swift\n[138/168] Compiling GRDB DatabaseCollation.swift\n[139/168] Compiling GRDB DatabaseError.swift\n[140/168] Compiling GRDB DatabaseFunction.swift\n[141/168] Compiling GRDB DatabasePool.swift\n[142/168] Compiling GRDB DatabasePublishers.swift\n[143/168] Compiling GRDB DatabaseQueue.swift\n[144/168] Compiling GRDB DatabaseReader.swift\n[145/168] Compiling GRDB DatabaseRegion.swift\n[146/168] Compiling GRDB DatabaseRegionObservation.swift\n[147/168] Compiling GRDB DatabaseSchemaCache.swift\n[148/168] Compiling GRDB DatabaseValueConvertible+RawRepresentable.swift\n[149/168] Compiling GRDB JSONRequiredEncoder.swift\n[150/168] Compiling GRDB Optional.swift\n[151/168] Compiling GRDB StandardLibrary.swift\n[152/168] Compiling GRDB TransactionClock.swift\n[153/168] Compiling GRDB TransactionObserver.swift\n[154/168] Compiling GRDB WALSnapshot.swift\n[155/168] Compiling GRDB WALSnapshotTransaction.swift\n[156/168] Compiling GRDB Database+Dump.swift\n[157/168] Compiling GRDB DatabaseReader+dump.swift\n[158/168] Compiling GRDB DumpFormat.swift\n[159/168] Compiling GRDB DebugDumpFormat.swift\n[160/168] Compiling GRDB JSONDumpFormat.swift\n[161/168] Compiling GRDB LineDumpFormat.swift\n[162/168] Compiling GRDB ListDumpFormat.swift\n[163/168] Compiling GRDB QuoteDumpFormat.swift\n[164/168] Compiling GRDB FTS3.swift\n[165/168] Emitting module GRDB\n[166/184] Compiling GRDB ReadWriteLock.swift\n[167/184] Compiling GRDB ReceiveValuesOn.swift\n[168/184] Compiling GRDB Refinable.swift\n[169/184] Compiling GRDB Utils.swift\n[170/184] Compiling GRDB DatabaseCancellable.swift\n[171/184] Compiling GRDB ValueConcurrentObserver.swift\n[172/184] Compiling GRDB ValueWriteOnlyObserver.swift\n[173/184] Compiling GRDB Fetch.swift\n[174/184] Compiling GRDB Map.swift\n[175/184] Compiling GRDB RemoveDuplicates.swift\n[176/184] Compiling GRDB Trace.swift\n[177/184] Compiling GRDB ValueReducer.swift\n[178/184] Compiling GRDB SharedValueObservation.swift\n[179/184] Compiling GRDB ValueObservation.swift\n[180/184] Compiling GRDB ValueObservationScheduler.swift\n[181/184] Compiling GRDB resource_bundle_accessor.swift\n[182/186] Compiling LinearLitePG18Failover main.swift\n[183/186] Emitting module LinearLitePG18Failover\n[183/186] Write Objects.LinkFileList\n[184/186] Linking LinearLitePG18Failover\n[185/186] Applying LinearLitePG18Failover\nBuild of product 'LinearLitePG18Failover' complete! (15.66s)\n"
+}

@@ -1,0 +1,3347 @@
+{
+  "status": "pass",
+  "failure": "",
+  "runtime": {
+    "scenario": "SWF-P0-4-filtered-windows",
+    "postgres": {
+      "initdb": "initdb (PostgreSQL) 18.4 (Homebrew)",
+      "initdbSha256": "fe96cd8f89ac3e1bea69893bb34e720461a2e3737e496d54826f48941f3e404c"
+    },
+    "engine": {
+      "path": "/Users/bozilabs/labs/electric-circuits/target/debug/electric-circuits-engine",
+      "sha256": "de675552b3ca8a605b97089711cd68cadcda42d6837365bf234f213fdecf1945",
+      "head": "e53cf40afc0a0a400736d43e9ec63b98c755bf9b",
+      "tree": "40d3dd9ab997e52fb33854fcc87880b3158fb1c7"
+    },
+    "durableStreams": {
+      "path": "/Users/bozilabs/.cargo/bin/durable-streams-server",
+      "sha256": "38a15e2772257b2bf0783db9831cc7c955a7342206ea359b5421eb3aeb6bfdd9"
+    },
+    "swift": "Apple Swift version 6.3.3 (swiftlang-6.3.3.1.3 clang-2100.1.1.101)",
+    "endpoints": {
+      "engine": "http://127.0.0.1:53602",
+      "durableStreams": "http://127.0.0.1:53600"
+    }
+  },
+  "result": {
+    "expectedA": [
+      {
+        "id": 51,
+        "modified": 6000,
+        "username": "ada",
+        "title": "newest-a"
+      },
+      {
+        "id": 50,
+        "modified": 5000,
+        "username": "ada",
+        "title": "overlap-a"
+      },
+      {
+        "id": 11,
+        "modified": 1011,
+        "username": "ada",
+        "title": "seed-11"
+      },
+      {
+        "id": 10,
+        "modified": 1010,
+        "username": "ada",
+        "title": "seed-10"
+      },
+      {
+        "id": 9,
+        "modified": 1009,
+        "username": "ada",
+        "title": "seed-9"
+      },
+      {
+        "id": 8,
+        "modified": 1008,
+        "username": "ada",
+        "title": "seed-8"
+      },
+      {
+        "id": 7,
+        "modified": 1007,
+        "username": "ada",
+        "title": "seed-7"
+      },
+      {
+        "id": 6,
+        "modified": 1006,
+        "username": "ada",
+        "title": "seed-6"
+      },
+      {
+        "id": 5,
+        "modified": 1005,
+        "username": "ada",
+        "title": "seed-5"
+      },
+      {
+        "id": 4,
+        "modified": 1004,
+        "username": "ada",
+        "title": "seed-4"
+      }
+    ],
+    "expectedB": [
+      {
+        "id": 12,
+        "modified": 7000,
+        "username": "bob",
+        "title": "b-after-a-close"
+      },
+      {
+        "id": 112,
+        "modified": 1112,
+        "username": "bob",
+        "title": "seed-112"
+      },
+      {
+        "id": 111,
+        "modified": 1111,
+        "username": "bob",
+        "title": "seed-111"
+      },
+      {
+        "id": 110,
+        "modified": 1110,
+        "username": "bob",
+        "title": "seed-110"
+      },
+      {
+        "id": 109,
+        "modified": 1109,
+        "username": "bob",
+        "title": "seed-109"
+      },
+      {
+        "id": 108,
+        "modified": 1108,
+        "username": "bob",
+        "title": "seed-108"
+      },
+      {
+        "id": 107,
+        "modified": 1107,
+        "username": "bob",
+        "title": "seed-107"
+      },
+      {
+        "id": 106,
+        "modified": 1106,
+        "username": "bob",
+        "title": "seed-106"
+      },
+      {
+        "id": 105,
+        "modified": 1105,
+        "username": "bob",
+        "title": "seed-105"
+      },
+      {
+        "id": 104,
+        "modified": 1104,
+        "username": "bob",
+        "title": "seed-104"
+      }
+    ],
+    "swift": {
+      "aInsert": {
+        "a": {
+          "cursor": {
+            "lsn": "0/1BF0C80",
+            "offset": "0000000000000000_0000000000000659"
+          },
+          "membershipCount": 10,
+          "rows": [
+            {
+              "id": 51,
+              "modified": 6000,
+              "title": "newest-a",
+              "username": "ada"
+            },
+            {
+              "id": 50,
+              "modified": 5000,
+              "title": "overlap-a",
+              "username": "ada"
+            },
+            {
+              "id": 12,
+              "modified": 1012,
+              "title": "seed-12",
+              "username": "ada"
+            },
+            {
+              "id": 11,
+              "modified": 1011,
+              "title": "seed-11",
+              "username": "ada"
+            },
+            {
+              "id": 10,
+              "modified": 1010,
+              "title": "seed-10",
+              "username": "ada"
+            },
+            {
+              "id": 9,
+              "modified": 1009,
+              "title": "seed-9",
+              "username": "ada"
+            },
+            {
+              "id": 8,
+              "modified": 1008,
+              "title": "seed-8",
+              "username": "ada"
+            },
+            {
+              "id": 7,
+              "modified": 1007,
+              "title": "seed-7",
+              "username": "ada"
+            },
+            {
+              "id": 6,
+              "modified": 1006,
+              "title": "seed-6",
+              "username": "ada"
+            },
+            {
+              "id": 5,
+              "modified": 1005,
+              "title": "seed-5",
+              "username": "ada"
+            }
+          ],
+          "sessionRows": [
+            {
+              "id": 51,
+              "modified": 6000,
+              "title": "newest-a",
+              "username": "ada"
+            },
+            {
+              "id": 50,
+              "modified": 5000,
+              "title": "overlap-a",
+              "username": "ada"
+            },
+            {
+              "id": 12,
+              "modified": 1012,
+              "title": "seed-12",
+              "username": "ada"
+            },
+            {
+              "id": 11,
+              "modified": 1011,
+              "title": "seed-11",
+              "username": "ada"
+            },
+            {
+              "id": 10,
+              "modified": 1010,
+              "title": "seed-10",
+              "username": "ada"
+            },
+            {
+              "id": 9,
+              "modified": 1009,
+              "title": "seed-9",
+              "username": "ada"
+            },
+            {
+              "id": 8,
+              "modified": 1008,
+              "title": "seed-8",
+              "username": "ada"
+            },
+            {
+              "id": 7,
+              "modified": 1007,
+              "title": "seed-7",
+              "username": "ada"
+            },
+            {
+              "id": 6,
+              "modified": 1006,
+              "title": "seed-6",
+              "username": "ada"
+            },
+            {
+              "id": 5,
+              "modified": 1005,
+              "title": "seed-5",
+              "username": "ada"
+            }
+          ]
+        },
+        "b": {
+          "cursor": {
+            "lsn": "0/1BF0A78",
+            "offset": "0000000000000000_0000000000000000"
+          },
+          "membershipCount": 10,
+          "rows": [
+            {
+              "id": 112,
+              "modified": 1112,
+              "title": "seed-112",
+              "username": "bob"
+            },
+            {
+              "id": 111,
+              "modified": 1111,
+              "title": "seed-111",
+              "username": "bob"
+            },
+            {
+              "id": 110,
+              "modified": 1110,
+              "title": "seed-110",
+              "username": "bob"
+            },
+            {
+              "id": 109,
+              "modified": 1109,
+              "title": "seed-109",
+              "username": "bob"
+            },
+            {
+              "id": 108,
+              "modified": 1108,
+              "title": "seed-108",
+              "username": "bob"
+            },
+            {
+              "id": 107,
+              "modified": 1107,
+              "title": "seed-107",
+              "username": "bob"
+            },
+            {
+              "id": 106,
+              "modified": 1106,
+              "title": "seed-106",
+              "username": "bob"
+            },
+            {
+              "id": 105,
+              "modified": 1105,
+              "title": "seed-105",
+              "username": "bob"
+            },
+            {
+              "id": 104,
+              "modified": 1104,
+              "title": "seed-104",
+              "username": "bob"
+            },
+            {
+              "id": 103,
+              "modified": 1103,
+              "title": "seed-103",
+              "username": "bob"
+            }
+          ],
+          "sessionRows": [
+            {
+              "id": 112,
+              "modified": 1112,
+              "title": "seed-112",
+              "username": "bob"
+            },
+            {
+              "id": 111,
+              "modified": 1111,
+              "title": "seed-111",
+              "username": "bob"
+            },
+            {
+              "id": 110,
+              "modified": 1110,
+              "title": "seed-110",
+              "username": "bob"
+            },
+            {
+              "id": 109,
+              "modified": 1109,
+              "title": "seed-109",
+              "username": "bob"
+            },
+            {
+              "id": 108,
+              "modified": 1108,
+              "title": "seed-108",
+              "username": "bob"
+            },
+            {
+              "id": 107,
+              "modified": 1107,
+              "title": "seed-107",
+              "username": "bob"
+            },
+            {
+              "id": 106,
+              "modified": 1106,
+              "title": "seed-106",
+              "username": "bob"
+            },
+            {
+              "id": 105,
+              "modified": 1105,
+              "title": "seed-105",
+              "username": "bob"
+            },
+            {
+              "id": 104,
+              "modified": 1104,
+              "title": "seed-104",
+              "username": "bob"
+            },
+            {
+              "id": 103,
+              "modified": 1103,
+              "title": "seed-103",
+              "username": "bob"
+            }
+          ]
+        },
+        "canonicalIssueCount": 20,
+        "canonicalIssueIDs": [
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          50,
+          51,
+          103,
+          104,
+          105,
+          106,
+          107,
+          108,
+          109,
+          110,
+          111,
+          112
+        ],
+        "name": "a-insert"
+      },
+      "bAfterAClose": {
+        "a": {
+          "cursor": {
+            "lsn": "0/1BF0EB0",
+            "offset": "0000000000000000_0000000000000759"
+          },
+          "membershipCount": 10,
+          "rows": [
+            {
+              "id": 51,
+              "modified": 6000,
+              "title": "newest-a",
+              "username": "ada"
+            },
+            {
+              "id": 50,
+              "modified": 5000,
+              "title": "overlap-a",
+              "username": "ada"
+            },
+            {
+              "id": 11,
+              "modified": 1011,
+              "title": "seed-11",
+              "username": "ada"
+            },
+            {
+              "id": 10,
+              "modified": 1010,
+              "title": "seed-10",
+              "username": "ada"
+            },
+            {
+              "id": 9,
+              "modified": 1009,
+              "title": "seed-9",
+              "username": "ada"
+            },
+            {
+              "id": 8,
+              "modified": 1008,
+              "title": "seed-8",
+              "username": "ada"
+            },
+            {
+              "id": 7,
+              "modified": 1007,
+              "title": "seed-7",
+              "username": "ada"
+            },
+            {
+              "id": 6,
+              "modified": 1006,
+              "title": "seed-6",
+              "username": "ada"
+            },
+            {
+              "id": 5,
+              "modified": 1005,
+              "title": "seed-5",
+              "username": "ada"
+            },
+            {
+              "id": 4,
+              "modified": 1004,
+              "title": "seed-4",
+              "username": "ada"
+            }
+          ],
+          "sessionRows": [
+            {
+              "id": 51,
+              "modified": 6000,
+              "title": "newest-a",
+              "username": "ada"
+            },
+            {
+              "id": 50,
+              "modified": 5000,
+              "title": "overlap-a",
+              "username": "ada"
+            },
+            {
+              "id": 11,
+              "modified": 1011,
+              "title": "seed-11",
+              "username": "ada"
+            },
+            {
+              "id": 10,
+              "modified": 1010,
+              "title": "seed-10",
+              "username": "ada"
+            },
+            {
+              "id": 9,
+              "modified": 1009,
+              "title": "seed-9",
+              "username": "ada"
+            },
+            {
+              "id": 8,
+              "modified": 1008,
+              "title": "seed-8",
+              "username": "ada"
+            },
+            {
+              "id": 7,
+              "modified": 1007,
+              "title": "seed-7",
+              "username": "ada"
+            },
+            {
+              "id": 6,
+              "modified": 1006,
+              "title": "seed-6",
+              "username": "ada"
+            },
+            {
+              "id": 5,
+              "modified": 1005,
+              "title": "seed-5",
+              "username": "ada"
+            },
+            {
+              "id": 4,
+              "modified": 1004,
+              "title": "seed-4",
+              "username": "ada"
+            }
+          ]
+        },
+        "b": {
+          "cursor": {
+            "lsn": "0/1BF1278",
+            "offset": "0000000000000000_0000000000000988"
+          },
+          "membershipCount": 10,
+          "rows": [
+            {
+              "id": 12,
+              "modified": 7000,
+              "title": "b-after-a-close",
+              "username": "bob"
+            },
+            {
+              "id": 112,
+              "modified": 1112,
+              "title": "seed-112",
+              "username": "bob"
+            },
+            {
+              "id": 111,
+              "modified": 1111,
+              "title": "seed-111",
+              "username": "bob"
+            },
+            {
+              "id": 110,
+              "modified": 1110,
+              "title": "seed-110",
+              "username": "bob"
+            },
+            {
+              "id": 109,
+              "modified": 1109,
+              "title": "seed-109",
+              "username": "bob"
+            },
+            {
+              "id": 108,
+              "modified": 1108,
+              "title": "seed-108",
+              "username": "bob"
+            },
+            {
+              "id": 107,
+              "modified": 1107,
+              "title": "seed-107",
+              "username": "bob"
+            },
+            {
+              "id": 106,
+              "modified": 1106,
+              "title": "seed-106",
+              "username": "bob"
+            },
+            {
+              "id": 105,
+              "modified": 1105,
+              "title": "seed-105",
+              "username": "bob"
+            },
+            {
+              "id": 104,
+              "modified": 1104,
+              "title": "seed-104",
+              "username": "bob"
+            }
+          ],
+          "sessionRows": [
+            {
+              "id": 12,
+              "modified": 7000,
+              "title": "b-after-a-close",
+              "username": "bob"
+            },
+            {
+              "id": 112,
+              "modified": 1112,
+              "title": "seed-112",
+              "username": "bob"
+            },
+            {
+              "id": 111,
+              "modified": 1111,
+              "title": "seed-111",
+              "username": "bob"
+            },
+            {
+              "id": 110,
+              "modified": 1110,
+              "title": "seed-110",
+              "username": "bob"
+            },
+            {
+              "id": 109,
+              "modified": 1109,
+              "title": "seed-109",
+              "username": "bob"
+            },
+            {
+              "id": 108,
+              "modified": 1108,
+              "title": "seed-108",
+              "username": "bob"
+            },
+            {
+              "id": 107,
+              "modified": 1107,
+              "title": "seed-107",
+              "username": "bob"
+            },
+            {
+              "id": 106,
+              "modified": 1106,
+              "title": "seed-106",
+              "username": "bob"
+            },
+            {
+              "id": 105,
+              "modified": 1105,
+              "title": "seed-105",
+              "username": "bob"
+            },
+            {
+              "id": 104,
+              "modified": 1104,
+              "title": "seed-104",
+              "username": "bob"
+            }
+          ]
+        },
+        "canonicalIssueCount": 20,
+        "canonicalIssueIDs": [
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          50,
+          51,
+          104,
+          105,
+          106,
+          107,
+          108,
+          109,
+          110,
+          111,
+          112
+        ],
+        "name": "b-after-a-close"
+      },
+      "baseline": {
+        "a": {
+          "cursor": {
+            "lsn": "0/1BF09C0",
+            "offset": "0000000000000000_0000000000000327"
+          },
+          "membershipCount": 10,
+          "rows": [
+            {
+              "id": 50,
+              "modified": 5000,
+              "title": "overlap-a",
+              "username": "ada"
+            },
+            {
+              "id": 12,
+              "modified": 1012,
+              "title": "seed-12",
+              "username": "ada"
+            },
+            {
+              "id": 11,
+              "modified": 1011,
+              "title": "seed-11",
+              "username": "ada"
+            },
+            {
+              "id": 10,
+              "modified": 1010,
+              "title": "seed-10",
+              "username": "ada"
+            },
+            {
+              "id": 9,
+              "modified": 1009,
+              "title": "seed-9",
+              "username": "ada"
+            },
+            {
+              "id": 8,
+              "modified": 1008,
+              "title": "seed-8",
+              "username": "ada"
+            },
+            {
+              "id": 7,
+              "modified": 1007,
+              "title": "seed-7",
+              "username": "ada"
+            },
+            {
+              "id": 6,
+              "modified": 1006,
+              "title": "seed-6",
+              "username": "ada"
+            },
+            {
+              "id": 5,
+              "modified": 1005,
+              "title": "seed-5",
+              "username": "ada"
+            },
+            {
+              "id": 4,
+              "modified": 1004,
+              "title": "seed-4",
+              "username": "ada"
+            }
+          ],
+          "sessionRows": [
+            {
+              "id": 50,
+              "modified": 5000,
+              "title": "overlap-a",
+              "username": "ada"
+            },
+            {
+              "id": 12,
+              "modified": 1012,
+              "title": "seed-12",
+              "username": "ada"
+            },
+            {
+              "id": 11,
+              "modified": 1011,
+              "title": "seed-11",
+              "username": "ada"
+            },
+            {
+              "id": 10,
+              "modified": 1010,
+              "title": "seed-10",
+              "username": "ada"
+            },
+            {
+              "id": 9,
+              "modified": 1009,
+              "title": "seed-9",
+              "username": "ada"
+            },
+            {
+              "id": 8,
+              "modified": 1008,
+              "title": "seed-8",
+              "username": "ada"
+            },
+            {
+              "id": 7,
+              "modified": 1007,
+              "title": "seed-7",
+              "username": "ada"
+            },
+            {
+              "id": 6,
+              "modified": 1006,
+              "title": "seed-6",
+              "username": "ada"
+            },
+            {
+              "id": 5,
+              "modified": 1005,
+              "title": "seed-5",
+              "username": "ada"
+            },
+            {
+              "id": 4,
+              "modified": 1004,
+              "title": "seed-4",
+              "username": "ada"
+            }
+          ]
+        },
+        "b": {
+          "cursor": {
+            "lsn": "0/1BF0A78",
+            "offset": "0000000000000000_0000000000000000"
+          },
+          "membershipCount": 10,
+          "rows": [
+            {
+              "id": 112,
+              "modified": 1112,
+              "title": "seed-112",
+              "username": "bob"
+            },
+            {
+              "id": 111,
+              "modified": 1111,
+              "title": "seed-111",
+              "username": "bob"
+            },
+            {
+              "id": 110,
+              "modified": 1110,
+              "title": "seed-110",
+              "username": "bob"
+            },
+            {
+              "id": 109,
+              "modified": 1109,
+              "title": "seed-109",
+              "username": "bob"
+            },
+            {
+              "id": 108,
+              "modified": 1108,
+              "title": "seed-108",
+              "username": "bob"
+            },
+            {
+              "id": 107,
+              "modified": 1107,
+              "title": "seed-107",
+              "username": "bob"
+            },
+            {
+              "id": 106,
+              "modified": 1106,
+              "title": "seed-106",
+              "username": "bob"
+            },
+            {
+              "id": 105,
+              "modified": 1105,
+              "title": "seed-105",
+              "username": "bob"
+            },
+            {
+              "id": 104,
+              "modified": 1104,
+              "title": "seed-104",
+              "username": "bob"
+            },
+            {
+              "id": 103,
+              "modified": 1103,
+              "title": "seed-103",
+              "username": "bob"
+            }
+          ],
+          "sessionRows": [
+            {
+              "id": 112,
+              "modified": 1112,
+              "title": "seed-112",
+              "username": "bob"
+            },
+            {
+              "id": 111,
+              "modified": 1111,
+              "title": "seed-111",
+              "username": "bob"
+            },
+            {
+              "id": 110,
+              "modified": 1110,
+              "title": "seed-110",
+              "username": "bob"
+            },
+            {
+              "id": 109,
+              "modified": 1109,
+              "title": "seed-109",
+              "username": "bob"
+            },
+            {
+              "id": 108,
+              "modified": 1108,
+              "title": "seed-108",
+              "username": "bob"
+            },
+            {
+              "id": 107,
+              "modified": 1107,
+              "title": "seed-107",
+              "username": "bob"
+            },
+            {
+              "id": 106,
+              "modified": 1106,
+              "title": "seed-106",
+              "username": "bob"
+            },
+            {
+              "id": 105,
+              "modified": 1105,
+              "title": "seed-105",
+              "username": "bob"
+            },
+            {
+              "id": 104,
+              "modified": 1104,
+              "title": "seed-104",
+              "username": "bob"
+            },
+            {
+              "id": 103,
+              "modified": 1103,
+              "title": "seed-103",
+              "username": "bob"
+            }
+          ]
+        },
+        "canonicalIssueCount": 20,
+        "canonicalIssueIDs": [
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          50,
+          103,
+          104,
+          105,
+          106,
+          107,
+          108,
+          109,
+          110,
+          111,
+          112
+        ],
+        "name": "baseline"
+      },
+      "headers": {
+        "feeds": 2,
+        "queries": 5,
+        "releases": 2,
+        "streams": 8
+      },
+      "neutralUpdate": {
+        "a": {
+          "cursor": {
+            "lsn": "0/1BF0EB0",
+            "offset": "0000000000000000_0000000000000759"
+          },
+          "membershipCount": 10,
+          "rows": [
+            {
+              "id": 51,
+              "modified": 6000,
+              "title": "newest-a",
+              "username": "ada"
+            },
+            {
+              "id": 50,
+              "modified": 5000,
+              "title": "overlap-a",
+              "username": "ada"
+            },
+            {
+              "id": 11,
+              "modified": 1011,
+              "title": "seed-11",
+              "username": "ada"
+            },
+            {
+              "id": 10,
+              "modified": 1010,
+              "title": "seed-10",
+              "username": "ada"
+            },
+            {
+              "id": 9,
+              "modified": 1009,
+              "title": "seed-9",
+              "username": "ada"
+            },
+            {
+              "id": 8,
+              "modified": 1008,
+              "title": "seed-8",
+              "username": "ada"
+            },
+            {
+              "id": 7,
+              "modified": 1007,
+              "title": "seed-7",
+              "username": "ada"
+            },
+            {
+              "id": 6,
+              "modified": 1006,
+              "title": "seed-6",
+              "username": "ada"
+            },
+            {
+              "id": 5,
+              "modified": 1005,
+              "title": "seed-5",
+              "username": "ada"
+            },
+            {
+              "id": 4,
+              "modified": 1004,
+              "title": "seed-4",
+              "username": "ada"
+            }
+          ],
+          "sessionRows": [
+            {
+              "id": 51,
+              "modified": 6000,
+              "title": "newest-a",
+              "username": "ada"
+            },
+            {
+              "id": 50,
+              "modified": 5000,
+              "title": "overlap-a",
+              "username": "ada"
+            },
+            {
+              "id": 11,
+              "modified": 1011,
+              "title": "seed-11",
+              "username": "ada"
+            },
+            {
+              "id": 10,
+              "modified": 1010,
+              "title": "seed-10",
+              "username": "ada"
+            },
+            {
+              "id": 9,
+              "modified": 1009,
+              "title": "seed-9",
+              "username": "ada"
+            },
+            {
+              "id": 8,
+              "modified": 1008,
+              "title": "seed-8",
+              "username": "ada"
+            },
+            {
+              "id": 7,
+              "modified": 1007,
+              "title": "seed-7",
+              "username": "ada"
+            },
+            {
+              "id": 6,
+              "modified": 1006,
+              "title": "seed-6",
+              "username": "ada"
+            },
+            {
+              "id": 5,
+              "modified": 1005,
+              "title": "seed-5",
+              "username": "ada"
+            },
+            {
+              "id": 4,
+              "modified": 1004,
+              "title": "seed-4",
+              "username": "ada"
+            }
+          ]
+        },
+        "b": {
+          "cursor": {
+            "lsn": "0/1BF1038",
+            "offset": "0000000000000000_0000000000000658"
+          },
+          "membershipCount": 10,
+          "rows": [
+            {
+              "id": 12,
+              "modified": 7000,
+              "title": "neutral-b-update",
+              "username": "bob"
+            },
+            {
+              "id": 112,
+              "modified": 1112,
+              "title": "seed-112",
+              "username": "bob"
+            },
+            {
+              "id": 111,
+              "modified": 1111,
+              "title": "seed-111",
+              "username": "bob"
+            },
+            {
+              "id": 110,
+              "modified": 1110,
+              "title": "seed-110",
+              "username": "bob"
+            },
+            {
+              "id": 109,
+              "modified": 1109,
+              "title": "seed-109",
+              "username": "bob"
+            },
+            {
+              "id": 108,
+              "modified": 1108,
+              "title": "seed-108",
+              "username": "bob"
+            },
+            {
+              "id": 107,
+              "modified": 1107,
+              "title": "seed-107",
+              "username": "bob"
+            },
+            {
+              "id": 106,
+              "modified": 1106,
+              "title": "seed-106",
+              "username": "bob"
+            },
+            {
+              "id": 105,
+              "modified": 1105,
+              "title": "seed-105",
+              "username": "bob"
+            },
+            {
+              "id": 104,
+              "modified": 1104,
+              "title": "seed-104",
+              "username": "bob"
+            }
+          ],
+          "sessionRows": [
+            {
+              "id": 12,
+              "modified": 7000,
+              "title": "neutral-b-update",
+              "username": "bob"
+            },
+            {
+              "id": 112,
+              "modified": 1112,
+              "title": "seed-112",
+              "username": "bob"
+            },
+            {
+              "id": 111,
+              "modified": 1111,
+              "title": "seed-111",
+              "username": "bob"
+            },
+            {
+              "id": 110,
+              "modified": 1110,
+              "title": "seed-110",
+              "username": "bob"
+            },
+            {
+              "id": 109,
+              "modified": 1109,
+              "title": "seed-109",
+              "username": "bob"
+            },
+            {
+              "id": 108,
+              "modified": 1108,
+              "title": "seed-108",
+              "username": "bob"
+            },
+            {
+              "id": 107,
+              "modified": 1107,
+              "title": "seed-107",
+              "username": "bob"
+            },
+            {
+              "id": 106,
+              "modified": 1106,
+              "title": "seed-106",
+              "username": "bob"
+            },
+            {
+              "id": 105,
+              "modified": 1105,
+              "title": "seed-105",
+              "username": "bob"
+            },
+            {
+              "id": 104,
+              "modified": 1104,
+              "title": "seed-104",
+              "username": "bob"
+            }
+          ]
+        },
+        "canonicalIssueCount": 20,
+        "canonicalIssueIDs": [
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          50,
+          51,
+          104,
+          105,
+          106,
+          107,
+          108,
+          109,
+          110,
+          111,
+          112
+        ],
+        "name": "neutral-update"
+      },
+      "reassignment": {
+        "a": {
+          "cursor": {
+            "lsn": "0/1BF0EB0",
+            "offset": "0000000000000000_0000000000000759"
+          },
+          "membershipCount": 10,
+          "rows": [
+            {
+              "id": 51,
+              "modified": 6000,
+              "title": "newest-a",
+              "username": "ada"
+            },
+            {
+              "id": 50,
+              "modified": 5000,
+              "title": "overlap-a",
+              "username": "ada"
+            },
+            {
+              "id": 11,
+              "modified": 1011,
+              "title": "seed-11",
+              "username": "ada"
+            },
+            {
+              "id": 10,
+              "modified": 1010,
+              "title": "seed-10",
+              "username": "ada"
+            },
+            {
+              "id": 9,
+              "modified": 1009,
+              "title": "seed-9",
+              "username": "ada"
+            },
+            {
+              "id": 8,
+              "modified": 1008,
+              "title": "seed-8",
+              "username": "ada"
+            },
+            {
+              "id": 7,
+              "modified": 1007,
+              "title": "seed-7",
+              "username": "ada"
+            },
+            {
+              "id": 6,
+              "modified": 1006,
+              "title": "seed-6",
+              "username": "ada"
+            },
+            {
+              "id": 5,
+              "modified": 1005,
+              "title": "seed-5",
+              "username": "ada"
+            },
+            {
+              "id": 4,
+              "modified": 1004,
+              "title": "seed-4",
+              "username": "ada"
+            }
+          ],
+          "sessionRows": [
+            {
+              "id": 51,
+              "modified": 6000,
+              "title": "newest-a",
+              "username": "ada"
+            },
+            {
+              "id": 50,
+              "modified": 5000,
+              "title": "overlap-a",
+              "username": "ada"
+            },
+            {
+              "id": 11,
+              "modified": 1011,
+              "title": "seed-11",
+              "username": "ada"
+            },
+            {
+              "id": 10,
+              "modified": 1010,
+              "title": "seed-10",
+              "username": "ada"
+            },
+            {
+              "id": 9,
+              "modified": 1009,
+              "title": "seed-9",
+              "username": "ada"
+            },
+            {
+              "id": 8,
+              "modified": 1008,
+              "title": "seed-8",
+              "username": "ada"
+            },
+            {
+              "id": 7,
+              "modified": 1007,
+              "title": "seed-7",
+              "username": "ada"
+            },
+            {
+              "id": 6,
+              "modified": 1006,
+              "title": "seed-6",
+              "username": "ada"
+            },
+            {
+              "id": 5,
+              "modified": 1005,
+              "title": "seed-5",
+              "username": "ada"
+            },
+            {
+              "id": 4,
+              "modified": 1004,
+              "title": "seed-4",
+              "username": "ada"
+            }
+          ]
+        },
+        "b": {
+          "cursor": {
+            "lsn": "0/1BF0EB0",
+            "offset": "0000000000000000_0000000000000327"
+          },
+          "membershipCount": 10,
+          "rows": [
+            {
+              "id": 12,
+              "modified": 7000,
+              "title": "moved-a-to-b",
+              "username": "bob"
+            },
+            {
+              "id": 112,
+              "modified": 1112,
+              "title": "seed-112",
+              "username": "bob"
+            },
+            {
+              "id": 111,
+              "modified": 1111,
+              "title": "seed-111",
+              "username": "bob"
+            },
+            {
+              "id": 110,
+              "modified": 1110,
+              "title": "seed-110",
+              "username": "bob"
+            },
+            {
+              "id": 109,
+              "modified": 1109,
+              "title": "seed-109",
+              "username": "bob"
+            },
+            {
+              "id": 108,
+              "modified": 1108,
+              "title": "seed-108",
+              "username": "bob"
+            },
+            {
+              "id": 107,
+              "modified": 1107,
+              "title": "seed-107",
+              "username": "bob"
+            },
+            {
+              "id": 106,
+              "modified": 1106,
+              "title": "seed-106",
+              "username": "bob"
+            },
+            {
+              "id": 105,
+              "modified": 1105,
+              "title": "seed-105",
+              "username": "bob"
+            },
+            {
+              "id": 104,
+              "modified": 1104,
+              "title": "seed-104",
+              "username": "bob"
+            }
+          ],
+          "sessionRows": [
+            {
+              "id": 12,
+              "modified": 7000,
+              "title": "moved-a-to-b",
+              "username": "bob"
+            },
+            {
+              "id": 112,
+              "modified": 1112,
+              "title": "seed-112",
+              "username": "bob"
+            },
+            {
+              "id": 111,
+              "modified": 1111,
+              "title": "seed-111",
+              "username": "bob"
+            },
+            {
+              "id": 110,
+              "modified": 1110,
+              "title": "seed-110",
+              "username": "bob"
+            },
+            {
+              "id": 109,
+              "modified": 1109,
+              "title": "seed-109",
+              "username": "bob"
+            },
+            {
+              "id": 108,
+              "modified": 1108,
+              "title": "seed-108",
+              "username": "bob"
+            },
+            {
+              "id": 107,
+              "modified": 1107,
+              "title": "seed-107",
+              "username": "bob"
+            },
+            {
+              "id": 106,
+              "modified": 1106,
+              "title": "seed-106",
+              "username": "bob"
+            },
+            {
+              "id": 105,
+              "modified": 1105,
+              "title": "seed-105",
+              "username": "bob"
+            },
+            {
+              "id": 104,
+              "modified": 1104,
+              "title": "seed-104",
+              "username": "bob"
+            }
+          ]
+        },
+        "canonicalIssueCount": 20,
+        "canonicalIssueIDs": [
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          50,
+          51,
+          104,
+          105,
+          106,
+          107,
+          108,
+          109,
+          110,
+          111,
+          112
+        ],
+        "name": "reassignment"
+      },
+      "reopened": {
+        "a": {
+          "cursor": {
+            "lsn": "0/1BF0EB0",
+            "offset": "0000000000000000_0000000000000759"
+          },
+          "membershipCount": 10,
+          "rows": [
+            {
+              "id": 51,
+              "modified": 6000,
+              "title": "newest-a",
+              "username": "ada"
+            },
+            {
+              "id": 50,
+              "modified": 5000,
+              "title": "overlap-a",
+              "username": "ada"
+            },
+            {
+              "id": 11,
+              "modified": 1011,
+              "title": "seed-11",
+              "username": "ada"
+            },
+            {
+              "id": 10,
+              "modified": 1010,
+              "title": "seed-10",
+              "username": "ada"
+            },
+            {
+              "id": 9,
+              "modified": 1009,
+              "title": "seed-9",
+              "username": "ada"
+            },
+            {
+              "id": 8,
+              "modified": 1008,
+              "title": "seed-8",
+              "username": "ada"
+            },
+            {
+              "id": 7,
+              "modified": 1007,
+              "title": "seed-7",
+              "username": "ada"
+            },
+            {
+              "id": 6,
+              "modified": 1006,
+              "title": "seed-6",
+              "username": "ada"
+            },
+            {
+              "id": 5,
+              "modified": 1005,
+              "title": "seed-5",
+              "username": "ada"
+            },
+            {
+              "id": 4,
+              "modified": 1004,
+              "title": "seed-4",
+              "username": "ada"
+            }
+          ],
+          "sessionRows": [
+            {
+              "id": 51,
+              "modified": 6000,
+              "title": "newest-a",
+              "username": "ada"
+            },
+            {
+              "id": 50,
+              "modified": 5000,
+              "title": "overlap-a",
+              "username": "ada"
+            },
+            {
+              "id": 11,
+              "modified": 1011,
+              "title": "seed-11",
+              "username": "ada"
+            },
+            {
+              "id": 10,
+              "modified": 1010,
+              "title": "seed-10",
+              "username": "ada"
+            },
+            {
+              "id": 9,
+              "modified": 1009,
+              "title": "seed-9",
+              "username": "ada"
+            },
+            {
+              "id": 8,
+              "modified": 1008,
+              "title": "seed-8",
+              "username": "ada"
+            },
+            {
+              "id": 7,
+              "modified": 1007,
+              "title": "seed-7",
+              "username": "ada"
+            },
+            {
+              "id": 6,
+              "modified": 1006,
+              "title": "seed-6",
+              "username": "ada"
+            },
+            {
+              "id": 5,
+              "modified": 1005,
+              "title": "seed-5",
+              "username": "ada"
+            },
+            {
+              "id": 4,
+              "modified": 1004,
+              "title": "seed-4",
+              "username": "ada"
+            }
+          ]
+        },
+        "b": {
+          "cursor": {
+            "lsn": "0/1BF1278",
+            "offset": "0000000000000000_0000000000000988"
+          },
+          "membershipCount": 10,
+          "rows": [
+            {
+              "id": 12,
+              "modified": 7000,
+              "title": "b-after-a-close",
+              "username": "bob"
+            },
+            {
+              "id": 112,
+              "modified": 1112,
+              "title": "seed-112",
+              "username": "bob"
+            },
+            {
+              "id": 111,
+              "modified": 1111,
+              "title": "seed-111",
+              "username": "bob"
+            },
+            {
+              "id": 110,
+              "modified": 1110,
+              "title": "seed-110",
+              "username": "bob"
+            },
+            {
+              "id": 109,
+              "modified": 1109,
+              "title": "seed-109",
+              "username": "bob"
+            },
+            {
+              "id": 108,
+              "modified": 1108,
+              "title": "seed-108",
+              "username": "bob"
+            },
+            {
+              "id": 107,
+              "modified": 1107,
+              "title": "seed-107",
+              "username": "bob"
+            },
+            {
+              "id": 106,
+              "modified": 1106,
+              "title": "seed-106",
+              "username": "bob"
+            },
+            {
+              "id": 105,
+              "modified": 1105,
+              "title": "seed-105",
+              "username": "bob"
+            },
+            {
+              "id": 104,
+              "modified": 1104,
+              "title": "seed-104",
+              "username": "bob"
+            }
+          ],
+          "sessionRows": [
+            {
+              "id": 12,
+              "modified": 7000,
+              "title": "b-after-a-close",
+              "username": "bob"
+            },
+            {
+              "id": 112,
+              "modified": 1112,
+              "title": "seed-112",
+              "username": "bob"
+            },
+            {
+              "id": 111,
+              "modified": 1111,
+              "title": "seed-111",
+              "username": "bob"
+            },
+            {
+              "id": 110,
+              "modified": 1110,
+              "title": "seed-110",
+              "username": "bob"
+            },
+            {
+              "id": 109,
+              "modified": 1109,
+              "title": "seed-109",
+              "username": "bob"
+            },
+            {
+              "id": 108,
+              "modified": 1108,
+              "title": "seed-108",
+              "username": "bob"
+            },
+            {
+              "id": 107,
+              "modified": 1107,
+              "title": "seed-107",
+              "username": "bob"
+            },
+            {
+              "id": 106,
+              "modified": 1106,
+              "title": "seed-106",
+              "username": "bob"
+            },
+            {
+              "id": 105,
+              "modified": 1105,
+              "title": "seed-105",
+              "username": "bob"
+            },
+            {
+              "id": 104,
+              "modified": 1104,
+              "title": "seed-104",
+              "username": "bob"
+            }
+          ]
+        },
+        "canonicalIssueCount": 20,
+        "canonicalIssueIDs": [
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          50,
+          51,
+          104,
+          105,
+          106,
+          107,
+          108,
+          109,
+          110,
+          111,
+          112
+        ],
+        "name": "reopened"
+      },
+      "scopes": {
+        "a": "26:filtered-windows-principal|26:recent-subset:username=ada|12:assignee-ada|2:v1",
+        "b": "26:filtered-windows-principal|26:recent-subset:username=bob|12:assignee-bob|2:v1"
+      }
+    }
+  },
+  "phaseEvidence": {
+    "initial-pair-gate.json": {
+      "heads": 2,
+      "initialQueries": 2
+    },
+    "baseline-client-ready.json": {
+      "a": {
+        "cursor": {
+          "lsn": "0/1BF09C0",
+          "offset": "0000000000000000_0000000000000327"
+        },
+        "membershipCount": 10,
+        "rows": [
+          {
+            "id": 50,
+            "modified": 5000,
+            "title": "overlap-a",
+            "username": "ada"
+          },
+          {
+            "id": 12,
+            "modified": 1012,
+            "title": "seed-12",
+            "username": "ada"
+          },
+          {
+            "id": 11,
+            "modified": 1011,
+            "title": "seed-11",
+            "username": "ada"
+          },
+          {
+            "id": 10,
+            "modified": 1010,
+            "title": "seed-10",
+            "username": "ada"
+          },
+          {
+            "id": 9,
+            "modified": 1009,
+            "title": "seed-9",
+            "username": "ada"
+          },
+          {
+            "id": 8,
+            "modified": 1008,
+            "title": "seed-8",
+            "username": "ada"
+          },
+          {
+            "id": 7,
+            "modified": 1007,
+            "title": "seed-7",
+            "username": "ada"
+          },
+          {
+            "id": 6,
+            "modified": 1006,
+            "title": "seed-6",
+            "username": "ada"
+          },
+          {
+            "id": 5,
+            "modified": 1005,
+            "title": "seed-5",
+            "username": "ada"
+          },
+          {
+            "id": 4,
+            "modified": 1004,
+            "title": "seed-4",
+            "username": "ada"
+          }
+        ],
+        "sessionRows": [
+          {
+            "id": 50,
+            "modified": 5000,
+            "title": "overlap-a",
+            "username": "ada"
+          },
+          {
+            "id": 12,
+            "modified": 1012,
+            "title": "seed-12",
+            "username": "ada"
+          },
+          {
+            "id": 11,
+            "modified": 1011,
+            "title": "seed-11",
+            "username": "ada"
+          },
+          {
+            "id": 10,
+            "modified": 1010,
+            "title": "seed-10",
+            "username": "ada"
+          },
+          {
+            "id": 9,
+            "modified": 1009,
+            "title": "seed-9",
+            "username": "ada"
+          },
+          {
+            "id": 8,
+            "modified": 1008,
+            "title": "seed-8",
+            "username": "ada"
+          },
+          {
+            "id": 7,
+            "modified": 1007,
+            "title": "seed-7",
+            "username": "ada"
+          },
+          {
+            "id": 6,
+            "modified": 1006,
+            "title": "seed-6",
+            "username": "ada"
+          },
+          {
+            "id": 5,
+            "modified": 1005,
+            "title": "seed-5",
+            "username": "ada"
+          },
+          {
+            "id": 4,
+            "modified": 1004,
+            "title": "seed-4",
+            "username": "ada"
+          }
+        ]
+      },
+      "b": {
+        "cursor": {
+          "lsn": "0/1BF0A78",
+          "offset": "0000000000000000_0000000000000000"
+        },
+        "membershipCount": 10,
+        "rows": [
+          {
+            "id": 112,
+            "modified": 1112,
+            "title": "seed-112",
+            "username": "bob"
+          },
+          {
+            "id": 111,
+            "modified": 1111,
+            "title": "seed-111",
+            "username": "bob"
+          },
+          {
+            "id": 110,
+            "modified": 1110,
+            "title": "seed-110",
+            "username": "bob"
+          },
+          {
+            "id": 109,
+            "modified": 1109,
+            "title": "seed-109",
+            "username": "bob"
+          },
+          {
+            "id": 108,
+            "modified": 1108,
+            "title": "seed-108",
+            "username": "bob"
+          },
+          {
+            "id": 107,
+            "modified": 1107,
+            "title": "seed-107",
+            "username": "bob"
+          },
+          {
+            "id": 106,
+            "modified": 1106,
+            "title": "seed-106",
+            "username": "bob"
+          },
+          {
+            "id": 105,
+            "modified": 1105,
+            "title": "seed-105",
+            "username": "bob"
+          },
+          {
+            "id": 104,
+            "modified": 1104,
+            "title": "seed-104",
+            "username": "bob"
+          },
+          {
+            "id": 103,
+            "modified": 1103,
+            "title": "seed-103",
+            "username": "bob"
+          }
+        ],
+        "sessionRows": [
+          {
+            "id": 112,
+            "modified": 1112,
+            "title": "seed-112",
+            "username": "bob"
+          },
+          {
+            "id": 111,
+            "modified": 1111,
+            "title": "seed-111",
+            "username": "bob"
+          },
+          {
+            "id": 110,
+            "modified": 1110,
+            "title": "seed-110",
+            "username": "bob"
+          },
+          {
+            "id": 109,
+            "modified": 1109,
+            "title": "seed-109",
+            "username": "bob"
+          },
+          {
+            "id": 108,
+            "modified": 1108,
+            "title": "seed-108",
+            "username": "bob"
+          },
+          {
+            "id": 107,
+            "modified": 1107,
+            "title": "seed-107",
+            "username": "bob"
+          },
+          {
+            "id": 106,
+            "modified": 1106,
+            "title": "seed-106",
+            "username": "bob"
+          },
+          {
+            "id": 105,
+            "modified": 1105,
+            "title": "seed-105",
+            "username": "bob"
+          },
+          {
+            "id": 104,
+            "modified": 1104,
+            "title": "seed-104",
+            "username": "bob"
+          },
+          {
+            "id": 103,
+            "modified": 1103,
+            "title": "seed-103",
+            "username": "bob"
+          }
+        ]
+      },
+      "canonicalIssueCount": 20,
+      "canonicalIssueIDs": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        50,
+        103,
+        104,
+        105,
+        106,
+        107,
+        108,
+        109,
+        110,
+        111,
+        112
+      ],
+      "name": "baseline"
+    },
+    "a-insert-observed.json": {
+      "a": {
+        "cursor": {
+          "lsn": "0/1BF0C80",
+          "offset": "0000000000000000_0000000000000659"
+        },
+        "membershipCount": 10,
+        "rows": [
+          {
+            "id": 51,
+            "modified": 6000,
+            "title": "newest-a",
+            "username": "ada"
+          },
+          {
+            "id": 50,
+            "modified": 5000,
+            "title": "overlap-a",
+            "username": "ada"
+          },
+          {
+            "id": 12,
+            "modified": 1012,
+            "title": "seed-12",
+            "username": "ada"
+          },
+          {
+            "id": 11,
+            "modified": 1011,
+            "title": "seed-11",
+            "username": "ada"
+          },
+          {
+            "id": 10,
+            "modified": 1010,
+            "title": "seed-10",
+            "username": "ada"
+          },
+          {
+            "id": 9,
+            "modified": 1009,
+            "title": "seed-9",
+            "username": "ada"
+          },
+          {
+            "id": 8,
+            "modified": 1008,
+            "title": "seed-8",
+            "username": "ada"
+          },
+          {
+            "id": 7,
+            "modified": 1007,
+            "title": "seed-7",
+            "username": "ada"
+          },
+          {
+            "id": 6,
+            "modified": 1006,
+            "title": "seed-6",
+            "username": "ada"
+          },
+          {
+            "id": 5,
+            "modified": 1005,
+            "title": "seed-5",
+            "username": "ada"
+          }
+        ],
+        "sessionRows": [
+          {
+            "id": 51,
+            "modified": 6000,
+            "title": "newest-a",
+            "username": "ada"
+          },
+          {
+            "id": 50,
+            "modified": 5000,
+            "title": "overlap-a",
+            "username": "ada"
+          },
+          {
+            "id": 12,
+            "modified": 1012,
+            "title": "seed-12",
+            "username": "ada"
+          },
+          {
+            "id": 11,
+            "modified": 1011,
+            "title": "seed-11",
+            "username": "ada"
+          },
+          {
+            "id": 10,
+            "modified": 1010,
+            "title": "seed-10",
+            "username": "ada"
+          },
+          {
+            "id": 9,
+            "modified": 1009,
+            "title": "seed-9",
+            "username": "ada"
+          },
+          {
+            "id": 8,
+            "modified": 1008,
+            "title": "seed-8",
+            "username": "ada"
+          },
+          {
+            "id": 7,
+            "modified": 1007,
+            "title": "seed-7",
+            "username": "ada"
+          },
+          {
+            "id": 6,
+            "modified": 1006,
+            "title": "seed-6",
+            "username": "ada"
+          },
+          {
+            "id": 5,
+            "modified": 1005,
+            "title": "seed-5",
+            "username": "ada"
+          }
+        ]
+      },
+      "b": {
+        "cursor": {
+          "lsn": "0/1BF0A78",
+          "offset": "0000000000000000_0000000000000000"
+        },
+        "membershipCount": 10,
+        "rows": [
+          {
+            "id": 112,
+            "modified": 1112,
+            "title": "seed-112",
+            "username": "bob"
+          },
+          {
+            "id": 111,
+            "modified": 1111,
+            "title": "seed-111",
+            "username": "bob"
+          },
+          {
+            "id": 110,
+            "modified": 1110,
+            "title": "seed-110",
+            "username": "bob"
+          },
+          {
+            "id": 109,
+            "modified": 1109,
+            "title": "seed-109",
+            "username": "bob"
+          },
+          {
+            "id": 108,
+            "modified": 1108,
+            "title": "seed-108",
+            "username": "bob"
+          },
+          {
+            "id": 107,
+            "modified": 1107,
+            "title": "seed-107",
+            "username": "bob"
+          },
+          {
+            "id": 106,
+            "modified": 1106,
+            "title": "seed-106",
+            "username": "bob"
+          },
+          {
+            "id": 105,
+            "modified": 1105,
+            "title": "seed-105",
+            "username": "bob"
+          },
+          {
+            "id": 104,
+            "modified": 1104,
+            "title": "seed-104",
+            "username": "bob"
+          },
+          {
+            "id": 103,
+            "modified": 1103,
+            "title": "seed-103",
+            "username": "bob"
+          }
+        ],
+        "sessionRows": [
+          {
+            "id": 112,
+            "modified": 1112,
+            "title": "seed-112",
+            "username": "bob"
+          },
+          {
+            "id": 111,
+            "modified": 1111,
+            "title": "seed-111",
+            "username": "bob"
+          },
+          {
+            "id": 110,
+            "modified": 1110,
+            "title": "seed-110",
+            "username": "bob"
+          },
+          {
+            "id": 109,
+            "modified": 1109,
+            "title": "seed-109",
+            "username": "bob"
+          },
+          {
+            "id": 108,
+            "modified": 1108,
+            "title": "seed-108",
+            "username": "bob"
+          },
+          {
+            "id": 107,
+            "modified": 1107,
+            "title": "seed-107",
+            "username": "bob"
+          },
+          {
+            "id": 106,
+            "modified": 1106,
+            "title": "seed-106",
+            "username": "bob"
+          },
+          {
+            "id": 105,
+            "modified": 1105,
+            "title": "seed-105",
+            "username": "bob"
+          },
+          {
+            "id": 104,
+            "modified": 1104,
+            "title": "seed-104",
+            "username": "bob"
+          },
+          {
+            "id": 103,
+            "modified": 1103,
+            "title": "seed-103",
+            "username": "bob"
+          }
+        ]
+      },
+      "canonicalIssueCount": 20,
+      "canonicalIssueIDs": [
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        50,
+        51,
+        103,
+        104,
+        105,
+        106,
+        107,
+        108,
+        109,
+        110,
+        111,
+        112
+      ],
+      "name": "a-insert"
+    },
+    "reassignment-observed.json": {
+      "a": {
+        "cursor": {
+          "lsn": "0/1BF0EB0",
+          "offset": "0000000000000000_0000000000000759"
+        },
+        "membershipCount": 10,
+        "rows": [
+          {
+            "id": 51,
+            "modified": 6000,
+            "title": "newest-a",
+            "username": "ada"
+          },
+          {
+            "id": 50,
+            "modified": 5000,
+            "title": "overlap-a",
+            "username": "ada"
+          },
+          {
+            "id": 11,
+            "modified": 1011,
+            "title": "seed-11",
+            "username": "ada"
+          },
+          {
+            "id": 10,
+            "modified": 1010,
+            "title": "seed-10",
+            "username": "ada"
+          },
+          {
+            "id": 9,
+            "modified": 1009,
+            "title": "seed-9",
+            "username": "ada"
+          },
+          {
+            "id": 8,
+            "modified": 1008,
+            "title": "seed-8",
+            "username": "ada"
+          },
+          {
+            "id": 7,
+            "modified": 1007,
+            "title": "seed-7",
+            "username": "ada"
+          },
+          {
+            "id": 6,
+            "modified": 1006,
+            "title": "seed-6",
+            "username": "ada"
+          },
+          {
+            "id": 5,
+            "modified": 1005,
+            "title": "seed-5",
+            "username": "ada"
+          },
+          {
+            "id": 4,
+            "modified": 1004,
+            "title": "seed-4",
+            "username": "ada"
+          }
+        ],
+        "sessionRows": [
+          {
+            "id": 51,
+            "modified": 6000,
+            "title": "newest-a",
+            "username": "ada"
+          },
+          {
+            "id": 50,
+            "modified": 5000,
+            "title": "overlap-a",
+            "username": "ada"
+          },
+          {
+            "id": 11,
+            "modified": 1011,
+            "title": "seed-11",
+            "username": "ada"
+          },
+          {
+            "id": 10,
+            "modified": 1010,
+            "title": "seed-10",
+            "username": "ada"
+          },
+          {
+            "id": 9,
+            "modified": 1009,
+            "title": "seed-9",
+            "username": "ada"
+          },
+          {
+            "id": 8,
+            "modified": 1008,
+            "title": "seed-8",
+            "username": "ada"
+          },
+          {
+            "id": 7,
+            "modified": 1007,
+            "title": "seed-7",
+            "username": "ada"
+          },
+          {
+            "id": 6,
+            "modified": 1006,
+            "title": "seed-6",
+            "username": "ada"
+          },
+          {
+            "id": 5,
+            "modified": 1005,
+            "title": "seed-5",
+            "username": "ada"
+          },
+          {
+            "id": 4,
+            "modified": 1004,
+            "title": "seed-4",
+            "username": "ada"
+          }
+        ]
+      },
+      "b": {
+        "cursor": {
+          "lsn": "0/1BF0EB0",
+          "offset": "0000000000000000_0000000000000327"
+        },
+        "membershipCount": 10,
+        "rows": [
+          {
+            "id": 12,
+            "modified": 7000,
+            "title": "moved-a-to-b",
+            "username": "bob"
+          },
+          {
+            "id": 112,
+            "modified": 1112,
+            "title": "seed-112",
+            "username": "bob"
+          },
+          {
+            "id": 111,
+            "modified": 1111,
+            "title": "seed-111",
+            "username": "bob"
+          },
+          {
+            "id": 110,
+            "modified": 1110,
+            "title": "seed-110",
+            "username": "bob"
+          },
+          {
+            "id": 109,
+            "modified": 1109,
+            "title": "seed-109",
+            "username": "bob"
+          },
+          {
+            "id": 108,
+            "modified": 1108,
+            "title": "seed-108",
+            "username": "bob"
+          },
+          {
+            "id": 107,
+            "modified": 1107,
+            "title": "seed-107",
+            "username": "bob"
+          },
+          {
+            "id": 106,
+            "modified": 1106,
+            "title": "seed-106",
+            "username": "bob"
+          },
+          {
+            "id": 105,
+            "modified": 1105,
+            "title": "seed-105",
+            "username": "bob"
+          },
+          {
+            "id": 104,
+            "modified": 1104,
+            "title": "seed-104",
+            "username": "bob"
+          }
+        ],
+        "sessionRows": [
+          {
+            "id": 12,
+            "modified": 7000,
+            "title": "moved-a-to-b",
+            "username": "bob"
+          },
+          {
+            "id": 112,
+            "modified": 1112,
+            "title": "seed-112",
+            "username": "bob"
+          },
+          {
+            "id": 111,
+            "modified": 1111,
+            "title": "seed-111",
+            "username": "bob"
+          },
+          {
+            "id": 110,
+            "modified": 1110,
+            "title": "seed-110",
+            "username": "bob"
+          },
+          {
+            "id": 109,
+            "modified": 1109,
+            "title": "seed-109",
+            "username": "bob"
+          },
+          {
+            "id": 108,
+            "modified": 1108,
+            "title": "seed-108",
+            "username": "bob"
+          },
+          {
+            "id": 107,
+            "modified": 1107,
+            "title": "seed-107",
+            "username": "bob"
+          },
+          {
+            "id": 106,
+            "modified": 1106,
+            "title": "seed-106",
+            "username": "bob"
+          },
+          {
+            "id": 105,
+            "modified": 1105,
+            "title": "seed-105",
+            "username": "bob"
+          },
+          {
+            "id": 104,
+            "modified": 1104,
+            "title": "seed-104",
+            "username": "bob"
+          }
+        ]
+      },
+      "canonicalIssueCount": 20,
+      "canonicalIssueIDs": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        50,
+        51,
+        104,
+        105,
+        106,
+        107,
+        108,
+        109,
+        110,
+        111,
+        112
+      ],
+      "name": "reassignment"
+    },
+    "neutral-update-observed.json": {
+      "a": {
+        "cursor": {
+          "lsn": "0/1BF0EB0",
+          "offset": "0000000000000000_0000000000000759"
+        },
+        "membershipCount": 10,
+        "rows": [
+          {
+            "id": 51,
+            "modified": 6000,
+            "title": "newest-a",
+            "username": "ada"
+          },
+          {
+            "id": 50,
+            "modified": 5000,
+            "title": "overlap-a",
+            "username": "ada"
+          },
+          {
+            "id": 11,
+            "modified": 1011,
+            "title": "seed-11",
+            "username": "ada"
+          },
+          {
+            "id": 10,
+            "modified": 1010,
+            "title": "seed-10",
+            "username": "ada"
+          },
+          {
+            "id": 9,
+            "modified": 1009,
+            "title": "seed-9",
+            "username": "ada"
+          },
+          {
+            "id": 8,
+            "modified": 1008,
+            "title": "seed-8",
+            "username": "ada"
+          },
+          {
+            "id": 7,
+            "modified": 1007,
+            "title": "seed-7",
+            "username": "ada"
+          },
+          {
+            "id": 6,
+            "modified": 1006,
+            "title": "seed-6",
+            "username": "ada"
+          },
+          {
+            "id": 5,
+            "modified": 1005,
+            "title": "seed-5",
+            "username": "ada"
+          },
+          {
+            "id": 4,
+            "modified": 1004,
+            "title": "seed-4",
+            "username": "ada"
+          }
+        ],
+        "sessionRows": [
+          {
+            "id": 51,
+            "modified": 6000,
+            "title": "newest-a",
+            "username": "ada"
+          },
+          {
+            "id": 50,
+            "modified": 5000,
+            "title": "overlap-a",
+            "username": "ada"
+          },
+          {
+            "id": 11,
+            "modified": 1011,
+            "title": "seed-11",
+            "username": "ada"
+          },
+          {
+            "id": 10,
+            "modified": 1010,
+            "title": "seed-10",
+            "username": "ada"
+          },
+          {
+            "id": 9,
+            "modified": 1009,
+            "title": "seed-9",
+            "username": "ada"
+          },
+          {
+            "id": 8,
+            "modified": 1008,
+            "title": "seed-8",
+            "username": "ada"
+          },
+          {
+            "id": 7,
+            "modified": 1007,
+            "title": "seed-7",
+            "username": "ada"
+          },
+          {
+            "id": 6,
+            "modified": 1006,
+            "title": "seed-6",
+            "username": "ada"
+          },
+          {
+            "id": 5,
+            "modified": 1005,
+            "title": "seed-5",
+            "username": "ada"
+          },
+          {
+            "id": 4,
+            "modified": 1004,
+            "title": "seed-4",
+            "username": "ada"
+          }
+        ]
+      },
+      "b": {
+        "cursor": {
+          "lsn": "0/1BF1038",
+          "offset": "0000000000000000_0000000000000658"
+        },
+        "membershipCount": 10,
+        "rows": [
+          {
+            "id": 12,
+            "modified": 7000,
+            "title": "neutral-b-update",
+            "username": "bob"
+          },
+          {
+            "id": 112,
+            "modified": 1112,
+            "title": "seed-112",
+            "username": "bob"
+          },
+          {
+            "id": 111,
+            "modified": 1111,
+            "title": "seed-111",
+            "username": "bob"
+          },
+          {
+            "id": 110,
+            "modified": 1110,
+            "title": "seed-110",
+            "username": "bob"
+          },
+          {
+            "id": 109,
+            "modified": 1109,
+            "title": "seed-109",
+            "username": "bob"
+          },
+          {
+            "id": 108,
+            "modified": 1108,
+            "title": "seed-108",
+            "username": "bob"
+          },
+          {
+            "id": 107,
+            "modified": 1107,
+            "title": "seed-107",
+            "username": "bob"
+          },
+          {
+            "id": 106,
+            "modified": 1106,
+            "title": "seed-106",
+            "username": "bob"
+          },
+          {
+            "id": 105,
+            "modified": 1105,
+            "title": "seed-105",
+            "username": "bob"
+          },
+          {
+            "id": 104,
+            "modified": 1104,
+            "title": "seed-104",
+            "username": "bob"
+          }
+        ],
+        "sessionRows": [
+          {
+            "id": 12,
+            "modified": 7000,
+            "title": "neutral-b-update",
+            "username": "bob"
+          },
+          {
+            "id": 112,
+            "modified": 1112,
+            "title": "seed-112",
+            "username": "bob"
+          },
+          {
+            "id": 111,
+            "modified": 1111,
+            "title": "seed-111",
+            "username": "bob"
+          },
+          {
+            "id": 110,
+            "modified": 1110,
+            "title": "seed-110",
+            "username": "bob"
+          },
+          {
+            "id": 109,
+            "modified": 1109,
+            "title": "seed-109",
+            "username": "bob"
+          },
+          {
+            "id": 108,
+            "modified": 1108,
+            "title": "seed-108",
+            "username": "bob"
+          },
+          {
+            "id": 107,
+            "modified": 1107,
+            "title": "seed-107",
+            "username": "bob"
+          },
+          {
+            "id": 106,
+            "modified": 1106,
+            "title": "seed-106",
+            "username": "bob"
+          },
+          {
+            "id": 105,
+            "modified": 1105,
+            "title": "seed-105",
+            "username": "bob"
+          },
+          {
+            "id": 104,
+            "modified": 1104,
+            "title": "seed-104",
+            "username": "bob"
+          }
+        ]
+      },
+      "canonicalIssueCount": 20,
+      "canonicalIssueIDs": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        50,
+        51,
+        104,
+        105,
+        106,
+        107,
+        108,
+        109,
+        110,
+        111,
+        112
+      ],
+      "name": "neutral-update"
+    },
+    "b-after-a-close-observed.json": {
+      "a": {
+        "cursor": {
+          "lsn": "0/1BF0EB0",
+          "offset": "0000000000000000_0000000000000759"
+        },
+        "membershipCount": 10,
+        "rows": [
+          {
+            "id": 51,
+            "modified": 6000,
+            "title": "newest-a",
+            "username": "ada"
+          },
+          {
+            "id": 50,
+            "modified": 5000,
+            "title": "overlap-a",
+            "username": "ada"
+          },
+          {
+            "id": 11,
+            "modified": 1011,
+            "title": "seed-11",
+            "username": "ada"
+          },
+          {
+            "id": 10,
+            "modified": 1010,
+            "title": "seed-10",
+            "username": "ada"
+          },
+          {
+            "id": 9,
+            "modified": 1009,
+            "title": "seed-9",
+            "username": "ada"
+          },
+          {
+            "id": 8,
+            "modified": 1008,
+            "title": "seed-8",
+            "username": "ada"
+          },
+          {
+            "id": 7,
+            "modified": 1007,
+            "title": "seed-7",
+            "username": "ada"
+          },
+          {
+            "id": 6,
+            "modified": 1006,
+            "title": "seed-6",
+            "username": "ada"
+          },
+          {
+            "id": 5,
+            "modified": 1005,
+            "title": "seed-5",
+            "username": "ada"
+          },
+          {
+            "id": 4,
+            "modified": 1004,
+            "title": "seed-4",
+            "username": "ada"
+          }
+        ],
+        "sessionRows": [
+          {
+            "id": 51,
+            "modified": 6000,
+            "title": "newest-a",
+            "username": "ada"
+          },
+          {
+            "id": 50,
+            "modified": 5000,
+            "title": "overlap-a",
+            "username": "ada"
+          },
+          {
+            "id": 11,
+            "modified": 1011,
+            "title": "seed-11",
+            "username": "ada"
+          },
+          {
+            "id": 10,
+            "modified": 1010,
+            "title": "seed-10",
+            "username": "ada"
+          },
+          {
+            "id": 9,
+            "modified": 1009,
+            "title": "seed-9",
+            "username": "ada"
+          },
+          {
+            "id": 8,
+            "modified": 1008,
+            "title": "seed-8",
+            "username": "ada"
+          },
+          {
+            "id": 7,
+            "modified": 1007,
+            "title": "seed-7",
+            "username": "ada"
+          },
+          {
+            "id": 6,
+            "modified": 1006,
+            "title": "seed-6",
+            "username": "ada"
+          },
+          {
+            "id": 5,
+            "modified": 1005,
+            "title": "seed-5",
+            "username": "ada"
+          },
+          {
+            "id": 4,
+            "modified": 1004,
+            "title": "seed-4",
+            "username": "ada"
+          }
+        ]
+      },
+      "b": {
+        "cursor": {
+          "lsn": "0/1BF1278",
+          "offset": "0000000000000000_0000000000000988"
+        },
+        "membershipCount": 10,
+        "rows": [
+          {
+            "id": 12,
+            "modified": 7000,
+            "title": "b-after-a-close",
+            "username": "bob"
+          },
+          {
+            "id": 112,
+            "modified": 1112,
+            "title": "seed-112",
+            "username": "bob"
+          },
+          {
+            "id": 111,
+            "modified": 1111,
+            "title": "seed-111",
+            "username": "bob"
+          },
+          {
+            "id": 110,
+            "modified": 1110,
+            "title": "seed-110",
+            "username": "bob"
+          },
+          {
+            "id": 109,
+            "modified": 1109,
+            "title": "seed-109",
+            "username": "bob"
+          },
+          {
+            "id": 108,
+            "modified": 1108,
+            "title": "seed-108",
+            "username": "bob"
+          },
+          {
+            "id": 107,
+            "modified": 1107,
+            "title": "seed-107",
+            "username": "bob"
+          },
+          {
+            "id": 106,
+            "modified": 1106,
+            "title": "seed-106",
+            "username": "bob"
+          },
+          {
+            "id": 105,
+            "modified": 1105,
+            "title": "seed-105",
+            "username": "bob"
+          },
+          {
+            "id": 104,
+            "modified": 1104,
+            "title": "seed-104",
+            "username": "bob"
+          }
+        ],
+        "sessionRows": [
+          {
+            "id": 12,
+            "modified": 7000,
+            "title": "b-after-a-close",
+            "username": "bob"
+          },
+          {
+            "id": 112,
+            "modified": 1112,
+            "title": "seed-112",
+            "username": "bob"
+          },
+          {
+            "id": 111,
+            "modified": 1111,
+            "title": "seed-111",
+            "username": "bob"
+          },
+          {
+            "id": 110,
+            "modified": 1110,
+            "title": "seed-110",
+            "username": "bob"
+          },
+          {
+            "id": 109,
+            "modified": 1109,
+            "title": "seed-109",
+            "username": "bob"
+          },
+          {
+            "id": 108,
+            "modified": 1108,
+            "title": "seed-108",
+            "username": "bob"
+          },
+          {
+            "id": 107,
+            "modified": 1107,
+            "title": "seed-107",
+            "username": "bob"
+          },
+          {
+            "id": 106,
+            "modified": 1106,
+            "title": "seed-106",
+            "username": "bob"
+          },
+          {
+            "id": 105,
+            "modified": 1105,
+            "title": "seed-105",
+            "username": "bob"
+          },
+          {
+            "id": 104,
+            "modified": 1104,
+            "title": "seed-104",
+            "username": "bob"
+          }
+        ]
+      },
+      "canonicalIssueCount": 20,
+      "canonicalIssueIDs": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        50,
+        51,
+        104,
+        105,
+        106,
+        107,
+        108,
+        109,
+        110,
+        111,
+        112
+      ],
+      "name": "b-after-a-close"
+    }
+  },
+  "swiftLog": "Fetching https://github.com/groue/GRDB.swift.git from cache\nFetched https://github.com/groue/GRDB.swift.git from cache (0.40s)\nComputing version for https://github.com/groue/GRDB.swift.git\nComputed https://github.com/groue/GRDB.swift.git at 7.11.1 (0.81s)\nComputed https://github.com/groue/GRDB.swift.git at 7.11.1 (0.00s)\nCreating working copy for https://github.com/groue/GRDB.swift.git\nWorking copy of https://github.com/groue/GRDB.swift.git resolved at 7.11.1\nBuilding for debugging...\n[0/12] Write sources\n[0/12] Copying Info.plist\n[0/12] Write sources\n[5/12] Copying PrivacyInfo.xcprivacy\n[7/12] Write LinearLiteRealFilteredWindows-entitlement.plist\n[8/12] Write swift-version-3CD7052B146186F2.txt\n[10/170] Compiling GRDB MutablePersistableRecord+Update.swift\n[11/170] Compiling GRDB MutablePersistableRecord+Upsert.swift\n[12/170] Compiling GRDB MutablePersistableRecord.swift\n[13/170] Compiling GRDB PersistableRecord+Insert.swift\n[14/170] Compiling GRDB PersistableRecord+Save.swift\n[15/170] Compiling GRDB PersistableRecord+Upsert.swift\n[16/170] Compiling GRDB PersistableRecord.swift\n[17/170] Compiling GRDB Record.swift\n[18/170] Compiling GRDB TableRecord.swift\n[19/170] Compiling GRDB CaseInsensitiveIdentifier.swift\n[20/170] Compiling GRDB Inflections+English.swift\n[21/170] Compiling GRDB Inflections.swift\n[22/170] Compiling GRDB Mutex.swift\n[23/170] Compiling GRDB OnDemandFuture.swift\n[24/170] Compiling GRDB OrderedDictionary.swift\n[25/170] Compiling GRDB Pool.swift\n[26/186] Compiling GRDB FTS3Pattern.swift\n[27/186] Compiling GRDB FTS3TokenizerDescriptor.swift\n[28/186] Compiling GRDB FTS4.swift\n[29/186] Compiling GRDB FTS5.swift\n[30/186] Compiling GRDB FTS5CustomTokenizer.swift\n[31/186] Compiling GRDB FTS5Pattern.swift\n[32/186] Compiling GRDB FTS5Tokenizer.swift\n[33/186] Compiling GRDB FTS5TokenizerDescriptor.swift\n[34/186] Compiling GRDB FTS5WrapperTokenizer.swift\n[35/186] Compiling GRDB Fixits.swift\n[36/186] Compiling GRDB JSONColumn.swift\n[37/186] Compiling GRDB SQLJSONExpressible.swift\n[38/186] Compiling GRDB SQLJSONFunctions.swift\n[39/186] Compiling GRDB DatabaseMigrator.swift\n[40/186] Compiling GRDB Migration.swift\n[41/186] Compiling GRDB FTS3+QueryInterface.swift\n[42/186] Compiling GRDB FTS5+QueryInterface.swift\n[43/186] Compiling ElectricCircuitsSwift StreamMaterialization.swift\n[44/186] Compiling ElectricCircuitsSwift Telemetry.swift\n[45/186] Compiling ElectricCircuitsSwift ShapeSubscriptionCoordinator.swift\n[46/186] Emitting module ElectricCircuitsSwift\n[47/186] Compiling ElectricCircuitsSwift ElectricCircuitsSwift.swift\n[48/186] Compiling GRDB DatabaseValueConvertible+RawRepresentable.swift\n[49/186] Compiling GRDB JSONRequiredEncoder.swift\n[50/186] Compiling GRDB Optional.swift\n[51/186] Compiling GRDB StandardLibrary.swift\n[52/186] Compiling GRDB TransactionClock.swift\n[53/186] Compiling GRDB TransactionObserver.swift\n[54/186] Compiling GRDB WALSnapshot.swift\n[55/186] Compiling GRDB WALSnapshotTransaction.swift\n[56/186] Compiling GRDB Database+Dump.swift\n[57/186] Compiling GRDB DatabaseReader+dump.swift\n[58/186] Compiling GRDB DumpFormat.swift\n[59/186] Compiling GRDB DebugDumpFormat.swift\n[60/186] Compiling GRDB JSONDumpFormat.swift\n[61/186] Compiling GRDB LineDumpFormat.swift\n[62/186] Compiling GRDB ListDumpFormat.swift\n[63/186] Compiling GRDB QuoteDumpFormat.swift\n[64/186] Compiling GRDB FTS3.swift\n[65/186] Compiling GRDB StatementAuthorizer.swift\n[66/186] Compiling GRDB StatementColumnConvertible.swift\n[67/186] Compiling GRDB CGFloat.swift\n[68/186] Compiling GRDB Data.swift\n[69/186] Compiling GRDB DatabaseDateComponents.swift\n[70/186] Compiling GRDB DatabaseValueConvertible+ReferenceConvertible.swift\n[71/186] Compiling GRDB Date.swift\n[72/186] Compiling GRDB Decimal.swift\n[73/186] Compiling GRDB NSData.swift\n[74/186] Compiling GRDB NSNull.swift\n[75/186] Compiling GRDB NSNumber.swift\n[76/186] Compiling GRDB NSString.swift\n[77/186] Compiling GRDB SQLiteDateParser.swift\n[78/186] Compiling GRDB URL.swift\n[79/186] Compiling GRDB UUID.swift\n[80/186] Compiling GRDB DatabaseValueConvertible+Decodable.swift\n[81/186] Compiling GRDB DatabaseValueConvertible+Encodable.swift\n[82/186] Emitting module GRDB\n[83/186] Compiling GRDB SQLForeignKeyRequest.swift\n[84/186] Compiling GRDB SQLFunctions.swift\n[85/186] Compiling GRDB SQLOperators.swift\n[86/186] Compiling GRDB SQLOrdering.swift\n[87/186] Compiling GRDB SQLRelation.swift\n[88/186] Compiling GRDB SQLSelection.swift\n[89/186] Compiling GRDB SQLSubquery.swift\n[90/186] Compiling GRDB Table.swift\n[91/186] Compiling GRDB SQLColumnGenerator.swift\n[92/186] Compiling GRDB SQLGenerationContext.swift\n[93/186] Compiling GRDB SQLIndexGenerator.swift\n[94/186] Compiling GRDB SQLQueryGenerator.swift\n[95/186] Compiling GRDB SQLTableAlterationGenerator.swift\n[96/186] Compiling GRDB SQLTableGenerator.swift\n[97/186] Compiling GRDB TableAlias.swift\n[98/186] Compiling GRDB SQLInterpolation+QueryInterface.swift\n[99/186] Compiling GRDB ColumnDefinition.swift\n[100/186] Compiling GRDB Database+SchemaDefinition.swift\n[101/186] Compiling GRDB ForeignKeyDefinition.swift\n[102/186] Compiling GRDB IndexDefinition.swift\n[103/186] Compiling GRDB TableAlteration.swift\n[104/186] Compiling GRDB TableDefinition.swift\n[105/186] Compiling GRDB VirtualTableModule.swift\n[106/186] Compiling GRDB TableRecord+Association.swift\n[107/186] Compiling GRDB TableRecord+QueryInterfaceRequest.swift\n[108/186] Compiling GRDB EncodableRecord+Encodable.swift\n[109/186] Compiling GRDB EncodableRecord.swift\n[110/186] Compiling GRDB FetchableRecord+Decodable.swift\n[111/186] Compiling GRDB FetchableRecord+TableRecord.swift\n[112/186] Compiling GRDB FetchableRecord.swift\n[113/186] Compiling GRDB MutablePersistableRecord+DAO.swift\n[114/186] Compiling GRDB MutablePersistableRecord+Delete.swift\n[115/186] Compiling GRDB MutablePersistableRecord+Insert.swift\n[116/186] Compiling GRDB MutablePersistableRecord+Save.swift\n[117/186] Compiling GRDB DatabaseSchemaSource.swift\n[118/186] Compiling GRDB DatabaseSnapshot.swift\n[119/186] Compiling GRDB DatabaseSnapshotPool.swift\n[120/186] Compiling GRDB DatabaseValue.swift\n[121/186] Compiling GRDB DatabaseValueConvertible.swift\n[122/186] Compiling GRDB DatabaseWriter.swift\n[123/186] Compiling GRDB DispatchQueueActor.swift\n[124/186] Compiling GRDB FetchRequest.swift\n[125/186] Compiling GRDB Row.swift\n[126/186] Compiling GRDB RowAdapter.swift\n[127/186] Compiling GRDB RowDecodingError.swift\n[128/186] Compiling GRDB SQL.swift\n[129/186] Compiling GRDB SQLInterpolation.swift\n[130/186] Compiling GRDB SQLRequest.swift\n[131/186] Compiling GRDB SchedulingWatchdog.swift\n[132/186] Compiling GRDB SerializedDatabase.swift\n[133/186] Compiling GRDB Statement.swift\n[134/186] Compiling GRDB ReadWriteLock.swift\n[135/186] Compiling GRDB ReceiveValuesOn.swift\n[136/186] Compiling GRDB Refinable.swift\n[137/186] Compiling GRDB Utils.swift\n[138/186] Compiling GRDB DatabaseCancellable.swift\n[139/186] Compiling GRDB ValueConcurrentObserver.swift\n[140/186] Compiling GRDB ValueWriteOnlyObserver.swift\n[141/186] Compiling GRDB Fetch.swift\n[142/186] Compiling GRDB Map.swift\n[143/186] Compiling GRDB RemoveDuplicates.swift\n[144/186] Compiling GRDB Trace.swift\n[145/186] Compiling GRDB ValueReducer.swift\n[146/186] Compiling GRDB SharedValueObservation.swift\n[147/186] Compiling GRDB ValueObservation.swift\n[148/186] Compiling GRDB ValueObservationScheduler.swift\n[149/186] Compiling GRDB resource_bundle_accessor.swift\n[150/186] Compiling GRDB ForeignKey.swift\n[151/186] Compiling GRDB Association.swift\n[152/186] Compiling GRDB AssociationAggregate.swift\n[153/186] Compiling GRDB BelongsToAssociation.swift\n[154/186] Compiling GRDB HasManyAssociation.swift\n[155/186] Compiling GRDB HasManyThroughAssociation.swift\n[156/186] Compiling GRDB HasOneAssociation.swift\n[157/186] Compiling GRDB HasOneThroughAssociation.swift\n[158/186] Compiling GRDB JoinAssociation.swift\n[159/186] Compiling GRDB CommonTableExpression.swift\n[160/186] Compiling GRDB QueryInterfaceRequest.swift\n[161/186] Compiling GRDB RequestProtocols.swift\n[162/186] Compiling GRDB Column.swift\n[163/186] Compiling GRDB DatabasePromise.swift\n[164/186] Compiling GRDB SQLAssociation.swift\n[165/186] Compiling GRDB SQLCollection.swift\n[166/186] Compiling GRDB SQLExpression.swift\n[167/186] Compiling GRDB Configuration.swift\n[168/186] Compiling GRDB Cursor.swift\n[169/186] Compiling GRDB Database+SQLCipher.swift\n[170/186] Compiling GRDB Database+Schema.swift\n[171/186] Compiling GRDB Database+Statements.swift\n[172/186] Compiling GRDB Database.swift\n[173/186] Compiling GRDB DatabaseBackupProgress.swift\n[174/186] Compiling GRDB DatabaseCollation.swift\n[175/186] Compiling GRDB DatabaseError.swift\n[176/186] Compiling GRDB DatabaseFunction.swift\n[177/186] Compiling GRDB DatabasePool.swift\n[178/186] Compiling GRDB DatabasePublishers.swift\n[179/186] Compiling GRDB DatabaseQueue.swift\n[180/186] Compiling GRDB DatabaseReader.swift\n[181/186] Compiling GRDB DatabaseRegion.swift\n[182/186] Compiling GRDB DatabaseRegionObservation.swift\n[183/186] Compiling GRDB DatabaseSchemaCache.swift\n[184/188] Compiling LinearLiteGRDB LinearLiteShapeMaterializer.swift\n[185/188] Emitting module LinearLiteGRDB\n[186/194] Compiling LinearLiteApp LinearLiteRootView.swift\n[187/194] Emitting module LinearLiteApp\n[188/194] Compiling LinearLiteApp LinearLiteIssuesView.swift\n[189/194] Compiling LinearLiteApp LinearLiteRecentSubsetWindow.swift\n[190/194] Compiling LinearLiteApp LinearLiteHostConfiguration.swift\n[191/194] Compiling LinearLiteApp LinearLiteSession.swift\n[192/196] Emitting module LinearLiteRealFilteredWindows\n[193/196] Compiling LinearLiteRealFilteredWindows main.swift\n[193/196] Write Objects.LinkFileList\n[194/196] Linking LinearLiteRealFilteredWindows\n[195/196] Applying LinearLiteRealFilteredWindows\nBuild of product 'LinearLiteRealFilteredWindows' complete! (13.75s)\n",
+  "cleanup": {
+    "swiftReaped": true,
+    "listenersGone": true,
+    "pgDataRemoved": true,
+    "scratchClean": true,
+    "rootRemoved": true,
+    "error": ""
+  }
+}

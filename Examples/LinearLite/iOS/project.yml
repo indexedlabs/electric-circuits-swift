@@ -1,0 +1,35 @@
+name: LinearLiteHost
+options:
+  deploymentTarget:
+    iOS: "16.0"
+  bundleIdPrefix: com.electriccircuits.examples
+packages:
+  LinearLite:
+    path: ..
+targets:
+  LinearLiteHost:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: LinearLiteHostApp.swift
+      - path: LinearLiteHostLifecycleAdapter.swift
+    info:
+      path: Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.electriccircuits.examples.linearlite
+        INFOPLIST_KEY_CFBundleDisplayName: LinearLite
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
+        SWIFT_VERSION: "6.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+    dependencies:
+      - package: LinearLite
+        product: LinearLiteApp
+schemes:
+  LinearLiteHost:
+    build:
+      targets:
+        LinearLiteHost: all
+    run:
+      config: Debug

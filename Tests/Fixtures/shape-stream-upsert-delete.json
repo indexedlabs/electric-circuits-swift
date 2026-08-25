@@ -1,0 +1,26 @@
+[
+  {
+    "type": "public.issues",
+    "key": "42",
+    "value": {"id": 42, "title": "First"},
+    "headers": {
+      "operation": "upsert",
+      "txid": "txn-7",
+      "offset": "server-stamped",
+      "lsn": "0/16B6A20",
+      "last": true
+    }
+  },
+  {
+    "type": "public.issues",
+    "key": "41",
+    "old": {"id": 41, "title": "Removed"},
+    "headers": {
+      "operation": "delete",
+      "txid": "txn-7",
+      "lsn": "0/16B6A20",
+      "seq": 1,
+      "last": true
+    }
+  }
+]

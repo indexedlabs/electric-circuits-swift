@@ -1,0 +1,38 @@
+name: Swift package quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swift-package-quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      XCODEGEN_BIN_DIR: ${{ runner.temp }}/xcodegen
+    steps:
+      - name: Check out the exact workflow commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Report selected toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Install checksum-pinned XcodeGen
+        run: Scripts/install-xcodegen.sh --bin-dir "$XCODEGEN_BIN_DIR"
+
+      - name: Run reproducible package-quality gates
+        run: Scripts/quality.sh
