@@ -29,11 +29,15 @@ required_files=(
   Sources/ElectricCircuitsSwift/ElectricCircuitsSwift.docc/Telemetry.md
   Policies/SUPPORT.md
   Policies/SEMVER.md
+  CHANGELOG.md
+  Docs/RELEASING.md
   .github/workflows/swift.yml
   Scripts/quality.sh
   Scripts/check-swift-format.sh
   Scripts/install-xcodegen.sh
   Scripts/generate-linear-lite-host-project.sh
+  Scripts/assert-versioned-package-resolved.swift
+  Scripts/qualify-versioned-linearlite-host.sh
   Examples/LinearLite/iOS/project.yml
   Examples/LinearLite/iOS/LinearLiteHost.xcodeproj/project.pbxproj
 )
@@ -55,6 +59,9 @@ require_text Policies/SUPPORT.md 'macOS 13'
 require_text Policies/SEMVER.md 'major'
 require_text Policies/SEMVER.md 'minor'
 require_text Policies/SEMVER.md 'patch'
+require_text CHANGELOG.md '0.1.0'
+require_text Docs/RELEASING.md '.package(url:'
+require_text Docs/RELEASING.md 'exact: "0.1.0"'
 require_text .github/workflows/swift.yml \
   'actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0'
 require_text .github/workflows/swift.yml 'macos-15'
@@ -62,5 +69,8 @@ require_text .github/workflows/swift.yml 'Xcode_26.3.app'
 require_text Scripts/quality.sh 'docc convert'
 require_text Scripts/quality.sh 'CODE_SIGNING_ALLOWED=NO'
 require_text Scripts/generate-linear-lite-host-project.sh 'cmp -s'
+require_text Scripts/assert-versioned-package-resolved.swift 'JSONDecoder'
+require_text Scripts/qualify-versioned-linearlite-host.sh 'git clone --quiet --no-local'
+require_text Scripts/qualify-versioned-linearlite-host.sh 'exact: "0.1.0"'
 
 printf 'package-quality: manifest is complete\n'

@@ -40,6 +40,10 @@ xcrun docc convert Sources/ElectricCircuitsSwift/ElectricCircuitsSwift.docc \
 
 Scripts/generate-linear-lite-host-project.sh
 
+# This is release-consumer qualification, not the normal development dependency path. It proves
+# that the actual host can resolve the core from an exact source-control version in isolation.
+Scripts/qualify-versioned-linearlite-host.sh
+
 xcodebuild -project Examples/LinearLite/iOS/LinearLiteHost.xcodeproj -scheme LinearLiteHost \
   -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -configuration Debug \
   -derivedDataPath "$work_dir/DerivedData" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
