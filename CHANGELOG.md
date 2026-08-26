@@ -3,6 +3,14 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
+## Unreleased
+
+- Add the storage-neutral `ElectricCircuitsCollections` product with typed predicates, exact-demand
+  lease sharing, an atomic row-claim/snapshot/cursor store contract, and an in-memory reference store.
+- Add the native subset snapshot + changes-feed source adapter with an awaited live-apply boundary and
+  stable subset-feed claim renewal.
+- Allow `ShapeSubscriptionCoordinator` to own either ordinary shapes or subset-feed claims.
+
 ## 0.1.0 — Initial release
 
 - Foundation-only SwiftPM client for Electric Circuits native `/v1` lifecycle, subset-query, and

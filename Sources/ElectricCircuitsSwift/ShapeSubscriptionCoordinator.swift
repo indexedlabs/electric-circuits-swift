@@ -156,6 +156,12 @@ public enum ShapeSubscriptionState: Equatable, Sendable {
   case failed(ShapeSubscriptionFailure)
 }
 
+/// Native claim route used for initial creation and stable-subscription renewal.
+public enum ShapeSubscriptionKind: Equatable, Sendable {
+  case shape
+  case subsetFeed
+}
+
 private struct MaterializerFailure: Error, Sendable {}
 private struct CoordinatedMaterializer: ShapeMaterializer {
   let base: any ShapeMaterializer
@@ -198,6 +204,7 @@ public actor ShapeSubscriptionCoordinator {
   private let capacity: ShapeSubscriptionCapacity?
   private let responseDecodingLimits: ResponseDecodingLimits
   private let telemetry: TelemetryReporter
+  private let kind: ShapeSubscriptionKind
   private var continuation: AsyncStream<ShapeSubscriptionState>.Continuation?
   private var handle: ShapeHandle?
   private var pendingRelease: [ShapeHandle] = []
@@ -236,7 +243,8 @@ public actor ShapeSubscriptionCoordinator {
     clock: any ShapeSubscriptionClock = ContinuousShapeSubscriptionClock(),
     capacity: ShapeSubscriptionCapacity? = nil,
     responseDecodingLimits: ResponseDecodingLimits = .default,
-    telemetry: TelemetryReporter = .noop
+    telemetry: TelemetryReporter = .noop,
+    kind: ShapeSubscriptionKind = .shape
   ) {
     self.client = client
     self.transport = transport
@@ -247,6 +255,7 @@ public actor ShapeSubscriptionCoordinator {
     self.capacity = capacity
     self.responseDecodingLimits = responseDecodingLimits
     self.telemetry = telemetry
+    self.kind = kind
     let updates = AsyncStream<ShapeSubscriptionState>.makeStream()
     stateUpdates = updates.stream
     continuation = updates.continuation
@@ -607,7 +616,12 @@ public actor ShapeSubscriptionCoordinator {
     }
     try Task.checkCancellation()
     return try await retrying(operation: "create") {
-      try await self.client.createShape(self.request)
+      switch self.kind {
+      case .shape:
+        try await self.client.createShape(self.request)
+      case .subsetFeed:
+        try await self.client.createSubsetFeed(self.request)
+      }
     }
   }
 
@@ -641,7 +655,14 @@ public actor ShapeSubscriptionCoordinator {
     await capacity.release(permit)
   }
   private func renewWithRetry() async throws -> ShapeHandle {
-    try await retrying(operation: "renew") { try await self.client.renewShape(self.request) }
+    try await retrying(operation: "renew") {
+      switch self.kind {
+      case .shape:
+        try await self.client.renewShape(self.request)
+      case .subsetFeed:
+        try await self.client.createSubsetFeed(self.request)
+      }
+    }
   }
 
   private func releasePending() async throws {

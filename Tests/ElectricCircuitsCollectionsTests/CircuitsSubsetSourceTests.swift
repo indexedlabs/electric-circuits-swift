@@ -1,0 +1,167 @@
+import ElectricCircuitsCollections
+import ElectricCircuitsSwift
+import Foundation
+import Testing
+
+#if canImport(FoundationNetworking)
+  import FoundationNetworking
+#endif
+
+private struct NativeIssue: Equatable, Sendable {
+  let id: Int64
+  let title: String
+
+  init(id: Int64, title: String) {
+    self.id = id
+    self.title = title
+  }
+
+  init(row: ChangeRow) throws {
+    guard case .int(let id) = row["id"], case .string(let title) = row["title"] else {
+      throw DecodeFailure()
+    }
+    self.id = id
+    self.title = title
+  }
+
+  struct DecodeFailure: Error {}
+}
+
+private actor NativeSubsetTransport: HTTPTransport {
+  private(set) var requests: [URLRequest] = []
+  private var streamReads = 0
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    let path = request.url?.path ?? ""
+    switch (request.httpMethod, path) {
+    case ("POST", "/v1/subset-feeds"):
+      return response(
+        #"{"shapeId":"shape-1","table":"public.issues","streamPath":"/streams/shape-1","streamUrl":"https://streams.test/streams/shape-1"}"#,
+        request: request)
+    case ("HEAD", "/streams/shape-1"):
+      return response("", request: request, headers: ["stream-next-offset": "10"])
+    case ("POST", "/v1/subsets/query"):
+      return response(
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/10"}"#,
+        request: request)
+    case ("GET", "/streams/shape-1"):
+      streamReads += 1
+      if streamReads == 1 {
+        return response(
+          #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"Live"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#,
+          request: request,
+          headers: ["stream-next-offset": "11"])
+      }
+      try await Task.sleep(for: .seconds(3_600))
+      throw CancellationError()
+    case ("DELETE", "/v1/shapes/shape-1"):
+      return response("", request: request, status: 204)
+    default:
+      return response("unexpected", request: request, status: 500)
+    }
+  }
+
+  private func response(
+    _ body: String,
+    request: URLRequest,
+    status: Int = 200,
+    headers: [String: String] = [:]
+  ) -> HTTPResponse {
+    HTTPResponse(
+      data: Data(body.utf8),
+      response: HTTPURLResponse(
+        url: request.url!,
+        statusCode: status,
+        httpVersion: nil,
+        headerFields: headers)!)
+  }
+}
+
+private actor AppliedNativeBatches {
+  private var batches: [CollectionChangeBatch<NativeIssue, Int64>] = []
+
+  func append(_ batch: CollectionChangeBatch<NativeIssue, Int64>) {
+    batches.append(batch)
+  }
+
+  func values() -> [CollectionChangeBatch<NativeIssue, Int64>] { batches }
+}
+
+@Suite("Native Circuits subset source")
+struct CircuitsSubsetSourceTests {
+  @Test func snapshotFenceThenAwaitedLiveTailUsesStableSubsetFeedClaim() async throws {
+    let transport = NativeSubsetTransport()
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let source = CircuitsSubsetSource<NativeIssue, Int64>(
+      client: client,
+      transport: transport,
+      table: "public.issues",
+      columns: ["id", "title"],
+      retryPolicy: ShapeSubscriptionRetryPolicy(maxRetries: 0),
+      decodeRow: NativeIssue.init(row:),
+      decodeKey: { key in
+        guard let id = Int64(key) else { throw CircuitsSubsetSourceError.invalidLiveKey(key) }
+        return id
+      }
+    )
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: CollectionID(rawValue: "issues"), key: \.id)
+    let scope = CollectionScope(
+      principal: "user-1", authorization: "workspace-1", generation: "generation-1")
+    let demand = CollectionDemand<NativeIssue>(
+      predicateIdentity: "status=open",
+      sourcePredicate: .leaf(column: "status", op: .eq, value: .string("open")),
+      order: [
+        CollectionOrder(fieldID: "modified", sourceName: "modified_at", direction: .descending)
+      ],
+      limit: 10
+    )
+    let identity = demand.identity(for: definition, scope: scope)
+    let materializationID = CollectionMaterializationID(rawValue: "issues-open-recent")
+
+    let session = try await source.materialize(
+      demand, identity: identity, materializationID: materializationID)
+
+    #expect(session.snapshot.rows == [NativeIssue(id: 1, title: "Snapshot")])
+    #expect(session.snapshot.cursor == StreamCursor(offset: "10", lsn: "0/10"))
+    #expect(session.snapshot.fence.rawValue.contains("0/10"))
+
+    let applied = AppliedNativeBatches()
+    let run = Task {
+      try await session.run { batch in await applied.append(batch) }
+    }
+    for _ in 0..<10_000 {
+      if await applied.values().count == 1 { break }
+      await Task.yield()
+    }
+    let batch = try #require(await applied.values().first)
+    #expect(batch.expectedCursor == StreamCursor(offset: "10", lsn: "0/10"))
+    #expect(batch.cursor == StreamCursor(offset: "11", lsn: "0/20"))
+    guard case .upsert(let issue) = try #require(batch.changes.first) else {
+      Issue.record("expected an upsert")
+      await session.stop()
+      return
+    }
+    #expect(issue == NativeIssue(id: 1, title: "Live"))
+
+    await session.stop()
+    try await run.value
+
+    let requests = await transport.requests
+    let subsetCreates = requests.filter {
+      $0.httpMethod == "POST" && $0.url?.path == "/v1/subset-feeds"
+    }
+    #expect(subsetCreates.count == 2)
+    #expect(requests.contains { $0.httpMethod == "HEAD" && $0.url?.path == "/streams/shape-1" })
+    #expect(requests.contains { $0.httpMethod == "POST" && $0.url?.path == "/v1/subsets/query" })
+    #expect(requests.contains { $0.httpMethod == "DELETE" && $0.url?.path == "/v1/shapes/shape-1" })
+
+    let createBodies = try subsetCreates.map { request in
+      try JSONDecoder().decode(ShapeRequest.self, from: #require(request.httpBody))
+    }
+    #expect(createBodies.allSatisfy { $0.subscription == materializationID.rawValue })
+    #expect(createBodies.allSatisfy { $0.changesOnly == true })
+  }
+}

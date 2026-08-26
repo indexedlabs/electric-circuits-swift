@@ -20,6 +20,32 @@ tables; it can share rows across multiple filtered subscriptions without making 
 core package. Optimistic writes use a client-generated UUIDv4 `client_id` alongside the server's
 numeric primary key, so the live feed can reconcile a write without a provisional numeric key.
 
+The separate `ElectricCircuitsCollections` product adds an on-demand, normalized collection layer
+without adding a database dependency. A stable `CollectionDefinition` owns one canonical entity set;
+typed `CollectionPredicate` values compile logical field IDs into native Circuits columns; and a
+`CollectionCoordinator` de-duplicates exact demands behind independently releasable leases. Its
+`CollectionStore` transaction includes canonical rows, per-materialization row claims, snapshot
+fences, and live cursors. `InMemoryCollectionStore` is the reference provider; applications can
+implement the same contract with GRDB or another store.
+
+`CircuitsSubsetSource` performs the native on-demand handoff in causal order: establish a named
+changes-only feed, read its durable frontier, query the subset snapshot, commit it, then consume live
+batches with awaited store application. It renews the same subset-feed claim through
+`ShapeSubscriptionCoordinator`, and the producer cannot advance its local cursor until the consumer's
+atomic store callback returns.
+
+```swift
+let definition = CollectionDefinition<Issue, Int64>(
+  id: CollectionID(rawValue: "issues"), key: \.id)
+let demand = CollectionDemand(
+  predicate: IssueFields.status == "open",
+  order: [CollectionOrder(fieldID: "modified", sourceName: "modified", direction: .descending)],
+  limit: 10)
+let lease = await coordinator.acquire(demand)
+// Observe canonical rows through the application's store, then release this consumer's interest.
+await lease.release()
+```
+
 ```swift
 let client = ElectricCircuitsClient(baseURL: URL(string: "https://engine.example")!)
 let shape = try await client.createShape(ShapeRequest(table: "public.items"))
@@ -138,9 +164,11 @@ dependencies: [
 ]
 ```
 
-Add the `ElectricCircuitsSwift` product to the target that uses the client. The optional LinearLite
-GRDB provider remains a separate example package. See [the release guide](Docs/RELEASING.md) for the
-release contract and versioned-source-control consumer qualification.
+Add the `ElectricCircuitsSwift` product to targets that use only the native protocol client. Add
+`ElectricCircuitsCollections` for typed demands, leases, snapshot/live coordination, and the
+store-provider contract. The optional LinearLite GRDB provider remains a separate example package.
+See [the release guide](Docs/RELEASING.md) for the release contract and versioned-source-control
+consumer qualification.
 
 ## Local package-quality gate
 

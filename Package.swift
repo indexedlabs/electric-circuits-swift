@@ -6,6 +6,7 @@ let package = Package(
   platforms: [.iOS(.v16), .macOS(.v13)],
   products: [
     .library(name: "ElectricCircuitsSwift", targets: ["ElectricCircuitsSwift"]),
+    .library(name: "ElectricCircuitsCollections", targets: ["ElectricCircuitsCollections"]),
     .executable(
       name: "ElectricCircuitsSwiftRealStack", targets: ["ElectricCircuitsSwiftRealStack"]),
     .executable(
@@ -14,6 +15,11 @@ let package = Package(
   ],
   targets: [
     .target(name: "ElectricCircuitsSwift", path: "Sources/ElectricCircuitsSwift"),
+    .target(
+      name: "ElectricCircuitsCollections",
+      dependencies: ["ElectricCircuitsSwift"],
+      path: "Sources/ElectricCircuitsCollections"
+    ),
     .executableTarget(
       name: "ElectricCircuitsSwiftRealStack",
       dependencies: ["ElectricCircuitsSwift"],
@@ -27,5 +33,9 @@ let package = Package(
     .testTarget(
       name: "ElectricCircuitsSwiftTests", dependencies: ["ElectricCircuitsSwift"],
       path: "Tests/ElectricCircuitsSwiftTests"),
+    .testTarget(
+      name: "ElectricCircuitsCollectionsTests",
+      dependencies: ["ElectricCircuitsCollections"],
+      path: "Tests/ElectricCircuitsCollectionsTests"),
   ]
 )
