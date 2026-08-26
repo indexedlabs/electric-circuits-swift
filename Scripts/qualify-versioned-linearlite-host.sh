@@ -33,6 +33,10 @@ if [[ "$clone_revision" != "$source_revision" ]]; then
   printf 'versioned-host: throwaway clone HEAD did not match candidate %s\n' "$source_revision" >&2
   exit 1
 fi
+# A normal clone inherits published tags from the source repository. The qualification tag must
+# identify this candidate inside the throwaway clone, so remove only the clone-local inherited tag
+# before recreating it below. The source repository is never mutated.
+git -C "$release_repo" tag --delete "$version" >/dev/null 2>&1 || true
 git -C "$release_repo" tag "$version" "$source_revision"
 
 tag_revision=$(git -C "$release_repo" rev-parse "$version^{commit}")
