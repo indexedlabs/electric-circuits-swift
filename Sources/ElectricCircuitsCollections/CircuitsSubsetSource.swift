@@ -3,6 +3,7 @@ import Foundation
 
 public enum CircuitsSubsetSourceError: Error, Equatable, Sendable {
   case unsupportedOrderCount(Int)
+  case unsupportedLimitedLiveDemand(Int)
   case invalidSnapshotRow(index: Int)
   case invalidLiveKey(String)
   case subscription(ShapeSubscriptionFailure)
@@ -58,6 +59,9 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     identity: CollectionDemandIdentity,
     materializationID: CollectionMaterializationID
   ) async throws -> CollectionSourceSession<Model, Key> {
+    if let limit = demand.limit {
+      throw CircuitsSubsetSourceError.unsupportedLimitedLiveDemand(limit)
+    }
     guard demand.order.count <= 1 else {
       throw CircuitsSubsetSourceError.unsupportedOrderCount(demand.order.count)
     }

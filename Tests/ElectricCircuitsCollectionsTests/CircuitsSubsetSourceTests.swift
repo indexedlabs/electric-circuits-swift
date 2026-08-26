@@ -115,8 +115,7 @@ struct CircuitsSubsetSourceTests {
       sourcePredicate: .leaf(column: "status", op: .eq, value: .string("open")),
       order: [
         CollectionOrder(fieldID: "modified", sourceName: "modified_at", direction: .descending)
-      ],
-      limit: 10
+      ]
     )
     let identity = demand.identity(for: definition, scope: scope)
     let materializationID = CollectionMaterializationID(rawValue: "issues-open-recent")
@@ -163,5 +162,41 @@ struct CircuitsSubsetSourceTests {
     }
     #expect(createBodies.allSatisfy { $0.subscription == materializationID.rawValue })
     #expect(createBodies.allSatisfy { $0.changesOnly == true })
+  }
+
+  @Test func limitedDemandFailsBeforeCreatingAnUnmaintainedLiveFeed() async throws {
+    let transport = NativeSubsetTransport()
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let source = CircuitsSubsetSource<NativeIssue, Int64>(
+      client: client,
+      transport: transport,
+      table: "public.issues",
+      decodeRow: NativeIssue.init(row:),
+      decodeKey: { key in
+        guard let id = Int64(key) else { throw CircuitsSubsetSourceError.invalidLiveKey(key) }
+        return id
+      }
+    )
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: CollectionID(rawValue: "issues"), key: \.id)
+    let scope = CollectionScope(
+      principal: "user-1", authorization: "workspace-1", generation: "generation-1")
+    let demand = CollectionDemand<NativeIssue>(
+      predicateIdentity: "recent",
+      order: [
+        CollectionOrder(fieldID: "modified", sourceName: "modified_at", direction: .descending)
+      ],
+      limit: 10
+    )
+
+    await #expect(throws: CircuitsSubsetSourceError.unsupportedLimitedLiveDemand(10)) {
+      _ = try await source.materialize(
+        demand,
+        identity: demand.identity(for: definition, scope: scope),
+        materializationID: CollectionMaterializationID(rawValue: "issues-recent")
+      )
+    }
+    #expect(await transport.requests.isEmpty)
   }
 }

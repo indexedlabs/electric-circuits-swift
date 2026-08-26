@@ -39,12 +39,16 @@ let definition = CollectionDefinition<Issue, Int64>(
   id: CollectionID(rawValue: "issues"), key: \.id)
 let demand = CollectionDemand(
   predicate: IssueFields.status == "open",
-  order: [CollectionOrder(fieldID: "modified", sourceName: "modified", direction: .descending)],
-  limit: 10)
+  order: [CollectionOrder(fieldID: "modified", sourceName: "modified", direction: .descending)])
 let lease = await coordinator.acquire(demand)
 // Observe canonical rows through the application's store, then release this consumer's interest.
 await lease.release()
 ```
+
+`CollectionDemand.limit` is part of the provider-neutral demand identity, but
+`CircuitsSubsetSource` rejects limited live demands until a source adapter can maintain the ordered
+window across inserts, updates, deletes, and boundary refill. Use the one-shot `querySubset` API for
+a limited snapshot; do not treat an unbounded changes feed as a live top-N materialization.
 
 ```swift
 let client = ElectricCircuitsClient(baseURL: URL(string: "https://engine.example")!)
@@ -156,11 +160,11 @@ wire contract, public API, and provider-schema release rules are explicit in
 [Policies/SUPPORT.md](Policies/SUPPORT.md) and [Policies/SEMVER.md](Policies/SEMVER.md). The DocC
 catalog begins at `ElectricCircuitsSwift` in Xcode's documentation viewer.
 
-## Install 0.1.0
+## Install 0.2.0
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.1.0"),
+  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.2.0"),
 ]
 ```
 
