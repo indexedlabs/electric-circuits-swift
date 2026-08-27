@@ -44,10 +44,10 @@ let definition = CollectionDefinition<Issue, Int64>(
   id: CollectionID(rawValue: "issues"), key: \.id)
 let demand = CollectionDemand(
   predicate: IssueFields.status == "open",
-  order: [CollectionOrder(fieldID: "modified", sourceName: "modified", direction: .descending)])
+  order: [CollectionOrder(field: IssueFields.modified, direction: .descending)])
 let lease = await coordinator.acquire(demand)
 // Observe canonical rows through the application's store, then release this consumer's interest.
-await lease.release()
+try await lease.release()
 ```
 
 `CollectionDemand.limit` is part of the provider-neutral demand identity, but
