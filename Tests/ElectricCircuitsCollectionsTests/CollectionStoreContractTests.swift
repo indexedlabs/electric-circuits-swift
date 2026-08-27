@@ -182,4 +182,38 @@ struct CollectionStoreContractTests {
     #expect(await store.rows(for: identity)[1]?.title == "new")
     #expect(try await store.materialization(for: identity)?.sourceVersion == version(20))
   }
+
+  @Test func olderOverlappingUpsertRetainsItsClaimAfterNewerMaterializationEvicts() async throws {
+    let store = InMemoryCollectionStore<TestIssue, Int>(key: \.id)
+    let older = CollectionMaterializationID(rawValue: "older")
+    let newer = CollectionMaterializationID(rawValue: "newer")
+    let oldRow = TestIssue(id: 1, title: "old bytes")
+    let newRow = TestIssue(id: 1, title: "new bytes")
+
+    try await store.replaceSnapshot(
+      .init(
+        rows: [], fence: .init(rawValue: "older"), sourceVersion: version(1),
+        cursor: .init(offset: "0")),
+      materializationID: older,
+      demand: demand("older")
+    )
+    try await store.replaceSnapshot(
+      .init(rows: [newRow], fence: .init(rawValue: "newer"), sourceVersion: version(20)),
+      materializationID: newer,
+      demand: demand("newer")
+    )
+    try await store.apply(
+      .init(
+        changes: [.upsert(oldRow)], expectedCursor: .init(offset: "0"), cursor: .init(offset: "1"),
+        sourceVersion: version(10)
+      ),
+      to: older
+    )
+
+    #expect(await store.rows()[1] == newRow)
+    #expect(await store.rowClaims(for: older) == [1])
+    try await store.removeMaterialization(newer)
+    #expect(await store.rows()[1] == newRow)
+    #expect(await store.rowClaims(for: older) == [1])
+  }
 }

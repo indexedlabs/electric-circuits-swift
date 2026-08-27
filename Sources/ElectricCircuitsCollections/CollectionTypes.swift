@@ -138,15 +138,34 @@ extension CollectionDemand {
     for definition: CollectionDefinition<Model, Key>,
     scope: CollectionScope
   ) -> CollectionDemandIdentity {
-    let orderIdentity = order.map { "\($0.fieldID):\($0.direction.rawValue)" }.joined(
-      separator: ",")
-    let limitIdentity = limit.map(String.init) ?? "none"
     return CollectionDemandIdentity(
       collection: definition.id,
       scope: scope,
-      canonicalDemand:
-        "predicate=\(predicateIdentity);order=\(orderIdentity);limit=\(limitIdentity)"
+      canonicalDemand: canonicalIdentity()
     )
+  }
+
+  /// A typed, length-prefixed encoding rather than a delimiter protocol. Unsafe demand inputs are
+  /// application controlled, so every component is framed independently and provider source names
+  /// participate in identity as well as in the outbound query.
+  private func canonicalIdentity() -> String {
+    func component(_ tag: String, _ value: String) -> String {
+      "\(tag)\(value.utf8.count):\(value)"
+    }
+    let orderIdentity = order.map { order in
+      component("f", order.fieldID)
+        + component("s", order.sourceName)
+        + component("d", order.direction.rawValue)
+    }.joined()
+    let limitIdentity: String
+    if let limit {
+      limitIdentity = component("some", String(limit))
+    } else {
+      limitIdentity = "none"
+    }
+    return "collection-demand-v1|" + component("p", predicateIdentity)
+      + component("o", orderIdentity)
+      + component("l", limitIdentity)
   }
 }
 

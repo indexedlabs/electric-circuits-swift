@@ -31,13 +31,22 @@ private actor NativeSubsetTransport: HTTPTransport {
   private(set) var requests: [URLRequest] = []
   private var streamReads = 0
   private var streamBodies: [String]
+  private var headFailures: Int
+  private var queryFailures: Int
+  private var deleteFailures: Int
 
   init(
     streamBodies: [String] = [
       #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"Live"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#
-    ]
+    ],
+    headFailures: Int = 0,
+    queryFailures: Int = 0,
+    deleteFailures: Int = 0
   ) {
     self.streamBodies = streamBodies
+    self.headFailures = headFailures
+    self.queryFailures = queryFailures
+    self.deleteFailures = deleteFailures
   }
 
   func send(_ request: URLRequest) async throws -> HTTPResponse {
@@ -49,8 +58,16 @@ private actor NativeSubsetTransport: HTTPTransport {
         #"{"shapeId":"shape-1","table":"public.issues","streamPath":"/streams/shape-1","streamUrl":"https://streams.test/streams/shape-1"}"#,
         request: request)
     case ("HEAD", "/streams/shape-1"):
+      if headFailures > 0 {
+        headFailures -= 1
+        return response("head failed", request: request, status: 503)
+      }
       return response("", request: request, headers: ["stream-next-offset": "10"])
     case ("POST", "/v1/subsets/query"):
+      if queryFailures > 0 {
+        queryFailures -= 1
+        return response("query failed", request: request, status: 503)
+      }
       return response(
         #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/10"}"#,
         request: request)
@@ -64,6 +81,10 @@ private actor NativeSubsetTransport: HTTPTransport {
       try await Task.sleep(for: .seconds(3_600))
       throw CancellationError()
     case ("DELETE", "/v1/shapes/shape-1"):
+      if deleteFailures > 0 {
+        deleteFailures -= 1
+        return response("delete failed", request: request, status: 503)
+      }
       return response("", request: request, status: 204)
     default:
       return response("unexpected", request: request, status: 500)
@@ -210,9 +231,9 @@ struct CircuitsSubsetSourceTests {
     #expect(await transport.requests.isEmpty)
   }
 
-  @Test func overlapAtOrBeforeSnapshotAdvancesOffsetWithoutMutatingAndStallsSafely() async throws {
+  @Test func overlapBeforeSnapshotAdvancesOffsetWithoutMutatingAndStallsSafely() async throws {
     let transport = NativeSubsetTransport(streamBodies: [
-      #"[{"type":"public.issues","key":"1","headers":{"operation":"delete","lsn":"0/F"}},{"type":"public.issues","key":"1","value":{"id":1,"title":"Old"},"headers":{"operation":"update","lsn":"0/10"}}]"#
+      #"[{"type":"public.issues","key":"1","headers":{"operation":"delete","lsn":"0/F"}},{"type":"public.issues","key":"1","value":{"id":1,"title":"Old"},"headers":{"operation":"update","lsn":"0/F"}}]"#
     ])
     let client = ElectricCircuitsClient(
       baseURL: URL(string: "https://engine.test")!, transport: transport)
@@ -239,6 +260,112 @@ struct CircuitsSubsetSourceTests {
     #expect(batch.cursor.lsn == "0/10")
     try await session.stop()
     try await task.value
+  }
+
+  @Test func equalSnapshotBoundaryUpdateAndDeleteBothApply() async throws {
+    let transport = NativeSubsetTransport(streamBodies: [
+      #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"Boundary update"},"headers":{"operation":"update","lsn":"0/10"}},{"type":"public.issues","key":"2","headers":{"operation":"delete","lsn":"0/10"}}]"#
+    ])
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let source = CircuitsSubsetSource<NativeIssue, Int64>(
+      client: client, transport: transport, table: "public.issues",
+      retryPolicy: .init(maxRetries: 0),
+      decodeRow: NativeIssue.init(row:), decodeKey: { Int64($0) ?? 0 })
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: CollectionID(rawValue: "issues"), key: \.id)
+    let scope = CollectionScope(principal: "u", authorization: "a", generation: "g")
+    let demand = CollectionDemand<NativeIssue>(unsafePredicateIdentity: "all")
+    let session = try await source.materialize(
+      demand, identity: demand.identity(for: definition, scope: scope),
+      materializationID: .init(rawValue: "boundary"))
+    let applied = AppliedNativeBatches()
+    let task = Task { try await session.run { await applied.append($0) } }
+    for _ in 0..<10_000 where await applied.values().isEmpty { await Task.yield() }
+    let batch = try #require(await applied.values().first)
+    #expect(batch.changes.count == 2)
+    #expect(batch.sourceVersion == .init(rawValue: "0/10", order: 16))
+    try await session.stop()
+    try await task.value
+  }
+
+  @Test func allEnvelopesAtOnePostSnapshotLSNApplyTogether() async throws {
+    let transport = NativeSubsetTransport(streamBodies: [
+      #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"First"},"headers":{"operation":"update","lsn":"0/20"}},{"type":"public.issues","key":"2","value":{"id":2,"title":"Second"},"headers":{"operation":"upsert","lsn":"0/20"}},{"type":"public.issues","key":"3","headers":{"operation":"delete","lsn":"0/20"}}]"#
+    ])
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let source = CircuitsSubsetSource<NativeIssue, Int64>(
+      client: client, transport: transport, table: "public.issues",
+      retryPolicy: .init(maxRetries: 0),
+      decodeRow: NativeIssue.init(row:), decodeKey: { Int64($0) ?? 0 })
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: CollectionID(rawValue: "issues"), key: \.id)
+    let scope = CollectionScope(principal: "u", authorization: "a", generation: "g")
+    let demand = CollectionDemand<NativeIssue>(unsafePredicateIdentity: "all")
+    let session = try await source.materialize(
+      demand, identity: demand.identity(for: definition, scope: scope),
+      materializationID: .init(rawValue: "same-lsn"))
+    let applied = AppliedNativeBatches()
+    let task = Task { try await session.run { await applied.append($0) } }
+    for _ in 0..<10_000 where await applied.values().isEmpty { await Task.yield() }
+    let batch = try #require(await applied.values().first)
+    #expect(batch.changes.count == 3)
+    #expect(batch.sourceVersion == .init(rawValue: "0/20", order: 32))
+    try await session.stop()
+    try await task.value
+  }
+
+  @Test func failedHeadSetupRetainsTheFeedReleaseHandleUntilTheNextAttemptCleansIt() async throws {
+    let transport = NativeSubsetTransport(headFailures: 1, deleteFailures: 1)
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let source = CircuitsSubsetSource<NativeIssue, Int64>(
+      client: client, transport: transport, table: "public.issues",
+      decodeRow: NativeIssue.init(row:), decodeKey: { Int64($0) ?? 0 })
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: CollectionID(rawValue: "issues"), key: \.id)
+    let scope = CollectionScope(principal: "u", authorization: "a", generation: "g")
+    let demand = CollectionDemand<NativeIssue>(unsafePredicateIdentity: "all")
+    let identity = demand.identity(for: definition, scope: scope)
+    let materializationID = CollectionMaterializationID(rawValue: "head-cleanup")
+
+    await #expect(throws: CircuitsSubsetSourceError.self) {
+      _ = try await source.materialize(
+        demand, identity: identity, materializationID: materializationID)
+    }
+    #expect(await transport.requests.filter { $0.httpMethod == "DELETE" }.count == 1)
+
+    let session = try await source.materialize(
+      demand, identity: identity, materializationID: materializationID)
+    #expect(await transport.requests.filter { $0.httpMethod == "DELETE" }.count == 2)
+    try await session.stop()
+  }
+
+  @Test func failedQuerySetupRetainsTheFeedReleaseHandleUntilTheNextAttemptCleansIt() async throws {
+    let transport = NativeSubsetTransport(queryFailures: 1, deleteFailures: 1)
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let source = CircuitsSubsetSource<NativeIssue, Int64>(
+      client: client, transport: transport, table: "public.issues",
+      decodeRow: NativeIssue.init(row:), decodeKey: { Int64($0) ?? 0 })
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: CollectionID(rawValue: "issues"), key: \.id)
+    let scope = CollectionScope(principal: "u", authorization: "a", generation: "g")
+    let demand = CollectionDemand<NativeIssue>(unsafePredicateIdentity: "all")
+    let identity = demand.identity(for: definition, scope: scope)
+    let materializationID = CollectionMaterializationID(rawValue: "query-cleanup")
+
+    await #expect(throws: CircuitsSubsetSourceError.self) {
+      _ = try await source.materialize(
+        demand, identity: identity, materializationID: materializationID)
+    }
+    #expect(await transport.requests.filter { $0.httpMethod == "DELETE" }.count == 1)
+
+    let session = try await source.materialize(
+      demand, identity: identity, materializationID: materializationID)
+    #expect(await transport.requests.filter { $0.httpMethod == "DELETE" }.count == 2)
+    try await session.stop()
   }
 
   @Test func malformedNonNilLiveLSNFailsClosedWithoutRegressingTheStoredSnapshot() async throws {

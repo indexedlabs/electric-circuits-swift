@@ -19,10 +19,17 @@ private actor ScriptedIssueSource: CollectionSourceAdapter {
   private var stopCalls = 0
   private var heldRuns: Int
   private var runGate: CheckedContinuation<Void, Never>?
+  private var runGateLanded = false
+  private var runGateLandedWaiters: [CheckedContinuation<Void, Never>] = []
   private var heldMaterializations: Int
   private var materializationGate: CheckedContinuation<Void, Never>?
   private var materializationLanded = false
   private var materializationLandedWaiters: [CheckedContinuation<Void, Never>] = []
+  private var heldStops: Int
+  private var stopGate: CheckedContinuation<Void, Never>?
+  private var stopGateLanded = false
+  private var stopGateLandedWaiters: [CheckedContinuation<Void, Never>] = []
+  private var startWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
   private var continuations:
     [CollectionMaterializationID: AsyncThrowingStream<
       CollectionChangeBatch<CoordinatorIssue, Int>, any Error
@@ -32,12 +39,13 @@ private actor ScriptedIssueSource: CollectionSourceAdapter {
 
   init(
     outcomes: [Outcome], stopFailures: Int = 0, heldRuns: Int = 0,
-    heldMaterializations: Int = 0
+    heldMaterializations: Int = 0, heldStops: Int = 0
   ) {
     self.outcomes = outcomes
     self.stopFailures = stopFailures
     self.heldRuns = heldRuns
     self.heldMaterializations = heldMaterializations
+    self.heldStops = heldStops
   }
 
   func materialize(
@@ -46,6 +54,9 @@ private actor ScriptedIssueSource: CollectionSourceAdapter {
     materializationID: CollectionMaterializationID
   ) async throws -> CollectionSourceSession<CoordinatorIssue, Int> {
     starts.append(identity)
+    let satisfiedWaiters = startWaiters.filter { $0.count <= starts.count }
+    startWaiters.removeAll { $0.count <= starts.count }
+    for waiter in satisfiedWaiters { waiter.continuation.resume() }
     let outcome = outcomes.isEmpty ? .success([]) : outcomes.removeFirst()
     guard case .success(let rows) = outcome else { throw SourceFailure() }
     let updates = AsyncThrowingStream<CollectionChangeBatch<CoordinatorIssue, Int>, any Error>
@@ -75,8 +86,16 @@ private actor ScriptedIssueSource: CollectionSourceAdapter {
     )
   }
 
-  func stop(_ materializationID: CollectionMaterializationID) throws {
+  func stop(_ materializationID: CollectionMaterializationID) async throws {
     stopCalls += 1
+    if heldStops > 0 {
+      heldStops -= 1
+      stopGateLanded = true
+      let waiters = stopGateLandedWaiters
+      stopGateLandedWaiters.removeAll()
+      for waiter in waiters { waiter.resume() }
+      await withCheckedContinuation { stopGate = $0 }
+    }
     if stopFailures > 0 {
       stopFailures -= 1
       throw SourceFailure()
@@ -89,7 +108,16 @@ private actor ScriptedIssueSource: CollectionSourceAdapter {
   private func waitForRunGateIfNeeded() async {
     guard heldRuns > 0 else { return }
     heldRuns -= 1
+    runGateLanded = true
+    let waiters = runGateLandedWaiters
+    runGateLandedWaiters.removeAll()
+    for waiter in waiters { waiter.resume() }
     await withCheckedContinuation { runGate = $0 }
+  }
+
+  func waitForRunGateLanding() async {
+    guard !runGateLanded else { return }
+    await withCheckedContinuation { runGateLandedWaiters.append($0) }
   }
 
   func releaseRunGate() {
@@ -105,6 +133,21 @@ private actor ScriptedIssueSource: CollectionSourceAdapter {
   func releaseMaterializationGate() {
     materializationGate?.resume()
     materializationGate = nil
+  }
+
+  func waitForStopGateLanding() async {
+    guard !stopGateLanded else { return }
+    await withCheckedContinuation { stopGateLandedWaiters.append($0) }
+  }
+
+  func releaseStopGate() {
+    stopGate?.resume()
+    stopGate = nil
+  }
+
+  func waitForStarts(_ count: Int) async {
+    guard starts.count < count else { return }
+    await withCheckedContinuation { startWaiters.append((count, $0)) }
   }
 
   func send(_ batch: CollectionChangeBatch<CoordinatorIssue, Int>) {
@@ -384,5 +427,101 @@ struct CollectionCoordinatorContractTests {
     for _ in 0..<10_000 where await source.starts.count != 2 { await Task.yield() }
     #expect(await source.starts.count == 2)
     try await lease.release()
+  }
+
+  @Test func concurrentRefreshesJoinTheHeldPriorRunBeforeOneReplacementStarts() async throws {
+    let source = ScriptedIssueSource(outcomes: [.success([]), .success([])], heldRuns: 1)
+    let store = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let lease = await coordinator.acquire(.init(unsafePredicateIdentity: "open"))
+    #expect(await wait(for: .live, lease: lease))
+    await source.waitForRunGateLanding()
+
+    let firstRefresh = Task { await lease.refresh() }
+    let secondRefresh = Task { await lease.refresh() }
+    await Task.yield()
+    #expect(await source.starts.count == 1)
+
+    await source.releaseRunGate()
+    await firstRefresh.value
+    await secondRefresh.value
+    await source.waitForStarts(2)
+    #expect(await source.starts.count == 2)
+    #expect(await wait(for: .live, lease: lease))
+    try await lease.release()
+  }
+
+  @Test func acquireDuringHeldFinalReleaseRetainsTheNewLeaseAndRestartsIt() async throws {
+    let source = ScriptedIssueSource(outcomes: [.success([]), .success([])], heldStops: 1)
+    let store = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let demand = CollectionDemand<CoordinatorIssue>(unsafePredicateIdentity: "open")
+    let first = await coordinator.acquire(demand)
+    #expect(await wait(for: .live, lease: first))
+
+    let release = Task { try await first.release() }
+    await source.waitForStopGateLanding()
+    let second = await coordinator.acquire(demand)
+    await source.releaseStopGate()
+    try await release.value
+
+    #expect(await wait(for: .live, lease: second))
+    #expect(await source.starts.count == 2)
+    try await second.release()
+  }
+
+  @Test func refreshStopFailureRetainsCleanupAuthorityForTheNextRefresh() async throws {
+    let source = ScriptedIssueSource(outcomes: [.success([]), .success([])], stopFailures: 1)
+    let store = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let lease = await coordinator.acquire(.init(unsafePredicateIdentity: "open"))
+    #expect(await wait(for: .live, lease: lease))
+
+    await lease.refresh()
+    #expect(await lease.state() == .failed(.sourceUnavailable))
+    #expect(await source.releaseAttempts() == 1)
+
+    await lease.refresh()
+    #expect(await source.releaseAttempts() == 2)
+    #expect(await wait(for: .live, lease: lease))
+    #expect(await source.starts.count == 2)
+    try await lease.release()
+  }
+
+  @Test func evictionRejectsAnActiveDemandWithoutTouchingItsMaterialization() async throws {
+    let row = CoordinatorIssue(id: 1, title: "cached")
+    let source = ScriptedIssueSource(outcomes: [.success([row])])
+    let store = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let demand = CollectionDemand<CoordinatorIssue>(unsafePredicateIdentity: "open")
+    let lease = await coordinator.acquire(demand)
+    #expect(await wait(for: .live, lease: lease))
+
+    await #expect(throws: CollectionEvictionError.activeDemand) {
+      try await coordinator.evict(demand)
+    }
+    #expect(await store.rows() == [row.id: row])
+    try await lease.release()
+  }
+
+  @Test func evictionRemovesAnInactiveCachedMaterializationAndItsUnclaimedRows() async throws {
+    let row = CoordinatorIssue(id: 1, title: "cached")
+    let source = ScriptedIssueSource(outcomes: [.success([row])])
+    let store = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let demand = CollectionDemand<CoordinatorIssue>(unsafePredicateIdentity: "open")
+    let identity = demand.identity(for: coordinatorIssues, scope: coordinatorScope)
+    let lease = await coordinator.acquire(demand)
+    #expect(await wait(for: .live, lease: lease))
+    try await lease.release()
+
+    try await coordinator.evict(demand)
+    #expect(try await store.materialization(for: identity) == nil)
+    #expect(await store.rows().isEmpty)
   }
 }

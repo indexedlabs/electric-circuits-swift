@@ -3,7 +3,7 @@ import ElectricCircuitsSwift
 import Foundation
 import Testing
 
-private enum PredicateIssue: Sendable {}
+private struct PredicateIssue: Sendable {}
 
 private enum PredicateIssueFields {
   static let modifiedAt = CollectionField<PredicateIssue, String>(
@@ -79,5 +79,49 @@ struct CollectionPredicateTests {
     #expect(demand.predicateIdentity == predicate.canonicalDescription)
     #expect(demand.sourcePredicate == predicate.circuitsPredicate)
     #expect(demand.limit == 10)
+  }
+
+  @Test func demandIdentityCannotAliasDelimiterBearingPredicateAndOrderValues() {
+    let definition = CollectionDefinition<PredicateIssue, Int>(
+      id: CollectionID(rawValue: "issues"), key: { _ in 0 })
+    let scope = CollectionScope(principal: "u", authorization: "a", generation: "g")
+    let first = CollectionDemand<PredicateIssue>(
+      unsafePredicateIdentity: "x",
+      order: [
+        .init(
+          unsafeFieldID: "a;limit=none;order=c",
+          sourceName: "source-a;limit=none;order=c"
+        )
+      ],
+      limit: 7
+    )
+    let second = CollectionDemand<PredicateIssue>(
+      unsafePredicateIdentity: "x;order=a;limit=none",
+      order: [.init(unsafeFieldID: "c", sourceName: "source-c")],
+      limit: 7
+    )
+
+    let firstIdentity = first.identity(for: definition, scope: scope)
+    let secondIdentity = second.identity(for: definition, scope: scope)
+    #expect(firstIdentity != secondIdentity)
+    #expect(firstIdentity.storageKey != secondIdentity.storageKey)
+  }
+
+  @Test func demandIdentityIncludesProviderOrderSourceName() {
+    let definition = CollectionDefinition<PredicateIssue, Int>(
+      id: CollectionID(rawValue: "issues"), key: { _ in 0 })
+    let scope = CollectionScope(principal: "u", authorization: "a", generation: "g")
+    let first = CollectionDemand<PredicateIssue>(
+      unsafePredicateIdentity: "all",
+      order: [.init(unsafeFieldID: "modified", sourceName: "modified_at")]
+    )
+    let second = CollectionDemand<PredicateIssue>(
+      unsafePredicateIdentity: "all",
+      order: [.init(unsafeFieldID: "modified", sourceName: "updated_at")]
+    )
+
+    #expect(
+      first.identity(for: definition, scope: scope)
+        != second.identity(for: definition, scope: scope))
   }
 }

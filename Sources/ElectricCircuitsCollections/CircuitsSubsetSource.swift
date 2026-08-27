@@ -29,6 +29,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   private let capacity: ShapeSubscriptionCapacity?
   private let responseDecodingLimits: ResponseDecodingLimits
   private let telemetry: TelemetryReporter
+  private let pendingCleanup: PendingSubsetFeedCleanup
 
   public init(
     client: ElectricCircuitsClient,
@@ -55,6 +56,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     self.telemetry = telemetry
     self.decodeRow = decodeRow
     self.decodeKey = decodeKey
+    pendingCleanup = PendingSubsetFeedCleanup(client: client)
   }
 
   public func materialize(
@@ -68,6 +70,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     guard demand.order.count <= 1 else {
       throw CircuitsSubsetSourceError.unsupportedOrderCount(demand.order.count)
     }
+    try await pendingCleanup.retry(materializationID)
     let subscription = materializationID.rawValue
     let feedRequest = ShapeRequest(
       table: table,
@@ -161,10 +164,17 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       do {
         try await client.releaseShape(feed)
       } catch let release as ClientError {
+        await pendingCleanup.record(feed, for: materializationID)
         throw CircuitsSubsetSourceError.release(release)
       }
       throw error
     }
+  }
+
+  public func cleanupAbandonedMaterialization(
+    _ materializationID: CollectionMaterializationID
+  ) async throws {
+    try await pendingCleanup.retry(materializationID)
   }
 
   private static func snapshotFence(offset: String, sourceVersion: String) -> String {
@@ -182,6 +192,29 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       high <= UInt64(UInt32.max), low <= UInt64(UInt32.max)
     else { return nil }
     return CollectionSourceVersion(rawValue: value, order: (high << 32) | low)
+  }
+}
+
+/// A failed setup has no session to return, but it can already have created a server feed. Keep
+/// the one release handle per materialization until the idempotent DELETE succeeds (or receives
+/// 404, which the client normalizes to success). The registry is bounded by active failed setup
+/// attempts and is drained before another feed with that stable subscription can be created.
+private actor PendingSubsetFeedCleanup {
+  private let client: ElectricCircuitsClient
+  private var handles: [CollectionMaterializationID: ShapeHandle] = [:]
+
+  init(client: ElectricCircuitsClient) {
+    self.client = client
+  }
+
+  func record(_ handle: ShapeHandle, for materializationID: CollectionMaterializationID) {
+    handles[materializationID] = handle
+  }
+
+  func retry(_ materializationID: CollectionMaterializationID) async throws {
+    guard let handle = handles[materializationID] else { return }
+    try await client.releaseShape(handle)
+    handles.removeValue(forKey: materializationID)
   }
 }
 
@@ -242,6 +275,7 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
   ShapeMaterializer
 {
   private var cursor: StreamCursor?
+  private let snapshotSourceVersion: CollectionSourceVersion
   private var sourceVersion: CollectionSourceVersion
   private let decodeRow: @Sendable (ChangeRow) throws -> Model
   private let decodeKey: @Sendable (String) throws -> Key
@@ -255,6 +289,7 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
     apply: @escaping @Sendable (CollectionChangeBatch<Model, Key>) async throws -> Void
   ) {
     self.cursor = cursor
+    snapshotSourceVersion = sourceVersion
     self.sourceVersion = sourceVersion
     self.decodeRow = decodeRow
     self.decodeKey = decodeKey
@@ -284,11 +319,12 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
       else {
         throw CircuitsSubsetSourceError.invalidLiveSourceVersion(envelope.headers.lsn)
       }
-      // The feed starts before the subset snapshot. Always consume its durable offset, but only
-      // expose mutations after the snapshot's source prefix; this makes update/delete overlap
-      // safe without regressing the persisted source watermark.
-      guard version > latest else { continue }
-      latest = version
+      // The feed starts before the subset snapshot. The snapshot LSN is an immutable lower bound:
+      // changes at that LSN are part of the same source transaction and must all apply. Do not use
+      // the moving high-water mark as a per-envelope filter or sibling changes sharing one LSN
+      // disappear. We still advance the durable offset for dropped pre-snapshot overlap.
+      guard version >= snapshotSourceVersion else { continue }
+      latest = max(latest, version)
       switch envelope.headers.operation {
       case .delete:
         do { accepted.append(.delete(try decodeKey(envelope.key))) } catch {

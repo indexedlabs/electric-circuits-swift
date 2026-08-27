@@ -131,23 +131,24 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     var nextRows = canonicalRows
     var nextClaims = claims
     var materializationClaims = nextClaims[materializationID] ?? []
-    let mayMutateRows = batch.sourceVersion >= record.sourceVersion
-    for change in batch.changes where mayMutateRows {
+    // Claims are membership facts, not a row-byte version. An older overlapping feed cannot
+    // replace newer canonical bytes, but it still proves that its materialization owns the key.
+    // Apply every claim delta while comparing source versions only at the canonical byte layer.
+    for change in batch.changes {
       switch change {
       case .upsert(let row):
         let rowKey = key(row)
         let canonicalKey = CanonicalKey(domain: domain, key: rowKey)
-        if let existing = nextRows[canonicalKey], existing.version > batch.sourceVersion {
-          continue
+        if nextRows[canonicalKey].map({ $0.version <= batch.sourceVersion }) ?? true {
+          nextRows[canonicalKey] = (row, batch.sourceVersion)
         }
-        nextRows[canonicalKey] = (row, batch.sourceVersion)
         materializationClaims.insert(rowKey)
       case .delete(let rowKey):
         materializationClaims.remove(rowKey)
       }
     }
     nextClaims[materializationID] = materializationClaims
-    for change in batch.changes where mayMutateRows {
+    for change in batch.changes {
       guard case .delete(let rowKey) = change else { continue }
       if !isClaimed(rowKey, in: nextClaims, domain: domain, current: materializationID) {
         nextRows.removeValue(forKey: CanonicalKey(domain: domain, key: rowKey))

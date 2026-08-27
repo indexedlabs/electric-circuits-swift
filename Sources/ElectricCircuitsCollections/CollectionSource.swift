@@ -35,4 +35,18 @@ public protocol CollectionSourceAdapter<Model, Key>: Sendable {
     identity: CollectionDemandIdentity,
     materializationID: CollectionMaterializationID
   ) async throws -> CollectionSourceSession<Model, Key>
+
+  /// Retries cleanup for a remote feed that was created before local source setup failed. The
+  /// coordinator calls this before replacing or finally releasing an attempt; implementations
+  /// retain this authority until a successful or already-retired release.
+  func cleanupAbandonedMaterialization(_ materializationID: CollectionMaterializationID)
+    async throws
+}
+
+extension CollectionSourceAdapter {
+  public func cleanupAbandonedMaterialization(
+    _: CollectionMaterializationID
+  ) async throws {
+    // Most adapters only acquire a remote resource after they can return a session.
+  }
 }

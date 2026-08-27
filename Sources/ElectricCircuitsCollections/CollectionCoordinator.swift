@@ -13,6 +13,11 @@ public enum CollectionLoadState: Equatable, Sendable {
   case failed(CollectionLoadFailure)
 }
 
+/// An eviction cannot invalidate a materialization while it has an active or transitioning lease.
+public enum CollectionEvictionError: Error, Equatable, Sendable {
+  case activeDemand
+}
+
 /// One consumer's cancellable interest in a collection demand. Copying is intentionally impossible:
 /// each acquired lease has one independently idempotent `release()` lifecycle.
 public actor CollectionLease {
@@ -105,6 +110,11 @@ public actor CollectionCoordinator<
     var attempt: UUID
     var task: Task<Void, Never>?
     var stop: AtMostOnceStop?
+    var refreshToken: UUID?
+    var refreshTask: Task<Void, Never>?
+    var releaseToken: UUID?
+    var releaseTask: Task<Void, Error>?
+    var awaitsEviction: Bool
   }
 
   private let definition: CollectionDefinition<Model, Key>
@@ -113,6 +123,7 @@ public actor CollectionCoordinator<
   private let store: Store
   private var entries: [CollectionDemandIdentity: Entry] = [:]
   private var demandByLease: [UUID: CollectionDemandIdentity] = [:]
+  private var evicting: Set<CollectionDemandIdentity> = []
 
   public init(
     definition: CollectionDefinition<Model, Key>,
@@ -146,10 +157,17 @@ public actor CollectionCoordinator<
         leases: [leaseID: updates.continuation],
         attempt: attempt,
         task: nil,
-        stop: nil
+        stop: nil,
+        refreshToken: nil,
+        refreshTask: nil,
+        releaseToken: nil,
+        releaseTask: nil,
+        awaitsEviction: evicting.contains(identity)
       )
       updates.continuation.yield(.unavailable)
-      startAttempt(for: identity, attempt: attempt)
+      if !evicting.contains(identity) {
+        startAttempt(for: identity, attempt: attempt)
+      }
     }
     demandByLease[leaseID] = identity
 
@@ -179,7 +197,9 @@ public actor CollectionCoordinator<
   }
 
   private func startAttempt(for identity: CollectionDemandIdentity, attempt: UUID) {
-    guard var entry = entries[identity], entry.attempt == attempt else { return }
+    guard var entry = entries[identity], entry.attempt == attempt, !entry.leases.isEmpty,
+      entry.releaseToken == nil, !entry.awaitsEviction
+    else { return }
     let task = Task { [weak self] in
       guard let self else { return }
       await self.run(identity: identity, attempt: attempt)
@@ -285,7 +305,8 @@ public actor CollectionCoordinator<
     identity: CollectionDemandIdentity,
     attempt: UUID
   ) async throws {
-    guard let current = entries[identity], current.attempt == attempt, !current.leases.isEmpty
+    guard let current = entries[identity], current.attempt == attempt, !current.leases.isEmpty,
+      current.releaseToken == nil
     else { throw CancellationError() }
     do {
       try await store.apply(batch, to: current.materializationID)
@@ -342,12 +363,13 @@ public actor CollectionCoordinator<
   private func fail(
     identity: CollectionDemandIdentity,
     attempt: UUID,
-    with failure: CollectionLoadFailure
+    with failure: CollectionLoadFailure,
+    retainTask: Bool = false
   ) {
     guard var entry = entries[identity], entry.attempt == attempt, !entry.leases.isEmpty else {
       return
     }
-    entry.task = nil
+    if !retainTask { entry.task = nil }
     // A failed cleanup retains the exact remote-release authority for an explicit lease retry.
     entry.state = .failed(failure)
     entries[identity] = entry
@@ -370,27 +392,24 @@ public actor CollectionCoordinator<
   }
 
   private func refresh(leaseID: UUID) async {
-    guard let identity = demandByLease[leaseID], var entry = entries[identity] else { return }
-    entry.task?.cancel()
-    let previousTask = entry.task
-    let previousStop = entry.stop
-    let attempt = UUID()
-    entry.attempt = attempt
-    entry.task = nil
-    entry.stop = nil
-    entry.state = .refreshing
-    entries[identity] = entry
-    for continuation in entry.leases.values {
-      continuation.yield(.refreshing)
-    }
-    // A cancellation-resistant source may still be applying or holding its server claim. Join it
-    // before installing a replacement so its delayed cleanup cannot release the new attempt.
-    if let previousTask { await previousTask.value }
-    do { try await previousStop?.call() } catch {
-      fail(identity: identity, attempt: entry.attempt, with: .sourceUnavailable)
+    guard let identity = demandByLease[leaseID], var entry = entries[identity],
+      entry.releaseToken == nil
+    else { return }
+    if let task = entry.refreshTask {
+      await task.value
       return
     }
-    startAttempt(for: identity, attempt: attempt)
+    let token = UUID()
+    let task = Task { [weak self] in
+      guard let self else { return }
+      await self.performRefresh(identity: identity, token: token)
+    }
+    entry.refreshToken = token
+    entry.refreshTask = task
+    entry.state = .refreshing
+    entries[identity] = entry
+    for continuation in entry.leases.values { continuation.yield(.refreshing) }
+    await task.value
   }
 
   private func release(leaseID: UUID) async throws {
@@ -402,21 +421,175 @@ public actor CollectionCoordinator<
       entries[identity] = entry
       return
     }
-
-    let task = entry.task
-    task?.cancel()
-    if let stop = entry.stop {
-      try await stop.call()
-    } else if let task {
-      // A source can have accepted a remote claim yet still be returning its local session when the
-      // final lease is released. Keep this lease's authority installed until that cancelled attempt
-      // has either installed and released its stop action or failed before creating a claim.
-      await task.value
-      guard let current = entries[identity] else { return }
-      if let stop = current.stop { try await stop.call() }
+    if let task = entry.releaseTask {
+      try await task.value
+      return
     }
+    let token = UUID()
+    let task = Task<Void, Error> { [weak self] in
+      guard let self else { return }
+      try await self.performFinalRelease(identity: identity, leaseID: leaseID, token: token)
+    }
+    entry.releaseToken = token
+    entry.releaseTask = task
+    entries[identity] = entry
+    try await task.value
+  }
+
+  private func performRefresh(identity: CollectionDemandIdentity, token: UUID) async {
+    guard let initial = entries[identity], initial.refreshToken == token,
+      initial.releaseToken == nil, !initial.leases.isEmpty
+    else {
+      clearRefresh(identity: identity, token: token)
+      return
+    }
+    let oldAttempt = initial.attempt
+    let oldTask = initial.task
+    let oldStop = initial.stop
+    do {
+      try await oldStop?.call()
+      guard let afterStop = entries[identity], afterStop.refreshToken == token,
+        afterStop.releaseToken == nil, afterStop.attempt == oldAttempt, !afterStop.leases.isEmpty
+      else {
+        clearRefresh(identity: identity, token: token)
+        return
+      }
+      try await source.cleanupAbandonedMaterialization(afterStop.materializationID)
+    } catch {
+      fail(identity: identity, attempt: oldAttempt, with: .sourceUnavailable, retainTask: true)
+      clearRefresh(identity: identity, token: token)
+      return
+    }
+    guard let afterCleanup = entries[identity], afterCleanup.refreshToken == token,
+      afterCleanup.releaseToken == nil, afterCleanup.attempt == oldAttempt,
+      !afterCleanup.leases.isEmpty
+    else {
+      clearRefresh(identity: identity, token: token)
+      return
+    }
+    oldTask?.cancel()
+    if let oldTask { await oldTask.value }
+    guard let current = entries[identity], current.refreshToken == token,
+      current.releaseToken == nil, current.attempt == oldAttempt, !current.leases.isEmpty
+    else {
+      clearRefresh(identity: identity, token: token)
+      return
+    }
+    guard var entry = entries[identity], entry.refreshToken == token,
+      entry.releaseToken == nil, entry.attempt == oldAttempt, !entry.leases.isEmpty
+    else {
+      clearRefresh(identity: identity, token: token)
+      return
+    }
+    let nextAttempt = UUID()
+    entry.attempt = nextAttempt
+    entry.task = nil
+    entry.stop = nil
+    entry.refreshToken = nil
+    entry.refreshTask = nil
+    entry.state = .unavailable
+    entries[identity] = entry
+    for continuation in entry.leases.values { continuation.yield(.unavailable) }
+    startAttempt(for: identity, attempt: nextAttempt)
+  }
+
+  private func clearRefresh(identity: CollectionDemandIdentity, token: UUID) {
+    guard var entry = entries[identity], entry.refreshToken == token else { return }
+    entry.refreshToken = nil
+    entry.refreshTask = nil
+    entries[identity] = entry
+  }
+
+  private func performFinalRelease(
+    identity: CollectionDemandIdentity,
+    leaseID: UUID,
+    token: UUID
+  ) async throws {
+    guard let initial = entries[identity], initial.releaseToken == token,
+      initial.leases[leaseID] != nil
+    else { return }
+    if let refresh = initial.refreshTask { await refresh.value }
+    guard let afterRefresh = entries[identity], afterRefresh.releaseToken == token,
+      afterRefresh.leases[leaseID] != nil
+    else { return }
+    do {
+      try await afterRefresh.stop?.call()
+    } catch {
+      failRelease(identity: identity, attempt: afterRefresh.attempt, token: token)
+      throw error
+    }
+    guard let afterStop = entries[identity], afterStop.releaseToken == token,
+      afterStop.leases[leaseID] != nil
+    else { return }
+    afterStop.task?.cancel()
+    if let task = afterStop.task { await task.value }
+    guard let current = entries[identity], current.releaseToken == token,
+      current.leases[leaseID] != nil
+    else { return }
+    do {
+      guard let afterCleanup = entries[identity], afterCleanup.releaseToken == token,
+        afterCleanup.leases[leaseID] != nil
+      else { return }
+      try await source.cleanupAbandonedMaterialization(afterCleanup.materializationID)
+    } catch {
+      failRelease(identity: identity, attempt: current.attempt, token: token)
+      throw error
+    }
+    guard var entry = entries[identity], entry.releaseToken == token,
+      entry.leases.removeValue(forKey: leaseID) != nil
+    else { return }
     demandByLease.removeValue(forKey: leaseID)
-    entry.leases[leaseID]?.finish()
-    entries.removeValue(forKey: identity)
+    initial.leases[leaseID]?.finish()
+    if entry.leases.isEmpty {
+      entries.removeValue(forKey: identity)
+      return
+    }
+    let nextAttempt = UUID()
+    entry.attempt = nextAttempt
+    entry.task = nil
+    entry.stop = nil
+    entry.releaseToken = nil
+    entry.releaseTask = nil
+    entry.state = .unavailable
+    entries[identity] = entry
+    for continuation in entry.leases.values { continuation.yield(.unavailable) }
+    startAttempt(for: identity, attempt: nextAttempt)
+  }
+
+  private func failRelease(identity: CollectionDemandIdentity, attempt: UUID, token: UUID) {
+    guard var entry = entries[identity], entry.releaseToken == token, entry.attempt == attempt,
+      !entry.leases.isEmpty
+    else { return }
+    entry.releaseToken = nil
+    entry.releaseTask = nil
+    entry.state = .failed(.sourceUnavailable)
+    entries[identity] = entry
+    for continuation in entry.leases.values { continuation.yield(.failed(.sourceUnavailable)) }
+  }
+
+  /// Removes an inactive cached materialization. Acquires that arrive while the store operation is
+  /// in flight are fenced behind it and receive a fresh source attempt after it completes.
+  public func evict(_ demand: CollectionDemand<Model>) async throws {
+    let identity = demand.identity(for: definition, scope: scope)
+    guard entries[identity] == nil else { throw CollectionEvictionError.activeDemand }
+    guard !evicting.contains(identity) else { return }
+    evicting.insert(identity)
+    do {
+      if let record = try await store.materialization(for: identity) {
+        try await store.removeMaterialization(record.id)
+      }
+      finishEviction(identity)
+    } catch {
+      finishEviction(identity)
+      throw error
+    }
+  }
+
+  private func finishEviction(_ identity: CollectionDemandIdentity) {
+    evicting.remove(identity)
+    guard var entry = entries[identity], entry.awaitsEviction, !entry.leases.isEmpty else { return }
+    entry.awaitsEviction = false
+    entries[identity] = entry
+    startAttempt(for: identity, attempt: entry.attempt)
   }
 }
