@@ -403,11 +403,20 @@ public actor CollectionCoordinator<
       return
     }
 
-    entry.task?.cancel()
-    let stop = entry.stop
-    if let stop { try await stop.call() }
+    let task = entry.task
+    task?.cancel()
+    if let stop = entry.stop {
+      try await stop.call()
+    } else if let task {
+      // A source can have accepted a remote claim yet still be returning its local session when the
+      // final lease is released. Keep this lease's authority installed until that cancelled attempt
+      // has either installed and released its stop action or failed before creating a claim.
+      await task.value
+      guard let current = entries[identity] else { return }
+      if let stop = current.stop { try await stop.call() }
+    }
     demandByLease.removeValue(forKey: leaseID)
-    entry.leases.removeValue(forKey: leaseID)?.finish()
+    entry.leases[leaseID]?.finish()
     entries.removeValue(forKey: identity)
   }
 }

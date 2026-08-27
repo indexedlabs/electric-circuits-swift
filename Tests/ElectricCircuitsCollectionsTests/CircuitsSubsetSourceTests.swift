@@ -241,9 +241,9 @@ struct CircuitsSubsetSourceTests {
     try await task.value
   }
 
-  @Test func missingOrMalformedLiveLSNIsRejectedBeforeApplication() async throws {
+  @Test func malformedNonNilLiveLSNFailsClosedWithoutRegressingTheStoredSnapshot() async throws {
     let transport = NativeSubsetTransport(streamBodies: [
-      #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"Bad"},"headers":{"operation":"upsert"}}]"#
+      #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"Bad"},"headers":{"operation":"upsert","lsn":"not-a-postgres-lsn"}}]"#
     ])
     let client = ElectricCircuitsClient(
       baseURL: URL(string: "https://engine.test")!, transport: transport)
@@ -255,11 +255,21 @@ struct CircuitsSubsetSourceTests {
       id: CollectionID(rawValue: "issues"), key: \.id)
     let scope = CollectionScope(principal: "u", authorization: "a", generation: "g")
     let demand = CollectionDemand<NativeIssue>(unsafePredicateIdentity: "all")
-    let session = try await source.materialize(
-      demand, identity: demand.identity(for: definition, scope: scope),
-      materializationID: CollectionMaterializationID(rawValue: "bad-lsn"))
-    await #expect(throws: CircuitsSubsetSourceError.subscription(.materializer)) {
-      try await session.run { _ in Issue.record("must not apply") }
+    let identity = demand.identity(for: definition, scope: scope)
+    let store = InMemoryCollectionStore<NativeIssue, Int64>(key: \.id)
+    let coordinator = CollectionCoordinator(
+      definition: definition, scope: scope, source: source, store: store)
+    let lease = await coordinator.acquire(demand)
+    for _ in 0..<10_000 {
+      if await lease.state() == .failed(.sourceUnavailable) { break }
+      await Task.yield()
     }
+    #expect(await lease.state() == .failed(.sourceUnavailable))
+    #expect(await store.rows() == [1: NativeIssue(id: 1, title: "Snapshot")])
+    let record = try #require(await store.materialization(for: identity))
+    #expect(record.cursor == StreamCursor(offset: "10", lsn: "0/10"))
+    #expect(record.sourceVersion == CollectionSourceVersion(rawValue: "0/10", order: 16))
+    #expect(await transport.requests.contains { $0.httpMethod == "DELETE" })
+    try await lease.release()
   }
 }
