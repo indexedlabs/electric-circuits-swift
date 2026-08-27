@@ -78,7 +78,12 @@ private actor AtMostOnceStop {
     let action = action
     let task = Task<Void, Error> { try await action() }
     self.task = task
-    try await task.value
+    do {
+      try await task.value
+    } catch {
+      self.task = nil
+      throw error
+    }
   }
 }
 
@@ -239,16 +244,16 @@ public actor CollectionCoordinator<
         demand: identity
       )
     } catch is CancellationError {
-      await cleanup(stop, identity: identity, attempt: attempt)
+      _ = await cleanup(stop, identity: identity, attempt: attempt)
       return
     } catch {
-      await cleanup(stop, identity: identity, attempt: attempt)
+      _ = await cleanup(stop, identity: identity, attempt: attempt)
       fail(identity: identity, attempt: attempt, with: .storeUnavailable)
       return
     }
 
     guard updateEntry(identity: identity, attempt: attempt, state: .live) else {
-      await cleanup(stop, identity: identity, attempt: attempt)
+      _ = await cleanup(stop, identity: identity, attempt: attempt)
       return
     }
 
@@ -258,20 +263,21 @@ public actor CollectionCoordinator<
         try await self.apply(batch, identity: identity, attempt: attempt)
       }
     } catch is CancellationError {
-      await cleanup(stop, identity: identity, attempt: attempt)
+      _ = await cleanup(stop, identity: identity, attempt: attempt)
       return
     } catch is CollectionStoreApplyFailure {
-      await cleanup(stop, identity: identity, attempt: attempt)
+      _ = await cleanup(stop, identity: identity, attempt: attempt)
       fail(identity: identity, attempt: attempt, with: .storeUnavailable)
       return
     } catch {
-      await cleanup(stop, identity: identity, attempt: attempt)
+      _ = await cleanup(stop, identity: identity, attempt: attempt)
       fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
       return
     }
 
-    await cleanup(stop, identity: identity, attempt: attempt)
-    finishStream(identity: identity, attempt: attempt)
+    if await cleanup(stop, identity: identity, attempt: attempt) {
+      finishStream(identity: identity, attempt: attempt)
+    }
   }
 
   private func apply(
@@ -292,10 +298,14 @@ public actor CollectionCoordinator<
 
   private func cleanup(
     _ stop: AtMostOnceStop, identity: CollectionDemandIdentity, attempt: UUID
-  ) async {
-    do { try await stop.call() } catch {
+  ) async -> Bool {
+    do {
+      try await stop.call()
+      return true
+    } catch {
       // Keep the failed stop installed so a lease release can retry the same server authority.
       fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
+      return false
     }
   }
 
@@ -338,7 +348,7 @@ public actor CollectionCoordinator<
       return
     }
     entry.task = nil
-    entry.stop = nil
+    // A failed cleanup retains the exact remote-release authority for an explicit lease retry.
     entry.state = .failed(failure)
     entries[identity] = entry
     for continuation in entry.leases.values {

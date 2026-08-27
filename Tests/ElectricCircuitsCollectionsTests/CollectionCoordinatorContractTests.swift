@@ -15,6 +15,10 @@ private actor ScriptedIssueSource: CollectionSourceAdapter {
   }
 
   private var outcomes: [Outcome]
+  private var stopFailures: Int
+  private var stopCalls = 0
+  private var heldRuns: Int
+  private var runGate: CheckedContinuation<Void, Never>?
   private var continuations:
     [CollectionMaterializationID: AsyncThrowingStream<
       CollectionChangeBatch<CoordinatorIssue, Int>, any Error
@@ -22,8 +26,10 @@ private actor ScriptedIssueSource: CollectionSourceAdapter {
   private(set) var starts: [CollectionDemandIdentity] = []
   private(set) var stopped: [CollectionMaterializationID] = []
 
-  init(outcomes: [Outcome]) {
+  init(outcomes: [Outcome], stopFailures: Int = 0, heldRuns: Int = 0) {
     self.outcomes = outcomes
+    self.stopFailures = stopFailures
+    self.heldRuns = heldRuns
   }
 
   func materialize(
@@ -44,23 +50,42 @@ private actor ScriptedIssueSource: CollectionSourceAdapter {
         cursor: StreamCursor(offset: "0")
       ),
       run: { apply in
+        await self.waitForRunGateIfNeeded()
         for try await batch in updates.stream {
           try await apply(batch)
         }
       },
-      stop: { await self.stop(materializationID) }
+      stop: { try await self.stop(materializationID) }
     )
   }
 
-  func stop(_ materializationID: CollectionMaterializationID) {
+  func stop(_ materializationID: CollectionMaterializationID) throws {
+    stopCalls += 1
+    if stopFailures > 0 {
+      stopFailures -= 1
+      throw SourceFailure()
+    }
     guard let continuation = continuations.removeValue(forKey: materializationID) else { return }
     continuation.finish()
     stopped.append(materializationID)
   }
 
+  private func waitForRunGateIfNeeded() async {
+    guard heldRuns > 0 else { return }
+    heldRuns -= 1
+    await withCheckedContinuation { runGate = $0 }
+  }
+
+  func releaseRunGate() {
+    runGate?.resume()
+    runGate = nil
+  }
+
   func send(_ batch: CollectionChangeBatch<CoordinatorIssue, Int>) {
     continuations.values.first?.yield(batch)
   }
+
+  func releaseAttempts() -> Int { stopCalls }
 
   struct SourceFailure: Error {}
 }
@@ -188,6 +213,50 @@ struct CollectionCoordinatorContractTests {
     for _ in 0..<10_000 where await store.rows()[1] != updated { await Task.yield() }
     #expect(await store.rows()[1] == updated)
     #expect(await lease.state() == .live)
+    try await lease.release()
+  }
+
+  @Test func failedReleaseRetainsLeaseAuthorityForAJoinedRetry() async throws {
+    let source = ScriptedIssueSource(outcomes: [.success([])], stopFailures: 1)
+    let store = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let lease = await coordinator.acquire(.init(unsafePredicateIdentity: "open"))
+    #expect(await wait(for: .live, lease: lease))
+    await #expect(throws: ScriptedIssueSource.SourceFailure.self) { try await lease.release() }
+    #expect(await source.releaseAttempts() == 1)
+    try await lease.release()
+    #expect(await source.releaseAttempts() == 2)
+    #expect(await source.stopped.count == 1)
+  }
+
+  @Test func repeatedReleaseFailureRemainsObservableWithoutDiscardingAuthority() async throws {
+    let source = ScriptedIssueSource(outcomes: [.success([])], stopFailures: 2)
+    let store = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let lease = await coordinator.acquire(.init(unsafePredicateIdentity: "open"))
+    #expect(await wait(for: .live, lease: lease))
+    await #expect(throws: ScriptedIssueSource.SourceFailure.self) { try await lease.release() }
+    await #expect(throws: ScriptedIssueSource.SourceFailure.self) { try await lease.release() }
+    #expect(await source.releaseAttempts() == 2)
+    #expect(await lease.state() == .failed(.sourceUnavailable))
+  }
+
+  @Test func refreshWaitsForCancellationResistantPriorRunBeforeReplacement() async throws {
+    let source = ScriptedIssueSource(outcomes: [.success([]), .success([])], heldRuns: 1)
+    let store = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let lease = await coordinator.acquire(.init(unsafePredicateIdentity: "open"))
+    #expect(await wait(for: .live, lease: lease))
+    let refresh = Task { await lease.refresh() }
+    for _ in 0..<1_000 { await Task.yield() }
+    #expect(await source.starts.count == 1)
+    await source.releaseRunGate()
+    await refresh.value
+    for _ in 0..<10_000 where await source.starts.count != 2 { await Task.yield() }
+    #expect(await source.starts.count == 2)
     try await lease.release()
   }
 }
