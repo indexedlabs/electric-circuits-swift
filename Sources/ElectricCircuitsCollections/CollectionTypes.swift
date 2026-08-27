@@ -1,6 +1,12 @@
 import ElectricCircuitsSwift
 import Foundation
 
+private func invalidPersistedCollectionValue(_ decoder: Decoder, _ description: String)
+  -> DecodingError
+{
+  .dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: description))
+}
+
 /// Stable application identity for one normalized entity set.
 public struct CollectionID: RawRepresentable, Codable, Equatable, Hashable, Sendable {
   public let rawValue: String
@@ -9,16 +15,38 @@ public struct CollectionID: RawRepresentable, Codable, Equatable, Hashable, Send
     precondition(!rawValue.isEmpty)
     self.rawValue = rawValue
   }
+
+  public init(from decoder: Decoder) throws {
+    let rawValue = try decoder.singleValueContainer().decode(String.self)
+    guard !rawValue.isEmpty else {
+      throw invalidPersistedCollectionValue(decoder, "CollectionID.rawValue is empty")
+    }
+    self.rawValue = rawValue
+  }
 }
 
 /// Principal and authorization epoch in which cached collection data is valid.
 public struct CollectionScope: Codable, Equatable, Hashable, Sendable {
+  private enum CodingKeys: String, CodingKey { case principal, authorization, generation }
   public let principal: String
   public let authorization: String
   public let generation: String
 
   public init(principal: String, authorization: String, generation: String) {
     precondition(!principal.isEmpty && !authorization.isEmpty && !generation.isEmpty)
+    self.principal = principal
+    self.authorization = authorization
+    self.generation = generation
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    let principal = try container.decode(String.self, forKey: .principal)
+    let authorization = try container.decode(String.self, forKey: .authorization)
+    let generation = try container.decode(String.self, forKey: .generation)
+    guard !principal.isEmpty, !authorization.isEmpty, !generation.isEmpty else {
+      throw invalidPersistedCollectionValue(decoder, "CollectionScope components must not be empty")
+    }
     self.principal = principal
     self.authorization = authorization
     self.generation = generation
@@ -107,12 +135,27 @@ public struct CollectionDefinition<Model: Sendable, Key: Hashable & Sendable>: S
 
 /// Exact identity used for conservative demand de-duplication and persisted materializations.
 public struct CollectionDemandIdentity: Codable, Equatable, Hashable, Sendable {
+  private enum CodingKeys: String, CodingKey { case collection, scope, canonicalDemand }
   public let collection: CollectionID
   public let scope: CollectionScope
   public let canonicalDemand: String
 
   public init(collection: CollectionID, scope: CollectionScope, canonicalDemand: String) {
     precondition(!canonicalDemand.isEmpty)
+    self.collection = collection
+    self.scope = scope
+    self.canonicalDemand = canonicalDemand
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    let collection = try container.decode(CollectionID.self, forKey: .collection)
+    let scope = try container.decode(CollectionScope.self, forKey: .scope)
+    let canonicalDemand = try container.decode(String.self, forKey: .canonicalDemand)
+    guard !canonicalDemand.isEmpty else {
+      throw invalidPersistedCollectionValue(
+        decoder, "CollectionDemandIdentity.canonicalDemand is empty")
+    }
     self.collection = collection
     self.scope = scope
     self.canonicalDemand = canonicalDemand
@@ -178,6 +221,15 @@ public struct CollectionMaterializationID: RawRepresentable, Codable, Equatable,
     precondition(!rawValue.isEmpty)
     self.rawValue = rawValue
   }
+
+  public init(from decoder: Decoder) throws {
+    let rawValue = try decoder.singleValueContainer().decode(String.self)
+    guard !rawValue.isEmpty else {
+      throw invalidPersistedCollectionValue(
+        decoder, "CollectionMaterializationID.rawValue is empty")
+    }
+    self.rawValue = rawValue
+  }
 }
 
 /// Opaque snapshot-to-live handoff value. The collection core never interprets it as an LSN.
@@ -188,12 +240,21 @@ public struct SnapshotFence: RawRepresentable, Codable, Equatable, Hashable, Sen
     precondition(!rawValue.isEmpty)
     self.rawValue = rawValue
   }
+
+  public init(from decoder: Decoder) throws {
+    let rawValue = try decoder.singleValueContainer().decode(String.self)
+    guard !rawValue.isEmpty else {
+      throw invalidPersistedCollectionValue(decoder, "SnapshotFence.rawValue is empty")
+    }
+    self.rawValue = rawValue
+  }
 }
 
 /// A source-provided, totally ordered row-state version. Stores persist both values and compare
 /// `order`; they never infer an order from a transport cursor. Sources must reject values they
 /// cannot translate to this contract before mutating a collection.
 public struct CollectionSourceVersion: Codable, Equatable, Hashable, Comparable, Sendable {
+  private enum CodingKeys: String, CodingKey { case rawValue, order }
   public let rawValue: String
   public let order: UInt64
 
@@ -203,7 +264,20 @@ public struct CollectionSourceVersion: Codable, Equatable, Hashable, Comparable,
     self.order = order
   }
 
-  public static func < (lhs: Self, rhs: Self) -> Bool { lhs.order < rhs.order }
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    let rawValue = try container.decode(String.self, forKey: .rawValue)
+    let order = try container.decode(UInt64.self, forKey: .order)
+    guard !rawValue.isEmpty else {
+      throw invalidPersistedCollectionValue(decoder, "CollectionSourceVersion.rawValue is empty")
+    }
+    self.rawValue = rawValue
+    self.order = order
+  }
+
+  public static func < (lhs: Self, rhs: Self) -> Bool {
+    lhs.order == rhs.order ? lhs.rawValue < rhs.rawValue : lhs.order < rhs.order
+  }
 }
 
 public enum CollectionMaterializationState: String, Codable, Equatable, Sendable {
@@ -256,8 +330,8 @@ public struct CollectionSnapshot<Model: Sendable>: Sendable {
 }
 
 public enum CollectionChange<Model: Sendable, Key: Hashable & Sendable>: Sendable {
-  case upsert(Model)
-  case delete(Key)
+  case upsert(Model, sourceVersion: CollectionSourceVersion)
+  case delete(Key, sourceVersion: CollectionSourceVersion)
 }
 
 public struct CollectionChangeBatch<Model: Sendable, Key: Hashable & Sendable>: Sendable {

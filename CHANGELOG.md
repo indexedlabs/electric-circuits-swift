@@ -3,6 +3,12 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
+## Unreleased
+
+- `CollectionChange` now requires a `CollectionSourceVersion` on each upsert and delete. Collection
+  store providers must migrate their live-apply implementation to persist per-change versions and
+  tombstones; `CollectionChangeBatch.sourceVersion` remains the high-water cursor record.
+
 ## 0.2.0
 
 - Add the storage-neutral `ElectricCircuitsCollections` product with typed predicates, exact-demand

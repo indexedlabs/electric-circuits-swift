@@ -145,8 +145,20 @@ public actor CollectionCoordinator<
 
     if var entry = entries[identity] {
       entry.leases[leaseID] = updates.continuation
+      let shouldRetry = {
+        guard case .failed = entry.state else { return false }
+        return entry.task == nil && entry.stop == nil && entry.releaseToken == nil
+          && !entry.awaitsEviction
+      }()
+      if shouldRetry {
+        entry.attempt = UUID()
+        entry.state = .unavailable
+      }
       entries[identity] = entry
-      updates.continuation.yield(entry.state)
+      for continuation in entry.leases.values { continuation.yield(entry.state) }
+      if shouldRetry {
+        startAttempt(for: identity, attempt: entry.attempt)
+      }
     } else {
       let attempt = UUID()
       let materializationID = CollectionMaterializationID(rawValue: UUID().uuidString.lowercased())

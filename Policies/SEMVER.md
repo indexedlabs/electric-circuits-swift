@@ -1,6 +1,7 @@
 # Semantic versioning policy
 
-The library follows Semantic Versioning for its public SwiftPM library product. Public means a
+The `ElectricCircuitsSwift` and `ElectricCircuitsCollections` libraries follow Semantic Versioning
+for their public SwiftPM products. Public means a
 non-underscored symbol, documented behavior, or serialized native-v1 field that a supported client
 is entitled to rely on. Documentation examples do not add a guarantee beyond their linked public
 contract.

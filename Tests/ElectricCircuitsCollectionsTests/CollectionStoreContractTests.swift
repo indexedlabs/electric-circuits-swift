@@ -1,5 +1,6 @@
 import ElectricCircuitsCollections
 import ElectricCircuitsSwift
+import Foundation
 import Testing
 
 private struct TestIssue: Equatable, Sendable {
@@ -26,8 +27,47 @@ private func version(_ order: UInt64) -> CollectionSourceVersion {
   CollectionSourceVersion(rawValue: "0/\(String(order, radix: 16).uppercased())", order: order)
 }
 
+private func assertDataCorrupted<T: Decodable>(_ type: T.Type, _ json: String) {
+  #expect {
+    try JSONDecoder().decode(type, from: Data(json.utf8))
+  } throws: { error in
+    if case DecodingError.dataCorrupted = error { return true }
+    return false
+  }
+}
+
 @Suite("Collection store contract")
 struct CollectionStoreContractTests {
+  @Test func persistedIdentityAndVersionValuesRejectEmptyComponentsAndRoundTrip() throws {
+    assertDataCorrupted(CollectionID.self, #"""#)
+    assertDataCorrupted(
+      CollectionScope.self, #"{"principal":"","authorization":"a","generation":"g"}"#)
+    assertDataCorrupted(
+      CollectionDemandIdentity.self,
+      #"{"collection":"issues","scope":{"principal":"u","authorization":"a","generation":"g"},"canonicalDemand":""}"#
+    )
+    assertDataCorrupted(CollectionMaterializationID.self, #"""#)
+    assertDataCorrupted(SnapshotFence.self, #"""#)
+    assertDataCorrupted(CollectionSourceVersion.self, #"{"rawValue":"","order":1}"#)
+
+    let identity = CollectionDemandIdentity(
+      collection: .init(rawValue: "issues"),
+      scope: .init(principal: "u", authorization: "a", generation: "g"), canonicalDemand: "all")
+    let record = CollectionMaterializationRecord(
+      id: .init(rawValue: "materialization"), demand: identity, state: .live,
+      snapshotFence: .init(rawValue: "fence"), sourceVersion: version(42),
+      cursor: .init(offset: "42"))
+    let data = try JSONEncoder().encode(record)
+    #expect(try JSONDecoder().decode(CollectionMaterializationRecord.self, from: data) == record)
+  }
+
+  @Test func sourceVersionComparisonUsesTheSameOrderingAsEquality() {
+    let first = CollectionSourceVersion(rawValue: "a", order: 7)
+    let second = CollectionSourceVersion(rawValue: "b", order: 7)
+    #expect(first != second)
+    #expect(first < second)
+  }
+
   @Test func overlappingSnapshotReplacementRetainsRowsClaimedByAnotherMaterialization() async throws
   {
     let store = InMemoryCollectionStore<TestIssue, Int>(key: \.id)
@@ -78,7 +118,7 @@ struct CollectionStoreContractTests {
 
     try await store.apply(
       CollectionChangeBatch(
-        changes: [.delete(shared.id)],
+        changes: [.delete(shared.id, sourceVersion: version(0))],
         expectedCursor: beginning,
         cursor: StreamCursor(offset: "1")
       ),
@@ -105,7 +145,7 @@ struct CollectionStoreContractTests {
       demand: demand("today")
     )
     let batch = CollectionChangeBatch<TestIssue, Int>(
-      changes: [.upsert(updated)],
+      changes: [.upsert(updated, sourceVersion: version(0))],
       expectedCursor: beginning,
       cursor: next
     )
@@ -117,7 +157,7 @@ struct CollectionStoreContractTests {
     #expect(try await store.materialization(for: demand("today"))?.cursor == next)
 
     let rejected = CollectionChangeBatch<TestIssue, Int>(
-      changes: [.delete(updated.id)],
+      changes: [.delete(updated.id, sourceVersion: version(0))],
       expectedCursor: beginning,
       cursor: StreamCursor(offset: "2")
     )
@@ -170,14 +210,19 @@ struct CollectionStoreContractTests {
         rows: [.init(id: 1, title: "new")], fence: .init(rawValue: "new"),
         sourceVersion: version(20), cursor: .init(offset: "20")),
       materializationID: materialization, demand: identity)
-    try await store.replaceSnapshot(
-      .init(
-        rows: [.init(id: 1, title: "old")], fence: .init(rawValue: "old"),
-        sourceVersion: version(10), cursor: .init(offset: "10")),
-      materializationID: materialization, demand: identity)
+    await #expect(
+      throws: CollectionStoreError.staleSnapshot(current: version(20), received: version(10))
+    ) {
+      try await store.replaceSnapshot(
+        .init(
+          rows: [.init(id: 1, title: "old")], fence: .init(rawValue: "old"),
+          sourceVersion: version(10), cursor: .init(offset: "10")),
+        materializationID: materialization, demand: identity)
+    }
     try await store.apply(
       .init(
-        changes: [.upsert(.init(id: 1, title: "older-live"))], expectedCursor: .init(offset: "20"),
+        changes: [.upsert(.init(id: 1, title: "older-live"), sourceVersion: version(15))],
+        expectedCursor: .init(offset: "20"),
         cursor: .init(offset: "21"), sourceVersion: version(15)), to: materialization)
     #expect(await store.rows(for: identity)[1]?.title == "new")
     #expect(try await store.materialization(for: identity)?.sourceVersion == version(20))
@@ -204,7 +249,8 @@ struct CollectionStoreContractTests {
     )
     try await store.apply(
       .init(
-        changes: [.upsert(oldRow)], expectedCursor: .init(offset: "0"), cursor: .init(offset: "1"),
+        changes: [.upsert(oldRow, sourceVersion: version(10))], expectedCursor: .init(offset: "0"),
+        cursor: .init(offset: "1"),
         sourceVersion: version(10)
       ),
       to: older
@@ -215,5 +261,102 @@ struct CollectionStoreContractTests {
     try await store.removeMaterialization(newer)
     #expect(await store.rows()[1] == newRow)
     #expect(await store.rowClaims(for: older) == [1])
+  }
+
+  @Test func eachChangeUsesItsOwnVersionAcrossCoalescedMaterializationBatches() async throws {
+    let store = InMemoryCollectionStore<TestIssue, Int>(key: \.id)
+    let newer = CollectionMaterializationID(rawValue: "newer")
+    let other = CollectionMaterializationID(rawValue: "other")
+    let key = TestIssue(id: 1, title: "k@100")
+    let stale = TestIssue(id: 1, title: "k@50")
+    let later = TestIssue(id: 1, title: "k@110")
+    let sibling = TestIssue(id: 2, title: "j@120")
+
+    try await store.replaceSnapshot(
+      .init(rows: [key], fence: .init(rawValue: "newer"), sourceVersion: version(100)),
+      materializationID: newer, demand: demand("newer"))
+    try await store.replaceSnapshot(
+      .init(
+        rows: [], fence: .init(rawValue: "other"), sourceVersion: version(0),
+        cursor: .init(offset: "0")), materializationID: other, demand: demand("other"))
+
+    try await store.apply(
+      .init(
+        changes: [
+          .upsert(stale, sourceVersion: version(50)),
+          .upsert(sibling, sourceVersion: version(120)),
+        ],
+        expectedCursor: .init(offset: "0"), cursor: .init(offset: "1"),
+        sourceVersion: version(120)), to: other)
+    #expect(await store.rows() == [key.id: key, sibling.id: sibling])
+
+    try await store.apply(
+      .init(
+        changes: [.upsert(later, sourceVersion: version(110))],
+        expectedCursor: .init(offset: "1"), cursor: .init(offset: "2"),
+        sourceVersion: version(120)), to: other)
+    #expect(await store.rows() == [later.id: later, sibling.id: sibling])
+  }
+
+  @Test func orderedDeleteThenSameVersionUpsertKeepsTheUpsert() async throws {
+    let store = InMemoryCollectionStore<TestIssue, Int>(key: \.id)
+    let materialization = CollectionMaterializationID(rawValue: "ordered")
+    let original = TestIssue(id: 1, title: "original")
+    let replacement = TestIssue(id: 1, title: "replacement")
+    try await store.replaceSnapshot(
+      .init(
+        rows: [original], fence: .init(rawValue: "ordered"), sourceVersion: version(1),
+        cursor: .init(offset: "0")), materializationID: materialization, demand: demand("ordered"))
+
+    try await store.apply(
+      .init(
+        changes: [
+          .delete(original.id, sourceVersion: version(10)),
+          .upsert(replacement, sourceVersion: version(10)),
+        ],
+        expectedCursor: .init(offset: "0"), cursor: .init(offset: "1"), sourceVersion: version(10)),
+      to: materialization)
+    #expect(await store.rows()[replacement.id] == replacement)
+  }
+
+  @Test func duplicateMaterializationBindingIsRejectedWithoutMutation() async throws {
+    let store = InMemoryCollectionStore<TestIssue, Int>(key: \.id)
+    let materialization = CollectionMaterializationID(rawValue: "shared")
+    let first = demand("first")
+    let second = demand("second")
+    try await store.replaceSnapshot(
+      .init(rows: [.init(id: 1, title: "first")], fence: .init(rawValue: "first")),
+      materializationID: materialization, demand: first)
+
+    await #expect(
+      throws: CollectionStoreError.materializationBoundToDifferentDemand(
+        materializationID: materialization, existing: first, requested: second
+      )
+    ) {
+      try await store.replaceSnapshot(
+        .init(rows: [.init(id: 2, title: "second")], fence: .init(rawValue: "second")),
+        materializationID: materialization, demand: second)
+    }
+    #expect(await store.rows(for: first)[1]?.title == "first")
+    #expect(try await store.materialization(for: second) == nil)
+  }
+
+  @Test func staleSnapshotIsExplicitlyRejectedWithoutMutation() async throws {
+    let store = InMemoryCollectionStore<TestIssue, Int>(key: \.id)
+    let materialization = CollectionMaterializationID(rawValue: "today")
+    let identity = demand("today")
+    try await store.replaceSnapshot(
+      .init(
+        rows: [.init(id: 1, title: "new")], fence: .init(rawValue: "new"),
+        sourceVersion: version(20)), materializationID: materialization, demand: identity)
+    await #expect(
+      throws: CollectionStoreError.staleSnapshot(current: version(20), received: version(10))
+    ) {
+      try await store.replaceSnapshot(
+        .init(
+          rows: [.init(id: 1, title: "old")], fence: .init(rawValue: "old"),
+          sourceVersion: version(10)), materializationID: materialization, demand: identity)
+    }
+    #expect(await store.rows(for: identity)[1]?.title == "new")
   }
 }

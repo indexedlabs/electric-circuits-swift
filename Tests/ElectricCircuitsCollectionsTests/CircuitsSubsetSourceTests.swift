@@ -175,12 +175,13 @@ struct CircuitsSubsetSourceTests {
     let batch = try #require(await applied.values().first)
     #expect(batch.expectedCursor == StreamCursor(offset: "10", lsn: "0/10"))
     #expect(batch.cursor == StreamCursor(offset: "11", lsn: "0/20"))
-    guard case .upsert(let issue) = try #require(batch.changes.first) else {
+    guard case .upsert(let issue, let changeVersion) = try #require(batch.changes.first) else {
       Issue.record("expected an upsert")
       try await session.stop()
       return
     }
     #expect(issue == NativeIssue(id: 1, title: "Live"))
+    #expect(changeVersion == .init(rawValue: "0/20", order: 32))
 
     try await session.stop()
     try await run.value
@@ -292,6 +293,13 @@ struct CircuitsSubsetSourceTests {
     let batch = try #require(await applied.values().first)
     #expect(batch.changes.count == 2)
     #expect(batch.sourceVersion == .init(rawValue: "0/10", order: 16))
+    #expect(
+      batch.changes.allSatisfy { change in
+        switch change {
+        case .upsert(_, let version), .delete(_, let version):
+          version == .init(rawValue: "0/10", order: 16)
+        }
+      })
     try await session.stop()
     try await task.value
   }
@@ -319,6 +327,13 @@ struct CircuitsSubsetSourceTests {
     let batch = try #require(await applied.values().first)
     #expect(batch.changes.count == 3)
     #expect(batch.sourceVersion == .init(rawValue: "0/20", order: 32))
+    #expect(
+      batch.changes.allSatisfy { change in
+        switch change {
+        case .upsert(_, let version), .delete(_, let version):
+          version == .init(rawValue: "0/20", order: 32)
+        }
+      })
     try await session.stop()
     try await task.value
   }

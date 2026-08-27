@@ -399,6 +399,43 @@ struct CollectionCoordinatorContractTests {
     try await second.release()
   }
 
+  @Test func acquireJoiningAnIdleFailureStartsOneSharedRetry() async throws {
+    let source = ScriptedIssueSource(outcomes: [.failure, .success([])])
+    let store = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let demand = CollectionDemand<CoordinatorIssue>(unsafePredicateIdentity: "open")
+    let failed = await coordinator.acquire(demand)
+    #expect(await wait(for: .failed(.sourceUnavailable), lease: failed))
+
+    let retry = await coordinator.acquire(demand)
+    #expect(await wait(for: .live, lease: retry))
+    #expect(await source.starts.count == 2)
+    try await failed.release()
+    try await retry.release()
+  }
+
+  @Test func concurrentAcquiresJoiningAnIdleFailureShareOneRetry() async throws {
+    let source = ScriptedIssueSource(outcomes: [.failure, .success([])])
+    let store = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let demand = CollectionDemand<CoordinatorIssue>(unsafePredicateIdentity: "open")
+    let failed = await coordinator.acquire(demand)
+    #expect(await wait(for: .failed(.sourceUnavailable), lease: failed))
+
+    async let first = coordinator.acquire(demand)
+    async let second = coordinator.acquire(demand)
+    let joined = await [first, second]
+    await source.waitForStarts(2)
+    #expect(await source.starts.count == 2)
+    #expect(await wait(for: .live, lease: joined[0]))
+    #expect(await wait(for: .live, lease: joined[1]))
+    try await failed.release()
+    try await joined[0].release()
+    try await joined[1].release()
+  }
+
   @Test func awaitedLiveBatchMutatesTheStoreBeforeTheCoordinatorRemainsLive() async throws {
     let original = CoordinatorIssue(id: 1, title: "before")
     let updated = CoordinatorIssue(id: 1, title: "after")
@@ -411,7 +448,8 @@ struct CollectionCoordinatorContractTests {
     #expect(await wait(for: .live, lease: lease))
     await source.send(
       .init(
-        changes: [.upsert(updated)], expectedCursor: .init(offset: "0"), cursor: .init(offset: "1"),
+        changes: [.upsert(updated, sourceVersion: .init(rawValue: "v1", order: 1))],
+        expectedCursor: .init(offset: "0"), cursor: .init(offset: "1"),
         sourceVersion: .init(rawValue: "v1", order: 1)))
     for _ in 0..<10_000 where await store.rows()[1] != updated { await Task.yield() }
     #expect(await store.rows()[1] == updated)
@@ -488,7 +526,8 @@ struct CollectionCoordinatorContractTests {
 
     await source.send(
       .init(
-        changes: [.upsert(attempted)], expectedCursor: .init(offset: "0"),
+        changes: [.upsert(attempted, sourceVersion: .init(rawValue: "v1", order: 1))],
+        expectedCursor: .init(offset: "0"),
         cursor: .init(offset: "1"),
         sourceVersion: .init(rawValue: "v1", order: 1)))
 

@@ -330,12 +330,12 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
       latest = max(latest, version)
       switch envelope.headers.operation {
       case .delete:
-        do { accepted.append(.delete(try decodeKey(envelope.key))) } catch {
+        do { accepted.append(.delete(try decodeKey(envelope.key), sourceVersion: version)) } catch {
           throw CircuitsSubsetSourceError.invalidLiveKey(envelope.key)
         }
       case .insert, .update, .upsert:
         guard let value = envelope.value else { throw StreamError.missingValue(key: envelope.key) }
-        accepted.append(.upsert(try decodeRow(value)))
+        accepted.append(.upsert(try decodeRow(value), sourceVersion: version))
       }
     }
     try await applyBatch(

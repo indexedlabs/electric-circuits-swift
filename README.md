@@ -28,6 +28,11 @@ typed `CollectionPredicate` values compile logical field IDs into native Circuit
 fences, and live cursors. `InMemoryCollectionStore` is the reference provider; applications can
 implement the same contract with GRDB or another store.
 
+Each `CollectionChange` carries its own `CollectionSourceVersion`; a `CollectionChangeBatch`
+`sourceVersion` is only the batch high-water mark and cursor record. Custom collection stores must
+persist versioned upserts and tombstones per change so a lower-LSN sibling in a coalesced batch
+cannot overwrite or resurrect a newer canonical row.
+
 `CircuitsSubsetSource` performs the native on-demand handoff in causal order: establish a named
 changes-only feed, read its durable frontier, query the subset snapshot, commit it, then consume live
 batches with awaited store application. It renews the same subset-feed claim through

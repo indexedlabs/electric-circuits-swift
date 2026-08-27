@@ -29,6 +29,12 @@ public protocol CollectionStore<Model, Key>: Sendable {
 public enum CollectionStoreError: Error, Equatable, Sendable {
   case missingMaterialization(CollectionMaterializationID)
   case cursorConflict(expected: StreamCursor?, actual: StreamCursor?, advancingTo: StreamCursor)
+  case materializationBoundToDifferentDemand(
+    materializationID: CollectionMaterializationID,
+    existing: CollectionDemandIdentity,
+    requested: CollectionDemandIdentity
+  )
+  case staleSnapshot(current: CollectionSourceVersion, received: CollectionSourceVersion)
 }
 
 /// Reference store for contract tests, previews and applications that do not require disk-backed
@@ -46,7 +52,9 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     let domain: Domain
     let key: Key
   }
-  private var canonicalRows: [CanonicalKey: (row: Model, version: CollectionSourceVersion)] = [:]
+  /// A nil row is a versioned tombstone. It prevents an older overlapping feed from resurrecting a
+  /// key after a later delete while retaining no application-visible row.
+  private var canonicalRows: [CanonicalKey: (row: Model?, version: CollectionSourceVersion)] = [:]
   private var recordsByDemand: [CollectionDemandIdentity: CollectionMaterializationRecord] = [:]
   private var demandByMaterialization: [CollectionMaterializationID: CollectionDemandIdentity] = [:]
   private var claims: [CollectionMaterializationID: Set<Key>] = [:]
@@ -70,13 +78,16 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     materializationID: CollectionMaterializationID,
     demand: CollectionDemandIdentity
   ) async throws {
+    if let existingDemand = demandByMaterialization[materializationID], existingDemand != demand {
+      throw CollectionStoreError.materializationBoundToDifferentDemand(
+        materializationID: materializationID, existing: existingDemand, requested: demand)
+    }
+    if let current = recordsByDemand[demand], snapshot.sourceVersion < current.sourceVersion {
+      throw CollectionStoreError.staleSnapshot(
+        current: current.sourceVersion, received: snapshot.sourceVersion)
+    }
     let oldClaims = claims[materializationID] ?? []
     let newClaims = Set(snapshot.rows.map(key))
-    // A stale overlapping snapshot may advance no local state and must never replace newer live
-    // data already committed by this materialization.
-    if let current = recordsByDemand[demand], snapshot.sourceVersion < current.sourceVersion {
-      return
-    }
     let domain = domain(for: demand)
     var nextRows = canonicalRows
     var nextClaims = claims
@@ -89,7 +100,7 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     }
     for row in snapshot.rows {
       let rowKey = CanonicalKey(domain: domain, key: key(row))
-      if let existing = nextRows[rowKey], existing.version > snapshot.sourceVersion {
+      if let existing = nextRows[rowKey], existing.version.order > snapshot.sourceVersion.order {
         continue
       }
       nextRows[rowKey] = (row, snapshot.sourceVersion)
@@ -136,22 +147,25 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     // Apply every claim delta while comparing source versions only at the canonical byte layer.
     for change in batch.changes {
       switch change {
-      case .upsert(let row):
+      case .upsert(let row, let sourceVersion):
         let rowKey = key(row)
         let canonicalKey = CanonicalKey(domain: domain, key: rowKey)
-        if nextRows[canonicalKey].map({ $0.version <= batch.sourceVersion }) ?? true {
-          nextRows[canonicalKey] = (row, batch.sourceVersion)
+        if nextRows[canonicalKey].map({ $0.version.order <= sourceVersion.order }) ?? true {
+          nextRows[canonicalKey] = (row, sourceVersion)
         }
         materializationClaims.insert(rowKey)
-      case .delete(let rowKey):
+      case .delete(let rowKey, _):
         materializationClaims.remove(rowKey)
       }
     }
     nextClaims[materializationID] = materializationClaims
     for change in batch.changes {
-      guard case .delete(let rowKey) = change else { continue }
+      guard case .delete(let rowKey, let sourceVersion) = change else { continue }
       if !isClaimed(rowKey, in: nextClaims, domain: domain, current: materializationID) {
-        nextRows.removeValue(forKey: CanonicalKey(domain: domain, key: rowKey))
+        let canonicalKey = CanonicalKey(domain: domain, key: rowKey)
+        if nextRows[canonicalKey].map({ $0.version.order <= sourceVersion.order }) ?? true {
+          nextRows[canonicalKey] = (nil, sourceVersion)
+        }
       }
     }
 
@@ -173,13 +187,13 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
   public func rows(for demand: CollectionDemandIdentity) -> [Key: Model] {
     let domain = domain(for: demand)
     return canonicalRows.reduce(into: [:]) { result, pair in
-      if pair.key.domain == domain { result[pair.key.key] = pair.value.row }
+      if pair.key.domain == domain, let row = pair.value.row { result[pair.key.key] = row }
     }
   }
 
   public func rows() -> [Key: Model] {
     canonicalRows.reduce(into: [:]) { result, pair in
-      result[pair.key.key] = pair.value.row
+      if let row = pair.value.row { result[pair.key.key] = row }
     }
   }
 

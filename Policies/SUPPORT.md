@@ -1,6 +1,7 @@
 # Supported profile
 
-`ElectricCircuitsSwift` first supports the following public library profile:
+`ElectricCircuitsSwift` and `ElectricCircuitsCollections` support the following public library
+profile:
 
 - Swift tools version 6.0.
 - iOS 16 and newer.

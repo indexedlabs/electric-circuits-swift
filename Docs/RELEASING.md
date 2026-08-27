@@ -2,10 +2,11 @@
 
 ## 0.2.0 contract
 
-`0.2.0` is the current public source release of the `ElectricCircuitsSwift` library product. Its
-supported profile is Swift tools 6.0, iOS 16+, and macOS 13+; its wire surface is the checked-in
-native `/v1` contract corpus. The core remains Foundation-only. GRDB and the SwiftUI application
-are optional LinearLite example dependencies, not core dependencies.
+`0.2.0` is the current public source release of the `ElectricCircuitsSwift` and
+`ElectricCircuitsCollections` library products. Their supported profile is Swift tools 6.0, iOS 16+,
+and macOS 13+; the transport product's wire surface is the checked-in native `/v1` contract corpus.
+Both products remain Foundation-only. GRDB and the SwiftUI application are optional LinearLite
+example dependencies, not core dependencies.
 
 Use the [SemVer policy](../Policies/SEMVER.md) to classify later changes. In particular, retain the
 documented source-compatibility promise within a supported release line and do not imply binary
@@ -19,8 +20,9 @@ dependencies: [
 ]
 ```
 
-Add the `ElectricCircuitsSwift` product to the target that uses the client. Applications that use
-the optional LinearLite provider resolve its separate package and GRDB dependency themselves.
+Add the `ElectricCircuitsSwift` product to targets that use the client and the
+`ElectricCircuitsCollections` product to targets that use collection coordination. Applications that
+use the optional LinearLite provider resolve its separate package and GRDB dependency themselves.
 
 ## Before publishing
 
