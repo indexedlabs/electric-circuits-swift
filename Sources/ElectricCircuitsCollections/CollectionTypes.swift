@@ -56,8 +56,8 @@ public struct CollectionOrder<Model: Sendable>: Equatable, Hashable, Sendable {
   }
 }
 
-/// Rows requested by one consumer. `predicateIdentity` is produced by the typed collection
-/// predicate AST and deliberately contains no provider-specific column names.
+/// Rows requested by one consumer. Typed predicate identity includes the provider-neutral schema
+/// mapping that determines its wire fields, so distinct mappings cannot share a materialization.
 public struct CollectionDemand<Model: Sendable>: Sendable {
   public let predicateIdentity: String
   public let sourcePredicate: ElectricCircuitsSwift.Predicate?
@@ -86,7 +86,7 @@ public struct CollectionDemand<Model: Sendable>: Sendable {
     limit: Int? = nil
   ) {
     self.init(
-      unsafePredicateIdentity: predicate.canonicalDescription,
+      unsafePredicateIdentity: predicate.canonicalIdentity,
       sourcePredicate: predicate.circuitsPredicate,
       order: order,
       limit: limit

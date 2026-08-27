@@ -196,6 +196,71 @@ private actor LiveApplyFailingStore: CollectionStore {
   struct ApplyFailure: Error {}
 }
 
+private actor EvictionGateStore: CollectionStore {
+  typealias Model = CoordinatorIssue
+  typealias Key = Int
+
+  enum RemovalFailure: Error, Equatable {
+    case injected
+  }
+
+  private let base: InMemoryCollectionStore<CoordinatorIssue, Int>
+  private let failsRemoval: Bool
+  private var removalCalls = 0
+  private var removalStarted = false
+  private var removalStartedWaiters: [CheckedContinuation<Void, Never>] = []
+  private var removalGate: CheckedContinuation<Void, Never>?
+
+  init(base: InMemoryCollectionStore<CoordinatorIssue, Int>, failsRemoval: Bool) {
+    self.base = base
+    self.failsRemoval = failsRemoval
+  }
+
+  func materialization(for demand: CollectionDemandIdentity) async throws
+    -> CollectionMaterializationRecord?
+  {
+    try await base.materialization(for: demand)
+  }
+
+  func replaceSnapshot(
+    _ snapshot: CollectionSnapshot<CoordinatorIssue>,
+    materializationID: CollectionMaterializationID,
+    demand: CollectionDemandIdentity
+  ) async throws {
+    try await base.replaceSnapshot(snapshot, materializationID: materializationID, demand: demand)
+  }
+
+  func apply(
+    _ batch: CollectionChangeBatch<CoordinatorIssue, Int>,
+    to materializationID: CollectionMaterializationID
+  ) async throws {
+    try await base.apply(batch, to: materializationID)
+  }
+
+  func removeMaterialization(_ materializationID: CollectionMaterializationID) async throws {
+    removalCalls += 1
+    removalStarted = true
+    let waiters = removalStartedWaiters
+    removalStartedWaiters.removeAll()
+    for waiter in waiters { waiter.resume() }
+    await withCheckedContinuation { removalGate = $0 }
+    if failsRemoval { throw RemovalFailure.injected }
+    try await base.removeMaterialization(materializationID)
+  }
+
+  func waitForRemovalStart() async {
+    guard !removalStarted else { return }
+    await withCheckedContinuation { removalStartedWaiters.append($0) }
+  }
+
+  func releaseRemovalGate() {
+    removalGate?.resume()
+    removalGate = nil
+  }
+
+  func calls() -> Int { removalCalls }
+}
+
 private actor ReleaseCompletion {
   private var finished = false
 
@@ -213,6 +278,13 @@ private let coordinatorScope = CollectionScope(
   authorization: "workspace-1",
   generation: "generation-1"
 )
+
+private enum CoordinatorIssueFields {
+  static let statusFromIssue = CollectionField<CoordinatorIssue, String>(
+    id: "status", sourceName: "issue_status", storageName: "status")
+  static let statusFromWorkflow = CollectionField<CoordinatorIssue, String>(
+    id: "status", sourceName: "workflow_status", storageName: "status")
+}
 
 private func wait(
   for expected: CollectionLoadState,
@@ -281,6 +353,24 @@ struct CollectionCoordinatorContractTests {
 
     try await september.release()
     try await october.release()
+  }
+
+  @Test func typedPredicatesWithDifferentSchemaMappingsStartDistinctSources() async throws {
+    let source = ScriptedIssueSource(outcomes: [.success([]), .success([])])
+    let store = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let firstDemand = CollectionDemand(predicate: CoordinatorIssueFields.statusFromIssue == "open")
+    let secondDemand = CollectionDemand(
+      predicate: CoordinatorIssueFields.statusFromWorkflow == "open")
+
+    let first = await coordinator.acquire(firstDemand)
+    let second = await coordinator.acquire(secondDemand)
+    #expect(await wait(for: .live, lease: first))
+    #expect(await wait(for: .live, lease: second))
+    #expect(await source.starts.count == 2)
+    try await first.release()
+    try await second.release()
   }
 
   @Test func failedCachedRefreshRetainsLastSuccessfulRowsAndCursor() async throws {
@@ -523,5 +613,47 @@ struct CollectionCoordinatorContractTests {
     try await coordinator.evict(demand)
     #expect(try await store.materialization(for: identity) == nil)
     #expect(await store.rows().isEmpty)
+  }
+
+  @Test func concurrentEvictionsJoinOneSuccessfulRemoval() async throws {
+    let row = CoordinatorIssue(id: 1, title: "cached")
+    let source = ScriptedIssueSource(outcomes: [.success([row])])
+    let base = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let store = EvictionGateStore(base: base, failsRemoval: false)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let demand = CollectionDemand<CoordinatorIssue>(unsafePredicateIdentity: "open")
+    let lease = await coordinator.acquire(demand)
+    #expect(await wait(for: .live, lease: lease))
+    try await lease.release()
+
+    let first = Task { try await coordinator.evict(demand) }
+    await store.waitForRemovalStart()
+    let second = Task { try await coordinator.evict(demand) }
+    await store.releaseRemovalGate()
+    try await first.value
+    try await second.value
+    #expect(await store.calls() == 1)
+  }
+
+  @Test func concurrentEvictionsJoinOneFailure() async throws {
+    let row = CoordinatorIssue(id: 1, title: "cached")
+    let source = ScriptedIssueSource(outcomes: [.success([row])])
+    let base = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let store = EvictionGateStore(base: base, failsRemoval: true)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let demand = CollectionDemand<CoordinatorIssue>(unsafePredicateIdentity: "open")
+    let lease = await coordinator.acquire(demand)
+    #expect(await wait(for: .live, lease: lease))
+    try await lease.release()
+
+    let first = Task { try await coordinator.evict(demand) }
+    await store.waitForRemovalStart()
+    let second = Task { try await coordinator.evict(demand) }
+    await store.releaseRemovalGate()
+    await #expect(throws: EvictionGateStore.RemovalFailure.injected) { try await first.value }
+    await #expect(throws: EvictionGateStore.RemovalFailure.injected) { try await second.value }
+    #expect(await store.calls() == 1)
   }
 }

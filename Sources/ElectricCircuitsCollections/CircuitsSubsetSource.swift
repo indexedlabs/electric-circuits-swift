@@ -163,9 +163,12 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     } catch {
       do {
         try await client.releaseShape(feed)
-      } catch let release as ClientError {
+      } catch {
         await pendingCleanup.record(feed, for: materializationID)
-        throw CircuitsSubsetSourceError.release(release)
+        if let release = error as? ClientError {
+          throw CircuitsSubsetSourceError.release(release)
+        }
+        throw error
       }
       throw error
     }

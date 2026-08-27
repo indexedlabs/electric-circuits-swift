@@ -123,7 +123,7 @@ public actor CollectionCoordinator<
   private let store: Store
   private var entries: [CollectionDemandIdentity: Entry] = [:]
   private var demandByLease: [UUID: CollectionDemandIdentity] = [:]
-  private var evicting: Set<CollectionDemandIdentity> = []
+  private var evictionTasks: [CollectionDemandIdentity: Task<Void, Error>] = [:]
 
   public init(
     definition: CollectionDefinition<Model, Key>,
@@ -162,10 +162,10 @@ public actor CollectionCoordinator<
         refreshTask: nil,
         releaseToken: nil,
         releaseTask: nil,
-        awaitsEviction: evicting.contains(identity)
+        awaitsEviction: evictionTasks[identity] != nil
       )
       updates.continuation.yield(.unavailable)
-      if !evicting.contains(identity) {
+      if evictionTasks[identity] == nil {
         startAttempt(for: identity, attempt: attempt)
       }
     }
@@ -571,9 +571,20 @@ public actor CollectionCoordinator<
   /// in flight are fenced behind it and receive a fresh source attempt after it completes.
   public func evict(_ demand: CollectionDemand<Model>) async throws {
     let identity = demand.identity(for: definition, scope: scope)
+    if let task = evictionTasks[identity] {
+      try await task.value
+      return
+    }
     guard entries[identity] == nil else { throw CollectionEvictionError.activeDemand }
-    guard !evicting.contains(identity) else { return }
-    evicting.insert(identity)
+    let task = Task<Void, Error> { [weak self] in
+      guard let self else { return }
+      try await self.performEviction(identity)
+    }
+    evictionTasks[identity] = task
+    try await task.value
+  }
+
+  private func performEviction(_ identity: CollectionDemandIdentity) async throws {
     do {
       if let record = try await store.materialization(for: identity) {
         try await store.removeMaterialization(record.id)
@@ -586,7 +597,7 @@ public actor CollectionCoordinator<
   }
 
   private func finishEviction(_ identity: CollectionDemandIdentity) {
-    evicting.remove(identity)
+    evictionTasks.removeValue(forKey: identity)
     guard var entry = entries[identity], entry.awaitsEviction, !entry.leases.isEmpty else { return }
     entry.awaitsEviction = false
     entries[identity] = entry

@@ -71,6 +71,23 @@ public enum CollectionPredicateScalar: Hashable, Sendable {
     case .bool(let value): .bool(value)
     }
   }
+
+  fileprivate var canonicalIdentity: String {
+    switch self {
+    case .string(let value):
+      framed("string", value)
+    case .int(let value):
+      framed("int", String(value))
+    case .double(let value):
+      framed("double", String(value.bitPattern, radix: 16))
+    case .bool(let value):
+      framed("bool", value ? "true" : "false")
+    }
+  }
+}
+
+private func framed(_ tag: String, _ value: String) -> String {
+  "\(tag)\(value.utf8.count):\(value)"
 }
 
 public protocol CollectionPredicateValue: Sendable {
@@ -165,6 +182,32 @@ public indirect enum CollectionPredicateExpression: Hashable, Sendable {
     }
   }
 
+  /// Injective identity for a typed predicate. It includes the provider-neutral schema mapping
+  /// used to construct the outbound predicate, rather than exposing any provider query syntax.
+  public var canonicalIdentity: String {
+    switch self {
+    case .comparison(let column, let operation, let value):
+      "comparison"
+        + framed("f", column.id)
+        + framed("s", column.sourceName)
+        + framed("o", operation.rawValue)
+        + framed("v", value.canonicalIdentity)
+    case .isNull(let column, let isNull):
+      "isNull"
+        + framed("f", column.id)
+        + framed("s", column.sourceName)
+        + framed("n", isNull ? "true" : "false")
+    case .and(let expressions):
+      "and" + framed("n", String(expressions.count))
+        + expressions.map { framed("e", $0.canonicalIdentity) }.joined()
+    case .or(let expressions):
+      "or" + framed("n", String(expressions.count))
+        + expressions.map { framed("e", $0.canonicalIdentity) }.joined()
+    case .not(let expression):
+      "not" + framed("e", expression.canonicalIdentity)
+    }
+  }
+
   fileprivate var flatteningAnd: [Self] {
     if case .and(let expressions) = self { return expressions }
     return [self]
@@ -191,6 +234,12 @@ public struct CollectionPredicate<Model: Sendable>: Hashable, Sendable {
 
   public var canonicalDescription: String {
     expression.canonicalDescription
+  }
+
+  /// Stable identity for de-duplicating requests. This is intentionally distinct from the
+  /// display-oriented canonical description and includes each field's wire schema mapping.
+  public var canonicalIdentity: String {
+    expression.canonicalIdentity
   }
 }
 

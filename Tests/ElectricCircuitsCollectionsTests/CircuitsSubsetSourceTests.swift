@@ -34,6 +34,7 @@ private actor NativeSubsetTransport: HTTPTransport {
   private var headFailures: Int
   private var queryFailures: Int
   private var deleteFailures: Int
+  private var deleteTransportFailures: Int
 
   init(
     streamBodies: [String] = [
@@ -41,12 +42,14 @@ private actor NativeSubsetTransport: HTTPTransport {
     ],
     headFailures: Int = 0,
     queryFailures: Int = 0,
-    deleteFailures: Int = 0
+    deleteFailures: Int = 0,
+    deleteTransportFailures: Int = 0
   ) {
     self.streamBodies = streamBodies
     self.headFailures = headFailures
     self.queryFailures = queryFailures
     self.deleteFailures = deleteFailures
+    self.deleteTransportFailures = deleteTransportFailures
   }
 
   func send(_ request: URLRequest) async throws -> HTTPResponse {
@@ -81,6 +84,10 @@ private actor NativeSubsetTransport: HTTPTransport {
       try await Task.sleep(for: .seconds(3_600))
       throw CancellationError()
     case ("DELETE", "/v1/shapes/shape-1"):
+      if deleteTransportFailures > 0 {
+        deleteTransportFailures -= 1
+        throw URLError(.networkConnectionLost)
+      }
       if deleteFailures > 0 {
         deleteFailures -= 1
         return response("delete failed", request: request, status: 503)
@@ -365,6 +372,42 @@ struct CircuitsSubsetSourceTests {
     let session = try await source.materialize(
       demand, identity: identity, materializationID: materializationID)
     #expect(await transport.requests.filter { $0.httpMethod == "DELETE" }.count == 2)
+    try await session.stop()
+  }
+
+  @Test func arbitraryDeleteTransportFailureRetainsSetupCleanupAuthority() async throws {
+    let transport = NativeSubsetTransport(headFailures: 1, deleteTransportFailures: 1)
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let source = CircuitsSubsetSource<NativeIssue, Int64>(
+      client: client, transport: transport, table: "public.issues",
+      decodeRow: NativeIssue.init(row:), decodeKey: { Int64($0) ?? 0 })
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: CollectionID(rawValue: "issues"), key: \.id)
+    let scope = CollectionScope(principal: "u", authorization: "a", generation: "g")
+    let demand = CollectionDemand<NativeIssue>(unsafePredicateIdentity: "all")
+    let identity = demand.identity(for: definition, scope: scope)
+    let materializationID = CollectionMaterializationID(rawValue: "url-error-cleanup")
+
+    await #expect(throws: URLError.self) {
+      _ = try await source.materialize(
+        demand, identity: identity, materializationID: materializationID)
+    }
+    let firstRequests = await transport.requests
+    #expect(firstRequests.compactMap(\.httpMethod) == ["POST", "HEAD", "DELETE"])
+
+    let session = try await source.materialize(
+      demand, identity: identity, materializationID: materializationID)
+    let requests = await transport.requests
+    let deleteIndices = requests.indices.filter { requests[$0].httpMethod == "DELETE" }
+    let feedPostIndices = requests.indices.filter {
+      requests[$0].httpMethod == "POST" && requests[$0].url?.path == "/v1/subset-feeds"
+    }
+    #expect(deleteIndices.count == 2)
+    #expect(feedPostIndices.count == 2)
+    let retryDelete = try #require(deleteIndices.last)
+    let replacementPost = try #require(feedPostIndices.last)
+    #expect(retryDelete < replacementPost)
     try await session.stop()
   }
 

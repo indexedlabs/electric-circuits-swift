@@ -20,7 +20,7 @@ private enum PredicateIssueFields {
 
 @Suite("Typed collection predicates")
 struct CollectionPredicateTests {
-  @Test func oneASTUsesSourceNamesForCircuitsAndLogicalNamesForIdentity() {
+  @Test func oneASTUsesSourceNamesForCircuitsAndSchemaMappingsForIdentity() {
     let assigneeID = UUID(uuidString: "00000000-0000-4000-8000-000000000001")!
     let predicate =
       PredicateIssueFields.modifiedAt >= "2026-08-26T00:00:00Z"
@@ -42,8 +42,9 @@ struct CollectionPredicateTests {
         ]))
     #expect(predicate.canonicalDescription.contains("modifiedAt"))
     #expect(predicate.canonicalDescription.contains("assigneeID"))
-    #expect(!predicate.canonicalDescription.contains("modified_at"))
-    #expect(!predicate.canonicalDescription.contains("assignee_id"))
+    let demand = CollectionDemand(predicate: predicate)
+    #expect(demand.predicateIdentity.contains("s11:modified_at"))
+    #expect(demand.predicateIdentity.contains("s11:assignee_id"))
   }
 
   @Test func canonicalIdentityPreservesGroupingAndEscapesStrings() {
@@ -76,9 +77,25 @@ struct CollectionPredicateTests {
     let predicate = PredicateIssueFields.priority >= 2
     let demand = CollectionDemand(predicate: predicate, limit: 10)
 
-    #expect(demand.predicateIdentity == predicate.canonicalDescription)
+    #expect(demand.predicateIdentity.contains("s8:priority"))
     #expect(demand.sourcePredicate == predicate.circuitsPredicate)
     #expect(demand.limit == 10)
+  }
+
+  @Test func canonicalIdentityFramesTheWireSchemaMappingForEveryFieldOccurrence() {
+    let first = CollectionField<PredicateIssue, String>(
+      id: "status", sourceName: "issue_status", storageName: "status")
+    let second = CollectionField<PredicateIssue, String>(
+      id: "status", sourceName: "workflow_status", storageName: "status")
+    let firstPredicate = first == "open"
+    let secondPredicate = second == "open"
+
+    #expect(firstPredicate.canonicalDescription == secondPredicate.canonicalDescription)
+    let firstDemand = CollectionDemand(predicate: firstPredicate)
+    let secondDemand = CollectionDemand(predicate: secondPredicate)
+    #expect(firstDemand.predicateIdentity != secondDemand.predicateIdentity)
+    #expect(firstDemand.predicateIdentity.contains("s12:issue_status"))
+    #expect(secondDemand.predicateIdentity.contains("s15:workflow_status"))
   }
 
   @Test func demandIdentityCannotAliasDelimiterBearingPredicateAndOrderValues() {
