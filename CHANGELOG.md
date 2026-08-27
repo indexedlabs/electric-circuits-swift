@@ -3,6 +3,11 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
+## 0.2.1
+
+- Publish the collection-coordination release from the canonical `main` branch and update release
+  and consumer qualification references for the `0.2.1` tag.
+
 ## 0.2.0
 
 - Add the storage-neutral `ElectricCircuitsCollections` product with typed predicates, exact-demand

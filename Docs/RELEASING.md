@@ -1,8 +1,8 @@
 # Releasing ElectricCircuitsSwift
 
-## 0.2.0 contract
+## 0.2.1 contract
 
-`0.2.0` is the current public source release of the `ElectricCircuitsSwift` and
+`0.2.1` is the current public source release of the `ElectricCircuitsSwift` and
 `ElectricCircuitsCollections` library products. Their supported profile is Swift tools 6.0, iOS 16+,
 and macOS 13+; the transport product's wire surface is the checked-in native `/v1` contract corpus.
 Both products remain Foundation-only. GRDB and the SwiftUI application are optional LinearLite
@@ -16,7 +16,7 @@ module stability.
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.2.0"),
+  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.2.1"),
 ]
 ```
 
@@ -34,16 +34,16 @@ Scripts/qualify-versioned-linearlite-host.sh
 ```
 
 The versioned-host qualifier keeps normal development local: it creates a throwaway local
-source-control clone, tags only that clone as `0.2.0`, rewrites a copied LinearLite manifest to use
-`.package(url: ..., exact: "0.2.0")`, asserts SwiftPM's resolved version and location, runs the
+source-control clone, tags only that clone as `0.2.1`, rewrites a copied LinearLite manifest to use
+`.package(url: ..., exact: "0.2.1")`, asserts SwiftPM's resolved version and location, runs the
 LinearLite tests, and builds the real unsigned generic iOS Simulator host. It creates no canonical
 tag and leaves no generated package dependency in this repository.
 
 After review approves the exact candidate and its release evidence, the authorized publisher may:
 
 ```sh
-git tag -a 0.2.0 <candidate-sha> -m 'ElectricCircuitsSwift 0.2.0'
-git push origin 0.2.0
+git tag -a 0.2.1 <candidate-sha> -m 'ElectricCircuitsSwift 0.2.1'
+git push origin 0.2.1
 # Create the matching GitHub release from CHANGELOG.md through the approved release workflow.
 ```
 

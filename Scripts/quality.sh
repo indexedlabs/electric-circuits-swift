@@ -36,7 +36,7 @@ swift build -Xswiftc -emit-symbol-graph -Xswiftc -emit-symbol-graph-dir -Xswiftc
 xcrun docc convert Sources/ElectricCircuitsSwift/ElectricCircuitsSwift.docc \
   --additional-symbol-graph-dir "$symbol_graphs" --output-path "$work_dir/ElectricCircuitsSwift.doccarchive" \
   --fallback-display-name ElectricCircuitsSwift \
-  --fallback-bundle-identifier com.electriccircuits.swift --fallback-bundle-version 0.2.0 \
+  --fallback-bundle-identifier com.electriccircuits.swift --fallback-bundle-version 0.2.1 \
   --warnings-as-errors
 
 Scripts/generate-linear-lite-host-project.sh

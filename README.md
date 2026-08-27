@@ -165,11 +165,11 @@ wire contract, public API, and provider-schema release rules are explicit in
 [Policies/SUPPORT.md](Policies/SUPPORT.md) and [Policies/SEMVER.md](Policies/SEMVER.md). The DocC
 catalog begins at `ElectricCircuitsSwift` in Xcode's documentation viewer.
 
-## Install 0.2.0
+## Install 0.2.1
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.2.0"),
+  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.2.1"),
 ]
 ```
 
