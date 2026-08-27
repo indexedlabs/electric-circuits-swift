@@ -58,6 +58,10 @@ private actor ScriptedIssueSource: CollectionSourceAdapter {
     stopped.append(materializationID)
   }
 
+  func send(_ batch: CollectionChangeBatch<CoordinatorIssue, Int>) {
+    continuations.values.first?.yield(batch)
+  }
+
   struct SourceFailure: Error {}
 }
 
@@ -96,7 +100,7 @@ struct CollectionCoordinatorContractTests {
       source: source,
       store: store
     )
-    let demand = CollectionDemand<CoordinatorIssue>(predicateIdentity: "status=open")
+    let demand = CollectionDemand<CoordinatorIssue>(unsafePredicateIdentity: "status=open")
 
     let first = await coordinator.acquire(demand)
     let second = await coordinator.acquire(demand)
@@ -106,11 +110,11 @@ struct CollectionCoordinatorContractTests {
     #expect(await source.starts.count == 1)
     #expect(await store.rows() == [row.id: row])
 
-    await first.release()
+    try await first.release()
     #expect(await source.stopped.isEmpty)
     #expect(await second.state() == .live)
 
-    await second.release()
+    try await second.release()
     #expect(await source.stopped.count == 1)
     #expect(await store.rows() == [row.id: row])
   }
@@ -128,16 +132,17 @@ struct CollectionCoordinatorContractTests {
     )
 
     let september = await coordinator.acquire(
-      CollectionDemand(predicateIdentity: "window=september"))
-    let october = await coordinator.acquire(CollectionDemand(predicateIdentity: "window=october"))
+      CollectionDemand(unsafePredicateIdentity: "window=september"))
+    let october = await coordinator.acquire(
+      CollectionDemand(unsafePredicateIdentity: "window=october"))
 
     #expect(await wait(for: .live, lease: september))
     #expect(await wait(for: .live, lease: october))
     #expect(await source.starts.count == 2)
     #expect(await store.rows() == [firstRow.id: firstRow, secondRow.id: secondRow])
 
-    await september.release()
-    await october.release()
+    try await september.release()
+    try await october.release()
   }
 
   @Test func failedCachedRefreshRetainsLastSuccessfulRowsAndCursor() async throws {
@@ -150,19 +155,39 @@ struct CollectionCoordinatorContractTests {
       source: source,
       store: store
     )
-    let demand = CollectionDemand<CoordinatorIssue>(predicateIdentity: "status=open")
+    let demand = CollectionDemand<CoordinatorIssue>(unsafePredicateIdentity: "status=open")
     let identity = demand.identity(for: coordinatorIssues, scope: coordinatorScope)
 
     let first = await coordinator.acquire(demand)
     #expect(await wait(for: .live, lease: first))
     let committed = try #require(await store.materialization(for: identity))
-    await first.release()
+    try await first.release()
 
     let second = await coordinator.acquire(demand)
     #expect(await wait(for: .failed(.sourceUnavailable), lease: second))
     #expect(await store.rows() == [row.id: row])
     #expect(try await store.materialization(for: identity) == committed)
 
-    await second.release()
+    try await second.release()
+  }
+
+  @Test func awaitedLiveBatchMutatesTheStoreBeforeTheCoordinatorRemainsLive() async throws {
+    let original = CoordinatorIssue(id: 1, title: "before")
+    let updated = CoordinatorIssue(id: 1, title: "after")
+    let source = ScriptedIssueSource(outcomes: [.success([original])])
+    let store = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let demand = CollectionDemand<CoordinatorIssue>(unsafePredicateIdentity: "open")
+    let lease = await coordinator.acquire(demand)
+    #expect(await wait(for: .live, lease: lease))
+    await source.send(
+      .init(
+        changes: [.upsert(updated)], expectedCursor: .init(offset: "0"), cursor: .init(offset: "1"),
+        sourceVersion: .init(rawValue: "v1", order: 1)))
+    for _ in 0..<10_000 where await store.rows()[1] != updated { await Task.yield() }
+    #expect(await store.rows()[1] == updated)
+    #expect(await lease.state() == .live)
+    try await lease.release()
   }
 }

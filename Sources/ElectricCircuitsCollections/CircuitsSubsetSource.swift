@@ -6,6 +6,9 @@ public enum CircuitsSubsetSourceError: Error, Equatable, Sendable {
   case unsupportedLimitedLiveDemand(Int)
   case invalidSnapshotRow(index: Int)
   case invalidLiveKey(String)
+  case invalidSnapshotSourceVersion(String)
+  case invalidLiveSourceVersion(String?)
+  case release(ClientError)
   case subscription(ShapeSubscriptionFailure)
 }
 
@@ -94,16 +97,21 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
         }
         return try decodeRow(row)
       }
-      let cursor = StreamCursor(offset: frontier.offset, lsn: response.lsn)
+      guard let snapshotVersion = Self.postgresLSN(response.lsn) else {
+        throw CircuitsSubsetSourceError.invalidSnapshotSourceVersion(response.lsn)
+      }
+      let cursor = StreamCursor(offset: frontier.offset, lsn: snapshotVersion.rawValue)
       let lifecycle = CircuitsSubsetSessionLifecycle(client: client, initialHandle: feed)
       let snapshotFence = SnapshotFence(
         rawValue: Self.snapshotFence(offset: frontier.offset, sourceVersion: response.lsn))
 
       return CollectionSourceSession(
-        snapshot: CollectionSnapshot(rows: rows, fence: snapshotFence, cursor: cursor),
+        snapshot: CollectionSnapshot(
+          rows: rows, fence: snapshotFence, sourceVersion: snapshotVersion, cursor: cursor),
         run: { apply in
           let materializer = CircuitsCollectionTailMaterializer(
             cursor: cursor,
+            sourceVersion: snapshotVersion,
             decodeRow: decodeRow,
             decodeKey: decodeKey,
             apply: apply
@@ -120,7 +128,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
             telemetry: telemetry,
             kind: .subsetFeed
           )
-          await lifecycle.install(coordinator)
+          try await lifecycle.install(coordinator)
           let states = await coordinator.stateUpdates
           do {
             try await withTaskCancellationHandler {
@@ -140,17 +148,21 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
                 }
               }
             } onCancel: {
-              Task { await lifecycle.stop() }
+              Task { _ = try? await lifecycle.stop() }
             }
           } catch {
-            await lifecycle.stop()
+            try await lifecycle.stop()
             throw error
           }
         },
-        stop: { await lifecycle.stop() }
+        stop: { try await lifecycle.stop() }
       )
     } catch {
-      try? await client.releaseShape(feed)
+      do {
+        try await client.releaseShape(feed)
+      } catch let release as ClientError {
+        throw CircuitsSubsetSourceError.release(release)
+      }
       throw error
     }
   }
@@ -160,6 +172,17 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       .map { "\($0.utf8.count):\($0)" }
       .joined(separator: "|")
   }
+
+  /// PostgreSQL LSNs are two unsigned hexadecimal 32-bit words. A `UInt64` sort key is portable
+  /// to Indexed/GRDB stores and avoids trusting lexicographic wire strings.
+  fileprivate static func postgresLSN(_ value: String) -> CollectionSourceVersion? {
+    let words = value.split(separator: "/", omittingEmptySubsequences: false)
+    guard words.count == 2, !words[0].isEmpty, !words[1].isEmpty,
+      let high = UInt64(words[0], radix: 16), let low = UInt64(words[1], radix: 16),
+      high <= UInt64(UInt32.max), low <= UInt64(UInt32.max)
+    else { return nil }
+    return CollectionSourceVersion(rawValue: value, order: (high << 32) | low)
+  }
 }
 
 private actor CircuitsSubsetSessionLifecycle {
@@ -168,17 +191,17 @@ private actor CircuitsSubsetSessionLifecycle {
   private var coordinator: ShapeSubscriptionCoordinator?
   private var coordinatorStarted = false
   private var stopped = false
-  private var stopTask: Task<Void, Never>?
+  private var stopTask: Task<Void, Error>?
 
   init(client: ElectricCircuitsClient, initialHandle: ShapeHandle) {
     self.client = client
     self.initialHandle = initialHandle
   }
 
-  func install(_ coordinator: ShapeSubscriptionCoordinator) async {
+  func install(_ coordinator: ShapeSubscriptionCoordinator) async throws {
     guard !stopped else {
-      try? await coordinator.stop()
-      return
+      try await coordinator.stop()
+      throw CancellationError()
     }
     self.coordinator = coordinator
   }
@@ -187,9 +210,14 @@ private actor CircuitsSubsetSessionLifecycle {
     coordinatorStarted = true
   }
 
-  func stop() async {
+  func stop() async throws {
     if let stopTask {
-      await stopTask.value
+      do {
+        try await stopTask.value
+      } catch {
+        self.stopTask = nil
+        throw error
+      }
       return
     }
     stopped = true
@@ -197,16 +225,16 @@ private actor CircuitsSubsetSessionLifecycle {
     let coordinatorStarted = coordinatorStarted
     let client = client
     let initialHandle = initialHandle
-    let task = Task {
+    let task = Task<Void, Error> {
       if let coordinator {
-        try? await coordinator.stop()
+        try await coordinator.stop()
       }
       if !coordinatorStarted {
-        try? await client.releaseShape(initialHandle)
+        try await client.releaseShape(initialHandle)
       }
     }
     stopTask = task
-    await task.value
+    try await task.value
   }
 }
 
@@ -214,17 +242,20 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
   ShapeMaterializer
 {
   private var cursor: StreamCursor?
+  private var sourceVersion: CollectionSourceVersion
   private let decodeRow: @Sendable (ChangeRow) throws -> Model
   private let decodeKey: @Sendable (String) throws -> Key
   private let applyBatch: @Sendable (CollectionChangeBatch<Model, Key>) async throws -> Void
 
   init(
     cursor: StreamCursor,
+    sourceVersion: CollectionSourceVersion,
     decodeRow: @escaping @Sendable (ChangeRow) throws -> Model,
     decodeKey: @escaping @Sendable (String) throws -> Key,
     apply: @escaping @Sendable (CollectionChangeBatch<Model, Key>) async throws -> Void
   ) {
     self.cursor = cursor
+    self.sourceVersion = sourceVersion
     self.decodeRow = decodeRow
     self.decodeKey = decodeKey
     applyBatch = apply
@@ -245,23 +276,37 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
         advancingTo: nextCursor
       )
     }
-    let changes = try batch.envelopes.map { envelope -> CollectionChange<Model, Key> in
+    var accepted: [CollectionChange<Model, Key>] = []
+    var latest = sourceVersion
+    for envelope in batch.envelopes {
+      guard let rawVersion = envelope.headers.lsn,
+        let version = CircuitsSubsetSource<Model, Key>.postgresLSN(rawVersion)
+      else {
+        throw CircuitsSubsetSourceError.invalidLiveSourceVersion(envelope.headers.lsn)
+      }
+      // The feed starts before the subset snapshot. Always consume its durable offset, but only
+      // expose mutations after the snapshot's source prefix; this makes update/delete overlap
+      // safe without regressing the persisted source watermark.
+      guard version > latest else { continue }
+      latest = version
       switch envelope.headers.operation {
       case .delete:
-        do { return .delete(try decodeKey(envelope.key)) } catch {
+        do { accepted.append(.delete(try decodeKey(envelope.key))) } catch {
           throw CircuitsSubsetSourceError.invalidLiveKey(envelope.key)
         }
       case .insert, .update, .upsert:
         guard let value = envelope.value else { throw StreamError.missingValue(key: envelope.key) }
-        return .upsert(try decodeRow(value))
+        accepted.append(.upsert(try decodeRow(value)))
       }
     }
     try await applyBatch(
       CollectionChangeBatch(
-        changes: changes,
+        changes: accepted,
         expectedCursor: expectedCursor,
-        cursor: nextCursor
+        cursor: StreamCursor(offset: nextCursor.offset, lsn: latest.rawValue),
+        sourceVersion: latest
       ))
-    cursor = nextCursor
+    cursor = StreamCursor(offset: nextCursor.offset, lsn: latest.rawValue)
+    sourceVersion = latest
   }
 }

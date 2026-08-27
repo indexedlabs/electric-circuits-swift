@@ -19,7 +19,11 @@ private let scope = CollectionScope(
 )
 
 private func demand(_ identity: String) -> CollectionDemandIdentity {
-  CollectionDemand<TestIssue>(predicateIdentity: identity).identity(for: issues, scope: scope)
+  CollectionDemand<TestIssue>(unsafePredicateIdentity: identity).identity(for: issues, scope: scope)
+}
+
+private func version(_ order: UInt64) -> CollectionSourceVersion {
+  CollectionSourceVersion(rawValue: "0/\(String(order, radix: 16).uppercased())", order: order)
 }
 
 @Suite("Collection store contract")
@@ -130,5 +134,52 @@ struct CollectionStoreContractTests {
     #expect(await store.rows() == [updated.id: updated])
     #expect(await store.rowClaims(for: materialization) == [updated.id])
     #expect(try await store.materialization(for: demand("today"))?.cursor == next)
+  }
+
+  @Test func sameKeyInDifferentScopesNeverLeaksCanonicalRowsOrClaims() async throws {
+    let store = InMemoryCollectionStore<TestIssue, Int>(key: \.id)
+    let first = CollectionMaterializationID(rawValue: "first")
+    let second = CollectionMaterializationID(rawValue: "second")
+    let firstDemand = demand("all")
+    let otherScope = CollectionScope(
+      principal: "user-2", authorization: "workspace-1", generation: "generation-1")
+    let secondDemand = CollectionDemand<TestIssue>(unsafePredicateIdentity: "all").identity(
+      for: issues, scope: otherScope)
+    try await store.replaceSnapshot(
+      .init(
+        rows: [.init(id: 1, title: "first")], fence: .init(rawValue: "f1"),
+        sourceVersion: version(1)),
+      materializationID: first, demand: firstDemand)
+    try await store.replaceSnapshot(
+      .init(
+        rows: [.init(id: 1, title: "second")], fence: .init(rawValue: "f2"),
+        sourceVersion: version(1)),
+      materializationID: second, demand: secondDemand)
+    #expect(await store.rows(for: firstDemand)[1]?.title == "first")
+    #expect(await store.rows(for: secondDemand)[1]?.title == "second")
+    try await store.removeMaterialization(first)
+    #expect(await store.rows(for: secondDemand)[1]?.title == "second")
+  }
+
+  @Test func olderOverlappingSnapshotAndLiveBatchCannotOverwriteNewerCanonicalRow() async throws {
+    let store = InMemoryCollectionStore<TestIssue, Int>(key: \.id)
+    let materialization = CollectionMaterializationID(rawValue: "today")
+    let identity = demand("today")
+    try await store.replaceSnapshot(
+      .init(
+        rows: [.init(id: 1, title: "new")], fence: .init(rawValue: "new"),
+        sourceVersion: version(20), cursor: .init(offset: "20")),
+      materializationID: materialization, demand: identity)
+    try await store.replaceSnapshot(
+      .init(
+        rows: [.init(id: 1, title: "old")], fence: .init(rawValue: "old"),
+        sourceVersion: version(10), cursor: .init(offset: "10")),
+      materializationID: materialization, demand: identity)
+    try await store.apply(
+      .init(
+        changes: [.upsert(.init(id: 1, title: "older-live"))], expectedCursor: .init(offset: "20"),
+        cursor: .init(offset: "21"), sourceVersion: version(15)), to: materialization)
+    #expect(await store.rows(for: identity)[1]?.title == "new")
+    #expect(try await store.materialization(for: identity)?.sourceVersion == version(20))
   }
 }

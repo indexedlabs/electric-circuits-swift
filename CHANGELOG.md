@@ -3,7 +3,7 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
-## Unreleased
+## 0.2.0
 
 - Add the storage-neutral `ElectricCircuitsCollections` product with typed predicates, exact-demand
   lease sharing, an atomic row-claim/snapshot/cursor store contract, and an in-memory reference store.

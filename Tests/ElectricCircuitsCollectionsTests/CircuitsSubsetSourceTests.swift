@@ -30,6 +30,15 @@ private struct NativeIssue: Equatable, Sendable {
 private actor NativeSubsetTransport: HTTPTransport {
   private(set) var requests: [URLRequest] = []
   private var streamReads = 0
+  private var streamBodies: [String]
+
+  init(
+    streamBodies: [String] = [
+      #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"Live"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#
+    ]
+  ) {
+    self.streamBodies = streamBodies
+  }
 
   func send(_ request: URLRequest) async throws -> HTTPResponse {
     requests.append(request)
@@ -47,11 +56,10 @@ private actor NativeSubsetTransport: HTTPTransport {
         request: request)
     case ("GET", "/streams/shape-1"):
       streamReads += 1
-      if streamReads == 1 {
+      if !streamBodies.isEmpty {
+        let body = streamBodies.removeFirst()
         return response(
-          #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"Live"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#,
-          request: request,
-          headers: ["stream-next-offset": "11"])
+          body, request: request, headers: ["stream-next-offset": "\(10 + streamReads)"])
       }
       try await Task.sleep(for: .seconds(3_600))
       throw CancellationError()
@@ -111,10 +119,11 @@ struct CircuitsSubsetSourceTests {
     let scope = CollectionScope(
       principal: "user-1", authorization: "workspace-1", generation: "generation-1")
     let demand = CollectionDemand<NativeIssue>(
-      predicateIdentity: "status=open",
+      unsafePredicateIdentity: "status=open",
       sourcePredicate: .leaf(column: "status", op: .eq, value: .string("open")),
       order: [
-        CollectionOrder(fieldID: "modified", sourceName: "modified_at", direction: .descending)
+        CollectionOrder(
+          unsafeFieldID: "modified", sourceName: "modified_at", direction: .descending)
       ]
     )
     let identity = demand.identity(for: definition, scope: scope)
@@ -140,12 +149,12 @@ struct CircuitsSubsetSourceTests {
     #expect(batch.cursor == StreamCursor(offset: "11", lsn: "0/20"))
     guard case .upsert(let issue) = try #require(batch.changes.first) else {
       Issue.record("expected an upsert")
-      await session.stop()
+      try await session.stop()
       return
     }
     #expect(issue == NativeIssue(id: 1, title: "Live"))
 
-    await session.stop()
+    try await session.stop()
     try await run.value
 
     let requests = await transport.requests
@@ -183,9 +192,10 @@ struct CircuitsSubsetSourceTests {
     let scope = CollectionScope(
       principal: "user-1", authorization: "workspace-1", generation: "generation-1")
     let demand = CollectionDemand<NativeIssue>(
-      predicateIdentity: "recent",
+      unsafePredicateIdentity: "recent",
       order: [
-        CollectionOrder(fieldID: "modified", sourceName: "modified_at", direction: .descending)
+        CollectionOrder(
+          unsafeFieldID: "modified", sourceName: "modified_at", direction: .descending)
       ],
       limit: 10
     )
@@ -198,5 +208,58 @@ struct CircuitsSubsetSourceTests {
       )
     }
     #expect(await transport.requests.isEmpty)
+  }
+
+  @Test func overlapAtOrBeforeSnapshotAdvancesOffsetWithoutMutatingAndStallsSafely() async throws {
+    let transport = NativeSubsetTransport(streamBodies: [
+      #"[{"type":"public.issues","key":"1","headers":{"operation":"delete","lsn":"0/F"}},{"type":"public.issues","key":"1","value":{"id":1,"title":"Old"},"headers":{"operation":"update","lsn":"0/10"}}]"#
+    ])
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let source = CircuitsSubsetSource<NativeIssue, Int64>(
+      client: client, transport: transport, table: "public.issues",
+      retryPolicy: .init(maxRetries: 0), decodeRow: NativeIssue.init(row:),
+      decodeKey: {
+        guard let key = Int64($0) else { throw NativeIssue.DecodeFailure() }
+        return key
+      })
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: CollectionID(rawValue: "issues"), key: \.id)
+    let scope = CollectionScope(principal: "u", authorization: "a", generation: "g")
+    let demand = CollectionDemand<NativeIssue>(unsafePredicateIdentity: "all")
+    let session = try await source.materialize(
+      demand, identity: demand.identity(for: definition, scope: scope),
+      materializationID: CollectionMaterializationID(rawValue: "overlap"))
+    let applied = AppliedNativeBatches()
+    let task = Task { try await session.run { await applied.append($0) } }
+    for _ in 0..<10_000 where await applied.values().isEmpty { await Task.yield() }
+    let batch = try #require(await applied.values().first)
+    #expect(batch.changes.isEmpty)
+    #expect(batch.cursor.offset == "11")
+    #expect(batch.cursor.lsn == "0/10")
+    try await session.stop()
+    try await task.value
+  }
+
+  @Test func missingOrMalformedLiveLSNIsRejectedBeforeApplication() async throws {
+    let transport = NativeSubsetTransport(streamBodies: [
+      #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"Bad"},"headers":{"operation":"upsert"}}]"#
+    ])
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let source = CircuitsSubsetSource<NativeIssue, Int64>(
+      client: client, transport: transport, table: "public.issues",
+      retryPolicy: .init(maxRetries: 0),
+      decodeRow: NativeIssue.init(row:), decodeKey: { Int64($0) ?? 0 })
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: CollectionID(rawValue: "issues"), key: \.id)
+    let scope = CollectionScope(principal: "u", authorization: "a", generation: "g")
+    let demand = CollectionDemand<NativeIssue>(unsafePredicateIdentity: "all")
+    let session = try await source.materialize(
+      demand, identity: demand.identity(for: definition, scope: scope),
+      materializationID: CollectionMaterializationID(rawValue: "bad-lsn"))
+    await #expect(throws: CircuitsSubsetSourceError.subscription(.materializer)) {
+      try await session.run { _ in Issue.record("must not apply") }
+    }
   }
 }

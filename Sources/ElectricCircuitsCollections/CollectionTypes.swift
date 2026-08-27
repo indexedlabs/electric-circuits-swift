@@ -37,8 +37,10 @@ public struct CollectionOrder<Model: Sendable>: Equatable, Hashable, Sendable {
   public let sourceName: String
   public let direction: Direction
 
+  /// Escape hatch for providers that do not have typed schema fields. It makes no aliasing
+  /// guarantee: callers own keeping this source spelling aligned with the wire predicate.
   public init(
-    fieldID: String,
+    unsafeFieldID fieldID: String,
     sourceName: String? = nil,
     direction: Direction = .ascending
   ) {
@@ -47,6 +49,10 @@ public struct CollectionOrder<Model: Sendable>: Equatable, Hashable, Sendable {
     self.fieldID = fieldID
     self.sourceName = sourceName
     self.direction = direction
+  }
+
+  public init<Value>(field: CollectionField<Model, Value>, direction: Direction = .ascending) {
+    self.init(unsafeFieldID: field.id, sourceName: field.sourceName, direction: direction)
   }
 }
 
@@ -58,8 +64,10 @@ public struct CollectionDemand<Model: Sendable>: Sendable {
   public let order: [CollectionOrder<Model>]
   public let limit: Int?
 
+  /// Escape hatch for provider adapters. Typed `CollectionPredicate` construction is the only
+  /// public form that guarantees the identity and wire predicate describe the same expression.
   public init(
-    predicateIdentity: String,
+    unsafePredicateIdentity predicateIdentity: String,
     sourcePredicate: ElectricCircuitsSwift.Predicate? = nil,
     order: [CollectionOrder<Model>] = [],
     limit: Int? = nil
@@ -78,7 +86,7 @@ public struct CollectionDemand<Model: Sendable>: Sendable {
     limit: Int? = nil
   ) {
     self.init(
-      predicateIdentity: predicate.canonicalDescription,
+      unsafePredicateIdentity: predicate.canonicalDescription,
       sourcePredicate: predicate.circuitsPredicate,
       order: order,
       limit: limit
@@ -163,6 +171,22 @@ public struct SnapshotFence: RawRepresentable, Codable, Equatable, Hashable, Sen
   }
 }
 
+/// A source-provided, totally ordered row-state version. Stores persist both values and compare
+/// `order`; they never infer an order from a transport cursor. Sources must reject values they
+/// cannot translate to this contract before mutating a collection.
+public struct CollectionSourceVersion: Codable, Equatable, Hashable, Comparable, Sendable {
+  public let rawValue: String
+  public let order: UInt64
+
+  public init(rawValue: String, order: UInt64) {
+    precondition(!rawValue.isEmpty)
+    self.rawValue = rawValue
+    self.order = order
+  }
+
+  public static func < (lhs: Self, rhs: Self) -> Bool { lhs.order < rhs.order }
+}
+
 public enum CollectionMaterializationState: String, Codable, Equatable, Sendable {
   case cached
   case live
@@ -174,6 +198,7 @@ public struct CollectionMaterializationRecord: Codable, Equatable, Sendable {
   public let demand: CollectionDemandIdentity
   public let state: CollectionMaterializationState
   public let snapshotFence: SnapshotFence
+  public let sourceVersion: CollectionSourceVersion
   public let cursor: StreamCursor?
 
   public init(
@@ -181,12 +206,14 @@ public struct CollectionMaterializationRecord: Codable, Equatable, Sendable {
     demand: CollectionDemandIdentity,
     state: CollectionMaterializationState,
     snapshotFence: SnapshotFence,
+    sourceVersion: CollectionSourceVersion,
     cursor: StreamCursor?
   ) {
     self.id = id
     self.demand = demand
     self.state = state
     self.snapshotFence = snapshotFence
+    self.sourceVersion = sourceVersion
     self.cursor = cursor
   }
 }
@@ -194,11 +221,17 @@ public struct CollectionMaterializationRecord: Codable, Equatable, Sendable {
 public struct CollectionSnapshot<Model: Sendable>: Sendable {
   public let rows: [Model]
   public let fence: SnapshotFence
+  public let sourceVersion: CollectionSourceVersion
   public let cursor: StreamCursor?
 
-  public init(rows: [Model], fence: SnapshotFence, cursor: StreamCursor? = nil) {
+  public init(
+    rows: [Model], fence: SnapshotFence,
+    sourceVersion: CollectionSourceVersion = .init(rawValue: "initial", order: 0),
+    cursor: StreamCursor? = nil
+  ) {
     self.rows = rows
     self.fence = fence
+    self.sourceVersion = sourceVersion
     self.cursor = cursor
   }
 }
@@ -212,14 +245,19 @@ public struct CollectionChangeBatch<Model: Sendable, Key: Hashable & Sendable>: 
   public let changes: [CollectionChange<Model, Key>]
   public let expectedCursor: StreamCursor?
   public let cursor: StreamCursor
+  /// The greatest accepted source version represented by this batch. A provider must atomically
+  /// persist it with the rows and cursor, and ignore row mutations older than its current value.
+  public let sourceVersion: CollectionSourceVersion
 
   public init(
     changes: [CollectionChange<Model, Key>],
     expectedCursor: StreamCursor?,
-    cursor: StreamCursor
+    cursor: StreamCursor,
+    sourceVersion: CollectionSourceVersion = .init(rawValue: "initial", order: 0)
   ) {
     self.changes = changes
     self.expectedCursor = expectedCursor
     self.cursor = cursor
+    self.sourceVersion = sourceVersion
   }
 }

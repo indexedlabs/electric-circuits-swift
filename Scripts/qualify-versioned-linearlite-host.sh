@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Proves the published-package boundary without changing the development fixture's local-path
-# dependency. The only 0.1.0 tag created here belongs to a throwaway clone and is deleted with it.
+# dependency. The only 0.2.0 tag created here belongs to a throwaway clone and is deleted with it.
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-version=0.1.0
+version=0.2.0
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/electric-circuits-swift-versioned-host.XXXXXX")
 trap 'rm -rf "$work_dir"' EXIT
 
@@ -54,7 +54,7 @@ manifest="$consumer_package/Package.swift"
 RELEASE_REPOSITORY_URL="file://$release_repo" perl -0pi -e '
   BEGIN {
     $old = q{.package(name: "electric-circuits-swift", path: "../.."),};
-    $new = qq{.package(url: "$ENV{RELEASE_REPOSITORY_URL}", exact: "0.1.0"),};
+    $new = qq{.package(url: "$ENV{RELEASE_REPOSITORY_URL}", exact: "0.2.0"),};
   }
   s/\Q$old\E/$new/ or die "versioned-host: LinearLite package no longer has the expected development dependency\n";
 ' "$manifest"

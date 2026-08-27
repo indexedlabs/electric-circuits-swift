@@ -8,7 +8,7 @@ public struct CollectionSourceSession<Model: Sendable, Key: Hashable & Sendable>
     @Sendable (
       @escaping @Sendable (CollectionChangeBatch<Model, Key>) async throws -> Void
     ) async throws -> Void
-  public let stop: @Sendable () async -> Void
+  public let stop: @Sendable () async throws -> Void
 
   public init(
     snapshot: CollectionSnapshot<Model>,
@@ -16,7 +16,7 @@ public struct CollectionSourceSession<Model: Sendable, Key: Hashable & Sendable>
       @escaping @Sendable (
         @escaping @Sendable (CollectionChangeBatch<Model, Key>) async throws -> Void
       ) async throws -> Void,
-    stop: @escaping @Sendable () async -> Void
+    stop: @escaping @Sendable () async throws -> Void
   ) {
     self.snapshot = snapshot
     self.run = run

@@ -21,7 +21,7 @@ public actor CollectionLease {
   private let id: UUID
   private let stateAction: @Sendable (UUID) async -> CollectionLoadState
   private let refreshAction: @Sendable (UUID) async -> Void
-  private let releaseAction: @Sendable (UUID) async -> Void
+  private let releaseAction: @Sendable (UUID) async throws -> Void
   private var released = false
 
   init(
@@ -29,7 +29,7 @@ public actor CollectionLease {
     stateUpdates: AsyncStream<CollectionLoadState>,
     stateAction: @escaping @Sendable (UUID) async -> CollectionLoadState,
     refreshAction: @escaping @Sendable (UUID) async -> Void,
-    releaseAction: @escaping @Sendable (UUID) async -> Void
+    releaseAction: @escaping @Sendable (UUID) async throws -> Void
   ) {
     self.id = id
     self.stateUpdates = stateUpdates
@@ -48,30 +48,37 @@ public actor CollectionLease {
     await refreshAction(id)
   }
 
-  public func release() async {
+  public func release() async throws {
     guard !released else { return }
+    try await releaseAction(id)
     released = true
-    await releaseAction(id)
   }
 }
 
 private actor AtMostOnceStop {
-  private let action: @Sendable () async -> Void
-  private var task: Task<Void, Never>?
+  private let action: @Sendable () async throws -> Void
+  private var task: Task<Void, Error>?
 
-  init(_ action: @escaping @Sendable () async -> Void) {
+  init(_ action: @escaping @Sendable () async throws -> Void) {
     self.action = action
   }
 
-  func call() async {
+  func call() async throws {
     if let task {
-      await task.value
+      do {
+        try await task.value
+      } catch {
+        // A remote DELETE failed; retain the caller's lease authority but allow a later explicit
+        // release to issue the retry rather than pinning this at-most-once wrapper forever.
+        self.task = nil
+        throw error
+      }
       return
     }
     let action = action
-    let task = Task { await action() }
+    let task = Task<Void, Error> { try await action() }
     self.task = task
-    await task.value
+    try await task.value
   }
 }
 
@@ -146,7 +153,7 @@ public actor CollectionCoordinator<
       stateUpdates: updates.stream,
       stateAction: { await self.state(for: $0) },
       refreshAction: { await self.refresh(leaseID: $0) },
-      releaseAction: { await self.release(leaseID: $0) }
+      releaseAction: { try await self.release(leaseID: $0) }
     )
   }
 
@@ -213,13 +220,17 @@ public actor CollectionCoordinator<
 
     let stop = AtMostOnceStop(session.stop)
     guard install(stop: stop, identity: identity, attempt: attempt) else {
-      await stop.call()
+      do {
+        try await stop.call()
+      } catch {
+        fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
+      }
       return
     }
     do {
       try Task.checkCancellation()
       guard let current = entries[identity], current.attempt == attempt else {
-        await stop.call()
+        try await stop.call()
         return
       }
       try await store.replaceSnapshot(
@@ -228,16 +239,16 @@ public actor CollectionCoordinator<
         demand: identity
       )
     } catch is CancellationError {
-      await stop.call()
+      await cleanup(stop, identity: identity, attempt: attempt)
       return
     } catch {
-      await stop.call()
+      await cleanup(stop, identity: identity, attempt: attempt)
       fail(identity: identity, attempt: attempt, with: .storeUnavailable)
       return
     }
 
     guard updateEntry(identity: identity, attempt: attempt, state: .live) else {
-      await stop.call()
+      await cleanup(stop, identity: identity, attempt: attempt)
       return
     }
 
@@ -247,19 +258,19 @@ public actor CollectionCoordinator<
         try await self.apply(batch, identity: identity, attempt: attempt)
       }
     } catch is CancellationError {
-      await stop.call()
+      await cleanup(stop, identity: identity, attempt: attempt)
       return
     } catch is CollectionStoreApplyFailure {
-      await stop.call()
+      await cleanup(stop, identity: identity, attempt: attempt)
       fail(identity: identity, attempt: attempt, with: .storeUnavailable)
       return
     } catch {
-      await stop.call()
+      await cleanup(stop, identity: identity, attempt: attempt)
       fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
       return
     }
 
-    await stop.call()
+    await cleanup(stop, identity: identity, attempt: attempt)
     finishStream(identity: identity, attempt: attempt)
   }
 
@@ -276,6 +287,15 @@ public actor CollectionCoordinator<
       throw CancellationError()
     } catch {
       throw CollectionStoreApplyFailure()
+    }
+  }
+
+  private func cleanup(
+    _ stop: AtMostOnceStop, identity: CollectionDemandIdentity, attempt: UUID
+  ) async {
+    do { try await stop.call() } catch {
+      // Keep the failed stop installed so a lease release can retry the same server authority.
+      fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
     }
   }
 
@@ -342,6 +362,7 @@ public actor CollectionCoordinator<
   private func refresh(leaseID: UUID) async {
     guard let identity = demandByLease[leaseID], var entry = entries[identity] else { return }
     entry.task?.cancel()
+    let previousTask = entry.task
     let previousStop = entry.stop
     let attempt = UUID()
     entry.attempt = attempt
@@ -352,22 +373,31 @@ public actor CollectionCoordinator<
     for continuation in entry.leases.values {
       continuation.yield(.refreshing)
     }
-    await previousStop?.call()
+    // A cancellation-resistant source may still be applying or holding its server claim. Join it
+    // before installing a replacement so its delayed cleanup cannot release the new attempt.
+    if let previousTask { await previousTask.value }
+    do { try await previousStop?.call() } catch {
+      fail(identity: identity, attempt: entry.attempt, with: .sourceUnavailable)
+      return
+    }
     startAttempt(for: identity, attempt: attempt)
   }
 
-  private func release(leaseID: UUID) async {
-    guard let identity = demandByLease.removeValue(forKey: leaseID), var entry = entries[identity]
+  private func release(leaseID: UUID) async throws {
+    guard let identity = demandByLease[leaseID], var entry = entries[identity]
     else { return }
-    entry.leases.removeValue(forKey: leaseID)?.finish()
-    guard entry.leases.isEmpty else {
+    guard entry.leases.count == 1 else {
+      demandByLease.removeValue(forKey: leaseID)
+      entry.leases.removeValue(forKey: leaseID)?.finish()
       entries[identity] = entry
       return
     }
 
     entry.task?.cancel()
     let stop = entry.stop
+    if let stop { try await stop.call() }
+    demandByLease.removeValue(forKey: leaseID)
+    entry.leases.removeValue(forKey: leaseID)?.finish()
     entries.removeValue(forKey: identity)
-    await stop?.call()
   }
 }

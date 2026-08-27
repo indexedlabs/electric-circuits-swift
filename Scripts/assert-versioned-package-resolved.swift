@@ -87,7 +87,7 @@ private func assertPin(
 private func selfTest() throws {
   let identity = "electric-circuits-swift"
   let location = "/tmp/electric-circuits-swift-release"
-  let version = "0.1.0"
+  let version = "0.2.0"
   let revision = "0123456789abcdef0123456789abcdef01234567"
   let valid = PackageResolved(
     pins: [.init(identity: identity, location: location, state: .init(revision: revision, version: version))])
