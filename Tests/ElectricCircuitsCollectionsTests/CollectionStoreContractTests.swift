@@ -61,11 +61,36 @@ struct CollectionStoreContractTests {
     #expect(try JSONDecoder().decode(CollectionMaterializationRecord.self, from: data) == record)
   }
 
-  @Test func sourceVersionComparisonUsesTheSameOrderingAsEquality() {
+  @Test func sourceVersionComparisonUsesOrderAsItsOnlySemanticIdentity() {
     let first = CollectionSourceVersion(rawValue: "a", order: 7)
     let second = CollectionSourceVersion(rawValue: "b", order: 7)
-    #expect(first != second)
-    #expect(first < second)
+    #expect(first == second)
+    #expect(!(first < second))
+    #expect(!(second < first))
+    #expect(Set([first, second]).count == 1)
+  }
+
+  @Test func equalOrderVersionsUseTheSameStoreFreshnessRuleForSnapshotsRowsAndHighWater()
+    async throws
+  {
+    let store = InMemoryCollectionStore<TestIssue, Int>(key: \.id)
+    let materialization = CollectionMaterializationID(rawValue: "today")
+    let identity = demand("today")
+    let first = CollectionSourceVersion(rawValue: "first-representation", order: 7)
+    let second = CollectionSourceVersion(rawValue: "second-representation", order: 7)
+    let original = TestIssue(id: 1, title: "original")
+    let replacement = TestIssue(id: 1, title: "replacement")
+
+    try await store.replaceSnapshot(
+      .init(rows: [original], fence: .init(rawValue: "first"), sourceVersion: first,
+        cursor: .init(offset: "0")), materializationID: materialization, demand: identity)
+    try await store.replaceSnapshot(
+      .init(rows: [replacement], fence: .init(rawValue: "second"), sourceVersion: second,
+        cursor: .init(offset: "1")), materializationID: materialization, demand: identity)
+
+    #expect(await store.rows(for: identity) == [replacement.id: replacement])
+    #expect(try await store.materialization(for: identity)?.sourceVersion == second)
+    #expect(try await store.materialization(for: identity)?.cursor == .init(offset: "1"))
   }
 
   @Test func overlappingSnapshotReplacementRetainsRowsClaimedByAnotherMaterialization() async throws
@@ -339,6 +364,85 @@ struct CollectionStoreContractTests {
     }
     #expect(await store.rows(for: first)[1]?.title == "first")
     #expect(try await store.materialization(for: second) == nil)
+  }
+
+  @Test func duplicateDemandBindingIsRejectedWithoutMutation() async throws {
+    let store = InMemoryCollectionStore<TestIssue, Int>(key: \.id)
+    let demand = demand("shared")
+    let firstMaterialization = CollectionMaterializationID(rawValue: "first")
+    let secondMaterialization = CollectionMaterializationID(rawValue: "second")
+    let original = TestIssue(id: 1, title: "original")
+    let replacement = TestIssue(id: 2, title: "replacement")
+    let originalCursor = StreamCursor(offset: "0")
+
+    try await store.replaceSnapshot(
+      .init(rows: [original], fence: .init(rawValue: "first"), sourceVersion: version(1),
+        cursor: originalCursor), materializationID: firstMaterialization, demand: demand)
+    let committed = try #require(await store.materialization(for: demand))
+
+    await #expect(
+      throws: CollectionStoreError.demandBoundToDifferentMaterialization(
+        demand: demand, existing: firstMaterialization, requested: secondMaterialization)
+    ) {
+      try await store.replaceSnapshot(
+        .init(rows: [replacement], fence: .init(rawValue: "second"), sourceVersion: version(2),
+          cursor: .init(offset: "1")), materializationID: secondMaterialization, demand: demand)
+    }
+
+    #expect(try await store.materialization(for: demand) == committed)
+    #expect(await store.rows(for: demand) == [original.id: original])
+    #expect(await store.rowClaims(for: firstMaterialization) == [original.id])
+    #expect(await store.rowClaims(for: secondMaterialization).isEmpty)
+  }
+
+  @Test func evictingTheLastDeletedMaterializationRetainsNoTombstone() async throws {
+    let store = InMemoryCollectionStore<TestIssue, Int>(key: \.id)
+    let materialization = CollectionMaterializationID(rawValue: "deleted")
+    let identity = demand("deleted")
+    let row = TestIssue(id: 1, title: "deleted")
+    try await store.replaceSnapshot(
+      .init(rows: [row], fence: .init(rawValue: "snapshot"), sourceVersion: version(1),
+        cursor: .init(offset: "0")), materializationID: materialization, demand: identity)
+    try await store.apply(
+      .init(changes: [.delete(row.id, sourceVersion: version(2))], expectedCursor: .init(offset: "0"),
+        cursor: .init(offset: "1"), sourceVersion: version(2)), to: materialization)
+
+    try await store.removeMaterialization(materialization)
+    #expect(await store.rows(for: identity).isEmpty)
+    #expect(await store.tombstoneCount(for: identity) == 0)
+  }
+
+  @Test func tombstoneProtectsAnOverlappingStaleUpsertUntilThatMaterializationAdvances()
+    async throws
+  {
+    let store = InMemoryCollectionStore<TestIssue, Int>(key: \.id)
+    let stale = CollectionMaterializationID(rawValue: "stale")
+    let deleting = CollectionMaterializationID(rawValue: "deleting")
+    let identity = demand("overlap")
+    let staleIdentity = demand("overlap-stale")
+    let row = TestIssue(id: 1, title: "old bytes")
+
+    try await store.replaceSnapshot(
+      .init(rows: [], fence: .init(rawValue: "stale"), sourceVersion: version(1),
+        cursor: .init(offset: "0")), materializationID: stale, demand: staleIdentity)
+    try await store.replaceSnapshot(
+      .init(rows: [row], fence: .init(rawValue: "deleting"), sourceVersion: version(1),
+        cursor: .init(offset: "0")), materializationID: deleting, demand: identity)
+    try await store.apply(
+      .init(changes: [.delete(row.id, sourceVersion: version(20))], expectedCursor: .init(offset: "0"),
+        cursor: .init(offset: "1"), sourceVersion: version(20)), to: deleting)
+    #expect(await store.tombstoneCount(for: identity) == 1)
+
+    try await store.apply(
+      .init(changes: [.upsert(row, sourceVersion: version(10))], expectedCursor: .init(offset: "0"),
+        cursor: .init(offset: "1"), sourceVersion: version(10)), to: stale)
+    #expect(await store.rows(for: identity).isEmpty)
+    #expect(await store.tombstoneCount(for: identity) == 1)
+
+    try await store.apply(
+      .init(changes: [], expectedCursor: .init(offset: "1"), cursor: .init(offset: "2"),
+        sourceVersion: version(20)), to: stale)
+    #expect(await store.tombstoneCount(for: identity) == 0)
   }
 
   @Test func staleSnapshotIsExplicitlyRejectedWithoutMutation() async throws {

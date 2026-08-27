@@ -3,12 +3,6 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
-## Unreleased
-
-- `CollectionChange` now requires a `CollectionSourceVersion` on each upsert and delete. Collection
-  store providers must migrate their live-apply implementation to persist per-change versions and
-  tombstones; `CollectionChangeBatch.sourceVersion` remains the high-water cursor record.
-
 ## 0.2.0
 
 - Add the storage-neutral `ElectricCircuitsCollections` product with typed predicates, exact-demand
@@ -16,6 +10,9 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 - Add the native subset snapshot + changes-feed source adapter with an awaited live-apply boundary and
   stable subset-feed claim renewal.
 - Allow `ShapeSubscriptionCoordinator` to own either ordinary shapes or subset-feed claims.
+- `CollectionChange` now requires a `CollectionSourceVersion` on each upsert and delete. Collection
+  store providers must migrate their live-apply implementation to persist per-change versions and
+  tombstones; `CollectionChangeBatch.sourceVersion` remains the high-water cursor record.
 
 ## 0.1.0 — Initial release
 

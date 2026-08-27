@@ -541,6 +541,40 @@ struct CollectionCoordinatorContractTests {
     #expect(await lease.state() == .unavailable)
   }
 
+  @Test func successfulCleanupAfterLiveStoreFailureAllowsConcurrentAcquiresToShareOneRetry()
+    async throws
+  {
+    let original = CoordinatorIssue(id: 1, title: "before")
+    let source = ScriptedIssueSource(outcomes: [.success([original]), .success([])])
+    let base = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let store = LiveApplyFailingStore(base: base)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let demand = CollectionDemand<CoordinatorIssue>(unsafePredicateIdentity: "open")
+    let failed = await coordinator.acquire(demand)
+    #expect(await wait(for: .live, lease: failed))
+
+    await source.send(
+      .init(
+        changes: [.upsert(.init(id: 1, title: "after"), sourceVersion: .init(rawValue: "v1", order: 1))],
+        expectedCursor: .init(offset: "0"), cursor: .init(offset: "1"),
+        sourceVersion: .init(rawValue: "v1", order: 1)))
+    #expect(await wait(for: .failed(.storeUnavailable), lease: failed))
+    #expect(await source.stopped.count == 1)
+
+    async let first = coordinator.acquire(demand)
+    async let second = coordinator.acquire(demand)
+    let retries = await [first, second]
+    for _ in 0..<10_000 where await source.starts.count != 2 { await Task.yield() }
+    #expect(await source.starts.count == 2)
+    #expect(await wait(for: .live, lease: retries[0]))
+    #expect(await wait(for: .live, lease: retries[1]))
+
+    try await failed.release()
+    try await retries[0].release()
+    try await retries[1].release()
+  }
+
   @Test func refreshWaitsForCancellationResistantPriorRunBeforeReplacement() async throws {
     let source = ScriptedIssueSource(outcomes: [.success([]), .success([])], heldRuns: 1)
     let store = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)

@@ -34,6 +34,11 @@ public enum CollectionStoreError: Error, Equatable, Sendable {
     existing: CollectionDemandIdentity,
     requested: CollectionDemandIdentity
   )
+  case demandBoundToDifferentMaterialization(
+    demand: CollectionDemandIdentity,
+    existing: CollectionMaterializationID,
+    requested: CollectionMaterializationID
+  )
   case staleSnapshot(current: CollectionSourceVersion, received: CollectionSourceVersion)
 }
 
@@ -82,6 +87,10 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
       throw CollectionStoreError.materializationBoundToDifferentDemand(
         materializationID: materializationID, existing: existingDemand, requested: demand)
     }
+    if let existing = recordsByDemand[demand], existing.id != materializationID {
+      throw CollectionStoreError.demandBoundToDifferentMaterialization(
+        demand: demand, existing: existing.id, requested: materializationID)
+    }
     if let current = recordsByDemand[demand], snapshot.sourceVersion < current.sourceVersion {
       throw CollectionStoreError.staleSnapshot(
         current: current.sourceVersion, received: snapshot.sourceVersion)
@@ -91,10 +100,15 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     let domain = domain(for: demand)
     var nextRows = canonicalRows
     var nextClaims = claims
+    var nextRecords = recordsByDemand
+    var nextDemandByMaterialization = demandByMaterialization
+    nextDemandByMaterialization[materializationID] = demand
     nextClaims[materializationID] = newClaims
 
     for oldKey in oldClaims.subtracting(newClaims) {
-      if !isClaimed(oldKey, in: nextClaims, domain: domain, current: materializationID) {
+      if !isClaimed(oldKey, in: nextClaims, domain: domain, bindings: nextDemandByMaterialization),
+        nextRows[CanonicalKey(domain: domain, key: oldKey)]?.row != nil
+      {
         nextRows.removeValue(forKey: CanonicalKey(domain: domain, key: oldKey))
       }
     }
@@ -114,10 +128,12 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
       sourceVersion: snapshot.sourceVersion,
       cursor: snapshot.cursor
     )
+    nextRecords[demand] = record
+    pruneTombstones(&nextRows, using: nextRecords)
     canonicalRows = nextRows
     claims = nextClaims
-    recordsByDemand[demand] = record
-    demandByMaterialization[materializationID] = demand
+    recordsByDemand = nextRecords
+    demandByMaterialization = nextDemandByMaterialization
   }
 
   public func apply(
@@ -141,6 +157,7 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     let domain = domain(for: demand)
     var nextRows = canonicalRows
     var nextClaims = claims
+    var nextRecords = recordsByDemand
     var materializationClaims = nextClaims[materializationID] ?? []
     // Claims are membership facts, not a row-byte version. An older overlapping feed cannot
     // replace newer canonical bytes, but it still proves that its materialization owns the key.
@@ -161,7 +178,7 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     nextClaims[materializationID] = materializationClaims
     for change in batch.changes {
       guard case .delete(let rowKey, let sourceVersion) = change else { continue }
-      if !isClaimed(rowKey, in: nextClaims, domain: domain, current: materializationID) {
+      if !isClaimed(rowKey, in: nextClaims, domain: domain, bindings: demandByMaterialization) {
         let canonicalKey = CanonicalKey(domain: domain, key: rowKey)
         if nextRows[canonicalKey].map({ $0.version.order <= sourceVersion.order }) ?? true {
           nextRows[canonicalKey] = (nil, sourceVersion)
@@ -174,12 +191,14 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
       demand: record.demand,
       state: .live,
       snapshotFence: record.snapshotFence,
-      sourceVersion: max(record.sourceVersion, batch.sourceVersion),
+      sourceVersion: later(of: record.sourceVersion, and: batch.sourceVersion),
       cursor: batch.cursor
     )
+    nextRecords[demand] = nextRecord
+    pruneTombstones(&nextRows, using: nextRecords)
     canonicalRows = nextRows
     claims = nextClaims
-    recordsByDemand[demand] = nextRecord
+    recordsByDemand = nextRecords
   }
 
   /// Convenience inspection for one-domain test stores. Production providers should expose their
@@ -201,30 +220,70 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     claims[materializationID] ?? []
   }
 
+  /// Reference-store diagnostic for testing bounded tombstone retention in one collection domain.
+  public func tombstoneCount(for demand: CollectionDemandIdentity) -> Int {
+    let domain = domain(for: demand)
+    return canonicalRows.reduce(into: 0) { count, pair in
+      if pair.key.domain == domain, pair.value.row == nil { count += 1 }
+    }
+  }
+
   public func removeMaterialization(
     _ materializationID: CollectionMaterializationID
   ) async throws {
-    guard let demand = demandByMaterialization.removeValue(forKey: materializationID) else {
+    guard let demand = demandByMaterialization[materializationID] else {
       return
     }
     let domain = domain(for: demand)
-    let oldClaims = claims.removeValue(forKey: materializationID) ?? []
-    recordsByDemand.removeValue(forKey: demand)
-    for rowKey in oldClaims where !isClaimed(rowKey, in: claims, domain: domain, current: nil) {
-      canonicalRows.removeValue(forKey: CanonicalKey(domain: domain, key: rowKey))
+    var nextRows = canonicalRows
+    var nextClaims = claims
+    var nextRecords = recordsByDemand
+    var nextDemandByMaterialization = demandByMaterialization
+    let oldClaims = nextClaims.removeValue(forKey: materializationID) ?? []
+    nextRecords.removeValue(forKey: demand)
+    nextDemandByMaterialization.removeValue(forKey: materializationID)
+    for rowKey in oldClaims
+    where !isClaimed(rowKey, in: nextClaims, domain: domain, bindings: nextDemandByMaterialization)
+      && nextRows[CanonicalKey(domain: domain, key: rowKey)]?.row != nil
+    {
+      nextRows.removeValue(forKey: CanonicalKey(domain: domain, key: rowKey))
     }
+    pruneTombstones(&nextRows, using: nextRecords)
+    canonicalRows = nextRows
+    claims = nextClaims
+    recordsByDemand = nextRecords
+    demandByMaterialization = nextDemandByMaterialization
+  }
+
+  /// Retains a tombstone until every materialization in its domain has durably applied the delete's
+  /// source frontier. Once that holds, no remaining stream can lawfully deliver an older row.
+  private func pruneTombstones(
+    _ rows: inout [CanonicalKey: (row: Model?, version: CollectionSourceVersion)],
+    using records: [CollectionDemandIdentity: CollectionMaterializationRecord]
+  ) {
+    rows = rows.filter { canonicalKey, value in
+      guard value.row == nil else { return true }
+      return records.contains { demand, record in
+        domain(for: demand) == canonicalKey.domain && record.sourceVersion < value.version
+      }
+    }
+  }
+
+  private func later(
+    of current: CollectionSourceVersion, and received: CollectionSourceVersion
+  ) -> CollectionSourceVersion {
+    received.order >= current.order ? received : current
   }
 
   private func isClaimed(
     _ rowKey: Key,
     in claims: [CollectionMaterializationID: Set<Key>],
     domain: Domain,
-    current: CollectionMaterializationID?
+    bindings: [CollectionMaterializationID: CollectionDemandIdentity]
   ) -> Bool {
     claims.contains { id, keys in
       guard keys.contains(rowKey) else { return false }
-      if id == current { return true }
-      return demandByMaterialization[id].map { self.domain(for: $0) == domain } ?? false
+      return bindings[id].map { self.domain(for: $0) == domain } ?? false
     }
   }
 }

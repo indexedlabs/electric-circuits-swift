@@ -334,12 +334,21 @@ public actor CollectionCoordinator<
   ) async -> Bool {
     do {
       try await stop.call()
+      clearInstalledStop(stop, identity: identity, attempt: attempt)
       return true
     } catch {
       // Keep the failed stop installed so a lease release can retry the same server authority.
       fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
       return false
     }
+  }
+
+  private func clearInstalledStop(
+    _ stop: AtMostOnceStop, identity: CollectionDemandIdentity, attempt: UUID
+  ) {
+    guard var entry = entries[identity], entry.attempt == attempt, entry.stop === stop else { return }
+    entry.stop = nil
+    entries[identity] = entry
   }
 
   private func install(

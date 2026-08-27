@@ -275,8 +275,16 @@ public struct CollectionSourceVersion: Codable, Equatable, Hashable, Comparable,
     self.order = order
   }
 
+  public static func == (lhs: Self, rhs: Self) -> Bool {
+    lhs.order == rhs.order
+  }
+
+  public func hash(into hasher: inout Hasher) {
+    hasher.combine(order)
+  }
+
   public static func < (lhs: Self, rhs: Self) -> Bool {
-    lhs.order == rhs.order ? lhs.rawValue < rhs.rawValue : lhs.order < rhs.order
+    lhs.order < rhs.order
   }
 }
 
