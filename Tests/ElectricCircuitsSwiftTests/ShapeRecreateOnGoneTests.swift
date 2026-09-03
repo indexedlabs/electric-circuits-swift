@@ -60,6 +60,54 @@ private actor FixedCreateStatusTransport: HTTPTransport {
   }
 }
 
+/// Creates `s1`, answers the join with `410`, then falls through to `s2`.
+private actor GoneJoinTransport: HTTPTransport {
+  private(set) var requests: [URLRequest] = []
+  private var posts = 0
+
+  var postBodies: [Data] { requests.filter { $0.httpMethod == "POST" }.compactMap(\.httpBody) }
+  var deleteURLs: [URL] { requests.filter { $0.httpMethod == "DELETE" }.compactMap(\.url) }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    try Task.checkCancellation()
+    switch request.httpMethod {
+    case "POST":
+      posts += 1
+      switch posts {
+      case 1: return recreateShapeResponse(id: "s1")
+      case 2: return recreateResponse("gone", status: 410)
+      default: return recreateShapeResponse(id: "s2")
+      }
+    case "GET":
+      while !Task.isCancelled { await Task.yield() }
+      throw CancellationError()
+    case "DELETE":
+      return recreateResponse("", status: 404)
+    default:
+      throw CancellationError()
+    }
+  }
+}
+
+/// Creates `s1` and answers every release with `410`.
+private actor GoneReleaseTransport: HTTPTransport {
+  private(set) var requests: [URLRequest] = []
+  var deleteCount: Int { requests.filter { $0.httpMethod == "DELETE" }.count }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    switch request.httpMethod {
+    case "POST": return recreateShapeResponse(id: "s1")
+    case "GET":
+      while !Task.isCancelled { await Task.yield() }
+      throw CancellationError()
+    case "DELETE": return recreateResponse("gone", status: 410)
+    default: throw CancellationError()
+    }
+  }
+}
+
 private func recreateResponse(_ body: String, status: Int = 200) -> HTTPResponse {
   HTTPResponse(
     data: Data(body.utf8),
@@ -170,5 +218,55 @@ struct ShapeRecreateOnGoneTests {
     ) { _ = try await coordinator.start() }
 
     #expect(await transport.postCount == 2)
+  }
+
+  @Test func goneJoinReseedsThroughTheReplacementPathAndReleasesBothClaims() async throws {
+    let transport = GoneJoinTransport()
+    let coordinator = recreateCoordinator(transport: transport, clock: RecreateClock())
+
+    let created = try await coordinator.start()
+    #expect(created.id == "s1")
+
+    await #expect(throws: ShapeSubscriptionFailure.self) { _ = try await coordinator.renew() }
+
+    guard case .reseedRequired(let outcome) = await coordinator.state else {
+      Issue.record("expected a reseed publication, got \(await coordinator.state)")
+      return
+    }
+    // A recreated join reaches the application through exactly the vocabulary the engine's own
+    // fall-through produces, which is the same `requireReseed` reconciliation the stream-read
+    // gone receipt uses. Materialization is reseeded once, not duplicated across two generations.
+    #expect(outcome.reason == .replacement(previousShapeID: "s1", replacementShapeID: "s2"))
+    #expect(outcome.previous.id == "s1")
+    #expect(outcome.previous.subscription == "stable-claim")
+    #expect(outcome.replacement?.id == "s2")
+    #expect(outcome.replacement?.subscription == "stable-claim")
+
+    // The recreate is a byte-identical re-POST under the same stable claim.
+    let bodies = await transport.postBodies
+    #expect(bodies.count == 3)
+    #expect(Set(bodies).count == 1)
+
+    // Both the retired identity and the replacement are released under that claim, so the
+    // application starts one explicit fresh scope instead of inheriting two live server claims.
+    let deletes = await transport.deleteURLs
+    #expect(Set(deletes.map(\.path)) == ["/v1/shapes/s1", "/v1/shapes/s2"])
+    #expect(
+      deletes.allSatisfy {
+        URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems
+          == [URLQueryItem(name: "subscription", value: "stable-claim")]
+      })
+  }
+
+  @Test func goneOnANonCreateControlRouteStaysTerminal() async throws {
+    let transport = GoneReleaseTransport()
+    let coordinator = recreateCoordinator(transport: transport, clock: RecreateClock())
+
+    _ = try await coordinator.start()
+    await #expect(
+      throws: ShapeSubscriptionFailure.client(.http(status: 410, message: "HTTP request failed"))
+    ) { try await coordinator.stop() }
+
+    #expect(await transport.deleteCount == 1)
   }
 }

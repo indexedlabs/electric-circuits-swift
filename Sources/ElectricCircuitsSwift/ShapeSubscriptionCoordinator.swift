@@ -710,8 +710,13 @@ public actor ShapeSubscriptionCoordinator {
     capacityPermit = nil
     await capacity.release(permit)
   }
+  /// A join repeats the create under the same stable claim, so it carries the same recreate
+  /// vocabulary. A recreated join answers with a fresh shape id, which is exactly the replacement
+  /// the engine's own fall-through produces: `renew()` routes it through `requireReseed`, the same
+  /// reconciliation the durable-stream gone receipt uses, so the application reseeds one explicit
+  /// fresh scope instead of inheriting two live server claims.
   private func renewWithRetry() async throws -> ShapeHandle {
-    try await retrying(operation: "renew") {
+    try await recreatingOnGone(operation: "renew") {
       switch self.kind {
       case .shape:
         try await self.client.renewShape(self.request)
