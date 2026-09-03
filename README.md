@@ -141,6 +141,12 @@ shape id, which is the same replacement the engine's own fall-through produces, 
 application through the existing `requireReseed` path: the retired identity and the replacement are
 both released under that claim, and one `.reseedRequired` publication carries both ids.
 
+`CircuitsSubsetSource` uses the same seam for the changes-only feed it creates before any
+coordinator exists, so a persisted materialization ID joining a dormant shape recreates rather than
+failing setup before the frontier `HEAD` and snapshot query. It takes the same policy through its
+own defaulted `recreatePolicy:` parameter and forwards it to the coordinator it builds for the live
+tail.
+
 `ShapeSubscriptionRecreatePolicy` bounds that fall-through (2 recreates and a 250 ms backoff by
 default). The bound matters because a join that timed out leaves a detached replay running on the
 engine, so each attempt can cost its full join timeout; the backoff avoids a hot loop rather than
