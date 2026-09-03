@@ -114,6 +114,87 @@ private actor GoneReleaseTransport: HTTPTransport {
   }
 }
 
+/// A clock whose sleeps park until the test releases them, so a test can observe the coordinator
+/// mid-backoff instead of racing it.
+private actor GatedRecreateClock: ShapeSubscriptionClock {
+  private(set) var delays: [Duration] = []
+  private var gate: CheckedContinuation<Void, Never>?
+  private var sleepWaiters: [CheckedContinuation<Void, Never>] = []
+
+  func sleep(for duration: Duration) async throws {
+    delays.append(duration)
+    for waiter in sleepWaiters { waiter.resume() }
+    sleepWaiters.removeAll()
+    await withCheckedContinuation { gate = $0 }
+    try Task.checkCancellation()
+  }
+
+  func waitForSleep(atLeast count: Int) async {
+    guard delays.count < count else { return }
+    await withCheckedContinuation { sleepWaiters.append($0) }
+  }
+
+  func release() {
+    gate?.resume()
+    gate = nil
+  }
+}
+
+/// Creates `s1` with a lease, answers the lease-driven join with `410`, then yields `s2`.
+private actor GoneLeaseRenewTransport: HTTPTransport {
+  private(set) var requests: [URLRequest] = []
+  private var posts = 0
+
+  var deleteURLs: [URL] { requests.filter { $0.httpMethod == "DELETE" }.compactMap(\.url) }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    try Task.checkCancellation()
+    switch request.httpMethod {
+    case "POST":
+      posts += 1
+      switch posts {
+      case 1: return recreateShapeResponse(id: "s1", leaseSeconds: 6)
+      case 2: return recreateResponse("gone", status: 410)
+      default: return recreateShapeResponse(id: "s2", leaseSeconds: 6)
+      }
+    case "GET":
+      try await Task.sleep(for: .seconds(3_600))
+      throw CancellationError()
+    case "DELETE":
+      return recreateResponse("", status: 404)
+    default:
+      throw CancellationError()
+    }
+  }
+}
+
+/// Creates `s1` with a lease and answers the lease-driven join with a different shape id — the
+/// engine's own fall-through, with no `410` anywhere.
+private actor LeaseReplacementTransport: HTTPTransport {
+  private(set) var requests: [URLRequest] = []
+  private var posts = 0
+
+  var deleteURLs: [URL] { requests.filter { $0.httpMethod == "DELETE" }.compactMap(\.url) }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    try Task.checkCancellation()
+    switch request.httpMethod {
+    case "POST":
+      posts += 1
+      return recreateShapeResponse(id: posts == 1 ? "s1" : "s2", leaseSeconds: 6)
+    case "GET":
+      try await Task.sleep(for: .seconds(3_600))
+      throw CancellationError()
+    case "DELETE":
+      return recreateResponse("", status: 404)
+    default:
+      throw CancellationError()
+    }
+  }
+}
+
 private func recreateResponse(_ body: String, status: Int = 200) -> HTTPResponse {
   HTTPResponse(
     data: Data(body.utf8),
@@ -122,10 +203,33 @@ private func recreateResponse(_ body: String, status: Int = 200) -> HTTPResponse
       headerFields: [:])!)
 }
 
-private func recreateShapeResponse(id: String) -> HTTPResponse {
-  recreateResponse(
-    "{\"shapeId\":\"\(id)\",\"table\":\"public.items\",\"streamPath\":\"/v1/streams/\(id)\",\"streamUrl\":\"https://streams.test/\(id)\"}"
+private func recreateShapeResponse(id: String, leaseSeconds: Int? = nil) -> HTTPResponse {
+  let lease = leaseSeconds.map { ",\"leaseSeconds\":\($0)" } ?? ""
+  return recreateResponse(
+    "{\"shapeId\":\"\(id)\",\"table\":\"public.items\",\"streamPath\":\"/v1/streams/\(id)\",\"streamUrl\":\"https://streams.test/\(id)\"\(lease)}"
   )
+}
+
+/// Waits for the coordinator's first reseed publication, bounded so a regression that never
+/// publishes fails the test instead of hanging the run.
+private func firstReseed(
+  _ updates: AsyncStream<ShapeSubscriptionState>
+) async -> ShapeSubscriptionState? {
+  await withTaskGroup(of: ShapeSubscriptionState?.self) { group in
+    group.addTask {
+      for await update in updates {
+        if case .reseedRequired = update { return update }
+      }
+      return nil
+    }
+    group.addTask {
+      try? await Task.sleep(for: .seconds(10))
+      return nil
+    }
+    let first = await group.next() ?? nil
+    group.cancelAll()
+    return first
+  }
 }
 
 private let recreateRequest = ShapeRequest(
@@ -258,7 +362,9 @@ struct ShapeRecreateOnGoneTests {
     // Both the retired identity and the replacement are released under that claim, so the
     // application starts one explicit fresh scope instead of inheriting two live server claims.
     let deletes = await transport.deleteURLs
-    #expect(Set(deletes.map(\.path)) == ["/v1/shapes/s1", "/v1/shapes/s2"])
+    #expect(deletes.count == 2)
+    #expect(deletes.filter { $0.path == "/v1/shapes/s1" }.count == 1)
+    #expect(deletes.filter { $0.path == "/v1/shapes/s2" }.count == 1)
     #expect(
       deletes.allSatisfy {
         URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems
@@ -276,6 +382,76 @@ struct ShapeRecreateOnGoneTests {
     ) { try await coordinator.stop() }
 
     #expect(await transport.deleteCount == 1)
+  }
+
+
+  @Test func aLeaseDrivenJoinAnsweredGoneRecreatesAndReseeds() async throws {
+    let transport = GoneLeaseRenewTransport()
+    let coordinator = recreateCoordinator(transport: transport, clock: RecreateClock())
+    let updates = await coordinator.stateUpdates
+
+    let created = try await coordinator.start()
+    #expect(created.id == "s1")
+
+    // The lease task, not a caller, drives this join. It must reach the same reseed vocabulary.
+    let published = await firstReseed(updates)
+    guard case .reseedRequired(let outcome) = published else {
+      Issue.record(
+        "expected a lease-driven reseed publication, got \(String(describing: published))")
+      return
+    }
+    #expect(outcome.reason == .replacement(previousShapeID: "s1", replacementShapeID: "s2"))
+    #expect(outcome.previous.subscription == "stable-claim")
+    #expect(outcome.replacement?.id == "s2")
+
+    let deletes = await transport.deleteURLs
+    #expect(deletes.count == 2)
+    #expect(deletes.filter { $0.path == "/v1/shapes/s1" }.count == 1)
+    #expect(deletes.filter { $0.path == "/v1/shapes/s2" }.count == 1)
+  }
+
+
+  @Test func aLeaseDrivenReplacementPublishesItsReseedAndReleasesBothClaims() async throws {
+    let transport = LeaseReplacementTransport()
+    let coordinator = recreateCoordinator(transport: transport, clock: RecreateClock())
+    let updates = await coordinator.stateUpdates
+
+    _ = try await coordinator.start()
+
+    // The engine's own 2xx fall-through on a lease renewal, with no 410 involved: the reseed is
+    // performed *on* the lease task, so it must not be cancelled before it publishes and releases.
+    let published = await firstReseed(updates)
+    guard case .reseedRequired(let outcome) = published else {
+      Issue.record("expected a reseed publication, got \(String(describing: published))")
+      return
+    }
+    #expect(outcome.reason == .replacement(previousShapeID: "s1", replacementShapeID: "s2"))
+    let deletes = await transport.deleteURLs
+    #expect(deletes.count == 2)
+    #expect(deletes.filter { $0.path == "/v1/shapes/s1" }.count == 1)
+    #expect(deletes.filter { $0.path == "/v1/shapes/s2" }.count == 1)
+  }
+
+  @Test func cancellingDuringARecreateBackoffLeavesNoClaimAndNoLaterRecreate() async throws {
+    let transport = GoneCreateTransport(goneCreates: 1)
+    let clock = GatedRecreateClock()
+    let coordinator = recreateCoordinator(transport: transport, clock: clock)
+
+    let start = Task { try await coordinator.start() }
+    await clock.waitForSleep(atLeast: 1)
+    #expect(await transport.postCount == 1)
+
+    start.cancel()
+    await clock.release()
+    await #expect(throws: CancellationError.self) { _ = try await start.value }
+    try await coordinator.stop()
+
+    // A recreate that outlived cancellation would mint a second claim against the one
+    // materializer; neither a second create nor an orphaned release may appear.
+    #expect(await coordinator.state == .stopped)
+    #expect(await transport.postCount == 1)
+    #expect(await transport.requests.filter { $0.httpMethod == "DELETE" }.isEmpty)
+    #expect(await clock.delays == [.milliseconds(250)])
   }
 
   @Test func recreatePolicyDefaultsToTwoRecreatesAndAShortBackoff() {

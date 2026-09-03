@@ -816,7 +816,6 @@ public actor ShapeSubscriptionCoordinator {
     _ outcome: ShapeSubscriptionReseedRequired, extraRelease: ShapeHandle? = nil
   ) async throws {
     generation &+= 1
-    leaseTask?.cancel()
     // A renew may already have been accepted with the old claim while the reader learned that its
     // epoch is terminal. Join it before reseed is visible and compensate any returned handle.
     let renewing = renewTask
@@ -831,6 +830,12 @@ public actor ShapeSubscriptionCoordinator {
     try await releasePending()
     await releaseCapacityPermit()
     transition(.reseedRequired(outcome))
+    // The lease loop is cancelled last, and never before this point. A lease-driven renew runs
+    // this reseed *on* the lease task, so cancelling it first made `releasePending` fail its own
+    // `Task.checkCancellation` and abandoned both the retired and the replacement claim without
+    // ever publishing `.reseedRequired`. The generation bump above already terminates the loop on
+    // its next `isCurrent` check, so the cancel only shortens a pending sleep.
+    leaseTask?.cancel()
   }
 
   private var isAcceptingOperations: Bool { !stopping && stopTask == nil }
