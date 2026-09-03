@@ -3,6 +3,27 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
+## Unreleased
+
+- `ShapeSubscriptionCoordinator` now answers `410 Gone` from the two native routes that mint a
+  shape (`POST /v1/shapes`, `POST /v1/subset-feeds`) with a bounded client-side fall-through: a
+  byte-identical re-POST under the same table, predicate, columns, and stable claim. A recreated
+  join reaches the application through the existing replacement/`requireReseed` path. `404` on a
+  create, `410` on any other control route, and the `408`/`425`/`429`/`5xx` retryable
+  classification are unchanged.
+- `CircuitsSubsetSource` routes its initial changes-only feed create through the same bounded
+  recreate, so a persisted materialization ID joining a dormant shape no longer fails collection
+  setup before the frontier HEAD and snapshot query.
+- Fix: a reseed triggered by a lease-driven renewal cancelled the lease task before releasing the
+  claims, so `releasePending()` failed its own cancellation check and both the retired and the
+  replacement claim were abandoned without publishing `.reseedRequired`. The lease loop is now
+  cancelled after the reseed is published. Reachable before this release through the engine's own
+  `2xx` fall-through on a lease renewal.
+- Add `ShapeSubscriptionRecreatePolicy` (default: 2 recreates, 250 ms backoff), its shared
+  `recreatingOnGone(clock:willRecreate:_:)`/`isGone(_:)`/`goneStatus` seam, and the defaulted
+  `ShapeSubscriptionCoordinator.init(recreatePolicy:)` and
+  `CircuitsSubsetSource.init(recreatePolicy:)` parameters. Additive and source-compatible.
+
 ## 0.2.1
 
 - Publish the collection-coordination release from the canonical `main` branch and update release

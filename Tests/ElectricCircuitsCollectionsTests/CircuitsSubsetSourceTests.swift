@@ -114,6 +114,63 @@ private actor NativeSubsetTransport: HTTPTransport {
   }
 }
 
+/// Answers the first `goneCreates` subset-feed creates with `410` and behaves like
+/// `NativeSubsetTransport` afterwards.
+private actor GoneSubsetFeedTransport: HTTPTransport {
+  private(set) var requests: [URLRequest] = []
+  private var creates = 0
+  private let goneCreates: Int
+
+  init(goneCreates: Int) { self.goneCreates = goneCreates }
+
+  var subsetFeedCreateCount: Int {
+    requests.filter { $0.httpMethod == "POST" && $0.url?.path == "/v1/subset-feeds" }.count
+  }
+  var subsetFeedCreateBodies: [Data] {
+    requests.filter { $0.httpMethod == "POST" && $0.url?.path == "/v1/subset-feeds" }
+      .compactMap(\.httpBody)
+  }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    let path = request.url?.path ?? ""
+    switch (request.httpMethod, path) {
+    case ("POST", "/v1/subset-feeds"):
+      creates += 1
+      if creates <= goneCreates { return goneResponse("gone", request: request, status: 410) }
+      return goneResponse(
+        #"{"shapeId":"shape-1","table":"public.issues","streamPath":"/streams/shape-1","streamUrl":"https://streams.test/streams/shape-1"}"#,
+        request: request)
+    case ("HEAD", "/streams/shape-1"):
+      return goneResponse("", request: request, headers: ["stream-next-offset": "10"])
+    case ("POST", "/v1/subsets/query"):
+      return goneResponse(
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/10"}"#, request: request)
+    case ("GET", "/streams/shape-1"):
+      try await Task.sleep(for: .seconds(3_600))
+      throw CancellationError()
+    case ("DELETE", "/v1/shapes/shape-1"):
+      return goneResponse("", request: request, status: 204)
+    default:
+      return goneResponse("unexpected", request: request, status: 500)
+    }
+  }
+}
+
+private func goneResponse(
+  _ body: String, request: URLRequest, status: Int = 200, headers: [String: String] = [:]
+) -> HTTPResponse {
+  HTTPResponse(
+    data: Data(body.utf8),
+    response: HTTPURLResponse(
+      url: request.url!, statusCode: status, httpVersion: nil, headerFields: headers)!)
+}
+
+private actor SubsetRecreateClock: ShapeSubscriptionClock {
+  private(set) var delays: [Duration] = []
+  func sleep(for duration: Duration) async throws { delays.append(duration) }
+}
+
 private actor AppliedNativeBatches {
   private var batches: [CollectionChangeBatch<NativeIssue, Int64>] = []
 
@@ -200,6 +257,83 @@ struct CircuitsSubsetSourceTests {
     }
     #expect(createBodies.allSatisfy { $0.subscription == materializationID.rawValue })
     #expect(createBodies.allSatisfy { $0.changesOnly == true })
+  }
+
+
+  @Test func goneOnTheInitialSubsetFeedRecreatesBeforeSnapshotSetup() async throws {
+    let transport = GoneSubsetFeedTransport(goneCreates: 2)
+    let clock = SubsetRecreateClock()
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let source = CircuitsSubsetSource<NativeIssue, Int64>(
+      client: client,
+      transport: transport,
+      table: "public.issues",
+      columns: ["id", "title"],
+      retryPolicy: ShapeSubscriptionRetryPolicy(maxRetries: 0),
+      clock: clock,
+      decodeRow: NativeIssue.init(row:),
+      decodeKey: { key in
+        guard let id = Int64(key) else { throw CircuitsSubsetSourceError.invalidLiveKey(key) }
+        return id
+      }
+    )
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: CollectionID(rawValue: "issues"), key: \.id)
+    let scope = CollectionScope(principal: "u", authorization: "a", generation: "g")
+    let demand = CollectionDemand<NativeIssue>(
+      unsafePredicateIdentity: "status=open",
+      sourcePredicate: .leaf(column: "status", op: .eq, value: .string("open")))
+    let materializationID = CollectionMaterializationID(rawValue: "issues-open")
+
+    // A persisted materialization ID joining a dormant shape whose fall-through the engine has
+    // exhausted must not fail setup before HEAD/snapshot; it must re-POST the identical claim.
+    let session = try await source.materialize(
+      demand,
+      identity: demand.identity(for: definition, scope: scope),
+      materializationID: materializationID)
+
+    #expect(session.snapshot.rows == [NativeIssue(id: 1, title: "Snapshot")])
+    #expect(session.snapshot.cursor == StreamCursor(offset: "10", lsn: "0/10"))
+    #expect(await transport.subsetFeedCreateCount == 3)
+    #expect(await clock.delays == [.milliseconds(250), .milliseconds(250)])
+    let bodies = await transport.subsetFeedCreateBodies
+    #expect(bodies.count == 3)
+    #expect(Set(bodies).count == 1)
+    try await session.stop()
+  }
+
+
+  @Test func aZeroBoundSourceSurfacesTheFirstGoneFromItsInitialFeed() async throws {
+    let transport = GoneSubsetFeedTransport(goneCreates: 1)
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let source = CircuitsSubsetSource<NativeIssue, Int64>(
+      client: client,
+      transport: transport,
+      table: "public.issues",
+      retryPolicy: ShapeSubscriptionRetryPolicy(maxRetries: 0),
+      clock: SubsetRecreateClock(),
+      recreatePolicy: ShapeSubscriptionRecreatePolicy(maximumRecreates: 0),
+      decodeRow: NativeIssue.init(row:),
+      decodeKey: { key in
+        guard let id = Int64(key) else { throw CircuitsSubsetSourceError.invalidLiveKey(key) }
+        return id
+      }
+    )
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: CollectionID(rawValue: "issues"), key: \.id)
+    let scope = CollectionScope(principal: "u", authorization: "a", generation: "g")
+    let demand = CollectionDemand<NativeIssue>(unsafePredicateIdentity: "all")
+
+    // A collection deployment that would rather run its own scope handoff must be able to say so.
+    await #expect(throws: ClientError.http(status: 410, message: "HTTP request failed")) {
+      _ = try await source.materialize(
+        demand,
+        identity: demand.identity(for: definition, scope: scope),
+        materializationID: CollectionMaterializationID(rawValue: "issues-all"))
+    }
+    #expect(await transport.subsetFeedCreateCount == 1)
   }
 
   @Test func limitedDemandFailsBeforeCreatingAnUnmaintainedLiveFeed() async throws {

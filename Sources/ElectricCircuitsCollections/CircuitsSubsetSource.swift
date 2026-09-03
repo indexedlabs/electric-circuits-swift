@@ -29,6 +29,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   private let capacity: ShapeSubscriptionCapacity?
   private let responseDecodingLimits: ResponseDecodingLimits
   private let telemetry: TelemetryReporter
+  private let recreatePolicy: ShapeSubscriptionRecreatePolicy
   private let pendingCleanup: PendingSubsetFeedCleanup
 
   public init(
@@ -41,6 +42,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     capacity: ShapeSubscriptionCapacity? = nil,
     responseDecodingLimits: ResponseDecodingLimits = .default,
     telemetry: TelemetryReporter = .noop,
+    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init(),
     decodeRow: @escaping @Sendable (ChangeRow) throws -> Model,
     decodeKey: @escaping @Sendable (String) throws -> Key
   ) {
@@ -54,6 +56,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     self.capacity = capacity
     self.responseDecodingLimits = responseDecodingLimits
     self.telemetry = telemetry
+    self.recreatePolicy = recreatePolicy
     self.decodeRow = decodeRow
     self.decodeKey = decodeKey
     pendingCleanup = PendingSubsetFeedCleanup(client: client)
@@ -79,7 +82,13 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       changesOnly: true,
       subscription: subscription
     )
-    let feed = try await client.createSubsetFeed(feedRequest)
+    // The initial feed create is the same native route the coordinator later joins, so it carries
+    // the same recreate vocabulary. A persisted materialization ID joining a dormant shape whose
+    // fall-through the engine has exhausted must re-POST the identical claim, not fail setup
+    // before the frontier HEAD and snapshot query.
+    let feed = try await recreatePolicy.recreatingOnGone(clock: clock) {
+      try await client.createSubsetFeed(feedRequest)
+    }
 
     do {
       let frontier = try await client.streamCursor(for: feed)
@@ -129,7 +138,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
             capacity: capacity,
             responseDecodingLimits: responseDecodingLimits,
             telemetry: telemetry,
-            kind: .subsetFeed
+            kind: .subsetFeed,
+            recreatePolicy: recreatePolicy
           )
           try await lifecycle.install(coordinator)
           let states = await coordinator.stateUpdates

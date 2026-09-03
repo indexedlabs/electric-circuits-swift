@@ -54,6 +54,76 @@ public struct ShapeSubscriptionRetryPolicy: Sendable {
   }
 }
 
+/// Bounds the client-side fall-through for a create/join the engine answered `410 Gone`.
+///
+/// The engine retires a dormant shape whose replay is over budget, and abandons a reactivation
+/// join past its own timeout, as a typed recreate outcome rather than a server fault
+/// (electric-circuits ADR-0011, "Dormant reactivation is bounded"). It normally answers that by
+/// falling through to a fresh create in the same round trip; when that fall-through is exhausted
+/// it answers `410` and expects the client to recreate.
+///
+/// The bound matters because a join that timed out leaves a detached replay running on the
+/// engine: each attempt can cost its full join timeout, and only a later attempt finds the shape
+/// active. A create answered `410` past the bound is a standing condition, not a reactivation
+/// race, and reaches the caller as the terminal `ClientError.http(status: 410, ...)` it already
+/// was. The backoff exists to avoid a hot loop, not to pace the engine's replay.
+public struct ShapeSubscriptionRecreatePolicy: Equatable, Sendable {
+  /// Recreates attempted after the first `410`. `0` surfaces the first `410` as terminal.
+  public let maximumRecreates: Int
+  public let backoff: Duration
+
+  public init(maximumRecreates: Int = 2, backoff: Duration = .milliseconds(250)) {
+    precondition(maximumRecreates >= 0)
+    precondition(backoff >= .zero)
+    self.maximumRecreates = maximumRecreates
+    self.backoff = backoff
+  }
+}
+
+extension ShapeSubscriptionRecreatePolicy {
+  /// The engine's "recreate" answer on a create/join whose fall-through it could not perform.
+  public static let goneStatus = 410
+
+  /// True when `error` is that answer, in either the raw `ClientError` form the client throws or
+  /// the `ShapeSubscriptionFailure` form the coordinator's retry wrapper produces.
+  public static func isGone(_ error: Error) -> Bool {
+    if case ClientError.http(let status, _) = error { return status == goneStatus }
+    if case ShapeSubscriptionFailure.client(let client) = error,
+      case .http(let status, _) = client
+    {
+      return status == goneStatus
+    }
+    return false
+  }
+
+  /// Runs `body`, answering a `410 Gone` with a bounded, backed-off re-run of the identical
+  /// request. This is the one implementation of the client-side fall-through: both
+  /// `ShapeSubscriptionCoordinator`'s create/join and a source's initial feed create use it, so a
+  /// shape minted before a coordinator exists gets the same recreate vocabulary as one minted by
+  /// it.
+  ///
+  /// `body` must be the same request every time — the two native routes that mint a shape carry no
+  /// shape id, so re-running them re-sends the same table, predicate, columns, and stable claim.
+  /// Every other outcome, `404` and the transient statuses included, propagates unchanged.
+  /// `willRecreate` receives the 1-based attempt number before its backoff, for state or telemetry.
+  public func recreatingOnGone<T: Sendable>(
+    clock: any ShapeSubscriptionClock,
+    willRecreate: @Sendable (Int) async -> Void = { _ in },
+    _ body: @Sendable () async throws -> T
+  ) async throws -> T {
+    var recreates = 0
+    while true {
+      do { return try await body() } catch {
+        guard Self.isGone(error), recreates < maximumRecreates else { throw error }
+        recreates += 1
+        await willRecreate(recreates)
+        try await clock.sleep(for: backoff)
+        try Task.checkCancellation()
+      }
+    }
+  }
+}
+
 /// A caller-owned, shared admission boundary for shape subscription coordinators. Sharing one
 /// instance across coordinators bounds active claims and the stream/retry tasks they own; it does
 /// not queue pending starts.
@@ -205,6 +275,7 @@ public actor ShapeSubscriptionCoordinator {
   private let responseDecodingLimits: ResponseDecodingLimits
   private let telemetry: TelemetryReporter
   private let kind: ShapeSubscriptionKind
+  private let recreatePolicy: ShapeSubscriptionRecreatePolicy
   private var continuation: AsyncStream<ShapeSubscriptionState>.Continuation?
   private var handle: ShapeHandle?
   private var pendingRelease: [ShapeHandle] = []
@@ -244,7 +315,8 @@ public actor ShapeSubscriptionCoordinator {
     capacity: ShapeSubscriptionCapacity? = nil,
     responseDecodingLimits: ResponseDecodingLimits = .default,
     telemetry: TelemetryReporter = .noop,
-    kind: ShapeSubscriptionKind = .shape
+    kind: ShapeSubscriptionKind = .shape,
+    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init()
   ) {
     self.client = client
     self.transport = transport
@@ -256,6 +328,7 @@ public actor ShapeSubscriptionCoordinator {
     self.responseDecodingLimits = responseDecodingLimits
     self.telemetry = telemetry
     self.kind = kind
+    self.recreatePolicy = recreatePolicy
     let updates = AsyncStream<ShapeSubscriptionState>.makeStream()
     stateUpdates = updates.stream
     continuation = updates.continuation
@@ -615,7 +688,7 @@ public actor ShapeSubscriptionCoordinator {
       throw MaterializerFailure()
     }
     try Task.checkCancellation()
-    return try await retrying(operation: "create") {
+    return try await recreatingOnGone(operation: "create") {
       switch self.kind {
       case .shape:
         try await self.client.createShape(self.request)
@@ -623,6 +696,43 @@ public actor ShapeSubscriptionCoordinator {
         try await self.client.createSubsetFeed(self.request)
       }
     }
+  }
+
+  /// `POST /v1/shapes` and `POST /v1/subset-feeds` are the only native routes that mint a shape,
+  /// and they are the only routes with a recreate vocabulary. The engine retires a dormant shape
+  /// whose replay is over budget, and abandons a reactivation join past its bound, as a typed
+  /// recreate outcome rather than a server fault (electric-circuits ADR-0011). It normally answers
+  /// that by falling through to a fresh create in the same round trip, returning `2xx` with a NEW
+  /// shape id — the replacement this coordinator already reseeds from. When the fall-through is
+  /// exhausted, or the join timed out, it answers `410 Gone` instead, because `410` is what the
+  /// durable-stream reader already maps to "gone, get a fresh one".
+  ///
+  /// This performs the fall-through the engine could not: a byte-identical re-POST. The request
+  /// carries no shape id — the retired id only ever lived on the server — so the same table,
+  /// predicate, columns, and stable subscription claim are re-sent and the caller's demand
+  /// identity survives. The bound matters because a join that timed out leaves a detached replay
+  /// running: each attempt can cost the engine's full join timeout, and only a later attempt finds
+  /// the shape active. The backoff exists to avoid a hot loop, not to pace that replay.
+  ///
+  /// `404` is deliberately excluded. ADR-0011 keeps it out of the create vocabulary because it is
+  /// ambiguous with an unknown shape id, and these two routes are collection endpoints with no
+  /// shape id at all, so a `404` there is a routing or deploy fault that retrying would mask.
+  /// `408`/`425`/`429`/`5xx` keep their transient `retryableHTTP` classification and the retry
+  /// policy's backoff. Once the recreate bound is spent, the standing `410` reaches the caller as
+  /// the terminal `ClientError.http(status: 410, ...)` it already was. The bound and its backoff
+  /// are `ShapeSubscriptionRecreatePolicy`.
+  private func recreatingOnGone(
+    operation: String, _ body: @escaping @Sendable () async throws -> ShapeHandle
+  ) async throws -> ShapeHandle {
+    try await recreatePolicy.recreatingOnGone(
+      clock: clock,
+      willRecreate: { attempt in await self.noteRecreateAttempt(attempt) },
+      { try await self.retrying(operation: operation, body) })
+  }
+
+  private func noteRecreateAttempt(_ attempt: Int) {
+    transition(
+      .waitingToRetry(operation: "recreate", attempt: attempt, delay: recreatePolicy.backoff))
   }
 
   /// Admission occurs inside the shared `startTask`, before materializer preflight or the create
@@ -654,8 +764,13 @@ public actor ShapeSubscriptionCoordinator {
     capacityPermit = nil
     await capacity.release(permit)
   }
+  /// A join repeats the create under the same stable claim, so it carries the same recreate
+  /// vocabulary. A recreated join answers with a fresh shape id, which is exactly the replacement
+  /// the engine's own fall-through produces: `renew()` routes it through `requireReseed`, the same
+  /// reconciliation the durable-stream gone receipt uses, so the application reseeds one explicit
+  /// fresh scope instead of inheriting two live server claims.
   private func renewWithRetry() async throws -> ShapeHandle {
-    try await retrying(operation: "renew") {
+    try await recreatingOnGone(operation: "renew") {
       switch self.kind {
       case .shape:
         try await self.client.renewShape(self.request)
@@ -701,7 +816,6 @@ public actor ShapeSubscriptionCoordinator {
     _ outcome: ShapeSubscriptionReseedRequired, extraRelease: ShapeHandle? = nil
   ) async throws {
     generation &+= 1
-    leaseTask?.cancel()
     // A renew may already have been accepted with the old claim while the reader learned that its
     // epoch is terminal. Join it before reseed is visible and compensate any returned handle.
     let renewing = renewTask
@@ -716,6 +830,12 @@ public actor ShapeSubscriptionCoordinator {
     try await releasePending()
     await releaseCapacityPermit()
     transition(.reseedRequired(outcome))
+    // The lease loop is cancelled last, and never before this point. A lease-driven renew runs
+    // this reseed *on* the lease task, so cancelling it first made `releasePending` fail its own
+    // `Task.checkCancellation` and abandoned both the retired and the replacement claim without
+    // ever publishing `.reseedRequired`. The generation bump above already terminates the loop on
+    // its next `isCurrent` check, so the cancel only shortens a pending sleep.
+    leaseTask?.cancel()
   }
 
   private var isAcceptingOperations: Bool { !stopping && stopTask == nil }
