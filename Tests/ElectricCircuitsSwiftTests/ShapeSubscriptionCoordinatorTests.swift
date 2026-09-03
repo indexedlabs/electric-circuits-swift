@@ -100,10 +100,9 @@ private actor CancellationTransport: HTTPTransport {
     if request.httpMethod == "DELETE" {
       return response("", status: 404)
     }
-    while true {
-      try Task.checkCancellation()
-      await Task.yield()
-    }
+    // See the note on the other long-poll fixtures: park cancellably rather than spinning.
+    try await Task.sleep(for: .seconds(3_600))
+    throw CancellationError()
   }
 }
 
@@ -115,7 +114,10 @@ private actor RenewalTransport: HTTPTransport {
     switch request.httpMethod {
     case "POST": return shapeResponse()
     case "GET":
-      while !Task.isCancelled { await Task.yield() }
+      // Hold the long poll open without busy-waiting: a spin occupies a cooperative-pool thread
+      // for the whole test run, and enough of them starve the yield-based progress waits and the
+      // telemetry exporter drain that other suites depend on.
+      try await Task.sleep(for: .seconds(3_600))
       throw CancellationError()
     case "DELETE": return response("", status: 404)
     default: throw CancellationError()
@@ -131,7 +133,10 @@ private actor ReleaseRetryTransport: HTTPTransport {
     switch request.httpMethod {
     case "POST": return shapeResponse()
     case "GET":
-      while !Task.isCancelled { await Task.yield() }
+      // Hold the long poll open without busy-waiting: a spin occupies a cooperative-pool thread
+      // for the whole test run, and enough of them starve the yield-based progress waits and the
+      // telemetry exporter drain that other suites depend on.
+      try await Task.sleep(for: .seconds(3_600))
       throw CancellationError()
     case "DELETE":
       deletes += 1
@@ -148,7 +153,10 @@ private actor LeaseTransport: HTTPTransport {
     switch request.httpMethod {
     case "POST": return shapeResponse(leaseSeconds: 6)
     case "GET":
-      while !Task.isCancelled { await Task.yield() }
+      // Hold the long poll open without busy-waiting: a spin occupies a cooperative-pool thread
+      // for the whole test run, and enough of them starve the yield-based progress waits and the
+      // telemetry exporter drain that other suites depend on.
+      try await Task.sleep(for: .seconds(3_600))
       throw CancellationError()
     case "DELETE": return response("", status: 404)
     default: throw CancellationError()
@@ -166,7 +174,10 @@ private actor ReplacementTransport: HTTPTransport {
       posts += 1
       return shapeResponse(id: posts == 1 ? "s1" : "s2")
     case "GET":
-      while !Task.isCancelled { await Task.yield() }
+      // Hold the long poll open without busy-waiting: a spin occupies a cooperative-pool thread
+      // for the whole test run, and enough of them starve the yield-based progress waits and the
+      // telemetry exporter drain that other suites depend on.
+      try await Task.sleep(for: .seconds(3_600))
       throw CancellationError()
     case "DELETE": return response("", status: 404)
     default: throw CancellationError()
@@ -189,7 +200,10 @@ private actor GatedRenewTransport: HTTPTransport {
       await withCheckedContinuation { gate = $0 }
       return shapeResponse()
     case "GET":
-      while !Task.isCancelled { await Task.yield() }
+      // Hold the long poll open without busy-waiting: a spin occupies a cooperative-pool thread
+      // for the whole test run, and enough of them starve the yield-based progress waits and the
+      // telemetry exporter drain that other suites depend on.
+      try await Task.sleep(for: .seconds(3_600))
       throw CancellationError()
     case "DELETE": return response("", status: 404)
     default: throw CancellationError()
@@ -287,7 +301,10 @@ private actor ExhaustedReleaseTransport: HTTPTransport {
     case "POST":
       return shapeResponse()
     case "GET":
-      while !Task.isCancelled { await Task.yield() }
+      // Hold the long poll open without busy-waiting: a spin occupies a cooperative-pool thread
+      // for the whole test run, and enough of them starve the yield-based progress waits and the
+      // telemetry exporter drain that other suites depend on.
+      try await Task.sleep(for: .seconds(3_600))
       throw CancellationError()
     case "DELETE":
       deletes += 1
