@@ -32,7 +32,9 @@ private actor GoneCreateTransport: HTTPTransport {
       return posts <= goneCreates
         ? recreateResponse("gone", status: 410) : recreateShapeResponse(id: "s1")
     case "GET":
-      while !Task.isCancelled { await Task.yield() }
+      // Hold the long poll open without busy-waiting: a spin would occupy a cooperative-pool
+      // thread for the whole test run and perturb unrelated concurrent suites.
+      try await Task.sleep(for: .seconds(3_600))
       throw CancellationError()
     case "DELETE":
       return recreateResponse("", status: 404)
@@ -80,7 +82,9 @@ private actor GoneJoinTransport: HTTPTransport {
       default: return recreateShapeResponse(id: "s2")
       }
     case "GET":
-      while !Task.isCancelled { await Task.yield() }
+      // Hold the long poll open without busy-waiting: a spin would occupy a cooperative-pool
+      // thread for the whole test run and perturb unrelated concurrent suites.
+      try await Task.sleep(for: .seconds(3_600))
       throw CancellationError()
     case "DELETE":
       return recreateResponse("", status: 404)
@@ -100,7 +104,9 @@ private actor GoneReleaseTransport: HTTPTransport {
     switch request.httpMethod {
     case "POST": return recreateShapeResponse(id: "s1")
     case "GET":
-      while !Task.isCancelled { await Task.yield() }
+      // Hold the long poll open without busy-waiting: a spin would occupy a cooperative-pool
+      // thread for the whole test run and perturb unrelated concurrent suites.
+      try await Task.sleep(for: .seconds(3_600))
       throw CancellationError()
     case "DELETE": return recreateResponse("gone", status: 410)
     default: throw CancellationError()
