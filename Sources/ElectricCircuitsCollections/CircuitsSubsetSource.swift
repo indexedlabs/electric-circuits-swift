@@ -29,6 +29,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   private let capacity: ShapeSubscriptionCapacity?
   private let responseDecodingLimits: ResponseDecodingLimits
   private let telemetry: TelemetryReporter
+  private let recreatePolicy = ShapeSubscriptionRecreatePolicy()
   private let pendingCleanup: PendingSubsetFeedCleanup
 
   public init(
@@ -79,7 +80,13 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       changesOnly: true,
       subscription: subscription
     )
-    let feed = try await client.createSubsetFeed(feedRequest)
+    // The initial feed create is the same native route the coordinator later joins, so it carries
+    // the same recreate vocabulary. A persisted materialization ID joining a dormant shape whose
+    // fall-through the engine has exhausted must re-POST the identical claim, not fail setup
+    // before the frontier HEAD and snapshot query.
+    let feed = try await recreatePolicy.recreatingOnGone(clock: clock) {
+      try await client.createSubsetFeed(feedRequest)
+    }
 
     do {
       let frontier = try await client.streamCursor(for: feed)

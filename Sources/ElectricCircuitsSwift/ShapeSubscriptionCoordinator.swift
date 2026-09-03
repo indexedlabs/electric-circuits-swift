@@ -80,6 +80,50 @@ public struct ShapeSubscriptionRecreatePolicy: Equatable, Sendable {
   }
 }
 
+extension ShapeSubscriptionRecreatePolicy {
+  /// The engine's "recreate" answer on a create/join whose fall-through it could not perform.
+  public static let goneStatus = 410
+
+  /// True when `error` is that answer, in either the raw `ClientError` form the client throws or
+  /// the `ShapeSubscriptionFailure` form the coordinator's retry wrapper produces.
+  public static func isGone(_ error: Error) -> Bool {
+    if case ClientError.http(let status, _) = error { return status == goneStatus }
+    if case ShapeSubscriptionFailure.client(let client) = error,
+      case .http(let status, _) = client
+    {
+      return status == goneStatus
+    }
+    return false
+  }
+
+  /// Runs `body`, answering a `410 Gone` with a bounded, backed-off re-run of the identical
+  /// request. This is the one implementation of the client-side fall-through: both
+  /// `ShapeSubscriptionCoordinator`'s create/join and a source's initial feed create use it, so a
+  /// shape minted before a coordinator exists gets the same recreate vocabulary as one minted by
+  /// it.
+  ///
+  /// `body` must be the same request every time — the two native routes that mint a shape carry no
+  /// shape id, so re-running them re-sends the same table, predicate, columns, and stable claim.
+  /// Every other outcome, `404` and the transient statuses included, propagates unchanged.
+  /// `willRecreate` receives the 1-based attempt number before its backoff, for state or telemetry.
+  public func recreatingOnGone<T: Sendable>(
+    clock: any ShapeSubscriptionClock,
+    willRecreate: @Sendable (Int) async -> Void = { _ in },
+    _ body: @Sendable () async throws -> T
+  ) async throws -> T {
+    var recreates = 0
+    while true {
+      do { return try await body() } catch {
+        guard Self.isGone(error), recreates < maximumRecreates else { throw error }
+        recreates += 1
+        await willRecreate(recreates)
+        try await clock.sleep(for: backoff)
+        try Task.checkCancellation()
+      }
+    }
+  }
+}
+
 /// A caller-owned, shared admission boundary for shape subscription coordinators. Sharing one
 /// instance across coordinators bounds active claims and the stream/retry tasks they own; it does
 /// not queue pending starts.
@@ -218,9 +262,6 @@ private struct CoordinatedMaterializer: ShapeMaterializer {
 /// One shape claim, reader, and lease lifecycle. Reconnects always read the cursor from the
 /// materializer, never from process memory, preserving the provider's atomic apply/cursor boundary.
 public actor ShapeSubscriptionCoordinator {
-  /// The engine's "recreate" answer on a create/join whose fall-through it could not perform.
-  private static let goneStatusCode = 410
-
   public let stateUpdates: AsyncStream<ShapeSubscriptionState>
   public private(set) var state: ShapeSubscriptionState = .idle
 
@@ -683,28 +724,15 @@ public actor ShapeSubscriptionCoordinator {
   private func recreatingOnGone(
     operation: String, _ body: @escaping @Sendable () async throws -> ShapeHandle
   ) async throws -> ShapeHandle {
-    var recreates = 0
-    while true {
-      do { return try await retrying(operation: operation, body) } catch {
-        guard Self.isGone(error), recreates < recreatePolicy.maximumRecreates else { throw error }
-        recreates += 1
-        transition(
-          .waitingToRetry(
-            operation: "recreate", attempt: recreates, delay: recreatePolicy.backoff))
-        try await clock.sleep(for: recreatePolicy.backoff)
-        try Task.checkCancellation()
-      }
-    }
+    try await recreatePolicy.recreatingOnGone(
+      clock: clock,
+      willRecreate: { attempt in await self.noteRecreateAttempt(attempt) },
+      { try await self.retrying(operation: operation, body) })
   }
 
-  private static func isGone(_ error: Error) -> Bool {
-    if case ClientError.http(let status, _) = error { return status == goneStatusCode }
-    if case ShapeSubscriptionFailure.client(let client) = error,
-      case .http(let status, _) = client
-    {
-      return status == goneStatusCode
-    }
-    return false
+  private func noteRecreateAttempt(_ attempt: Int) {
+    transition(
+      .waitingToRetry(operation: "recreate", attempt: attempt, delay: recreatePolicy.backoff))
   }
 
   /// Admission occurs inside the shared `startTask`, before materializer preflight or the create
