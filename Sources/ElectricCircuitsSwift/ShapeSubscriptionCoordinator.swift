@@ -192,6 +192,13 @@ private struct CoordinatedMaterializer: ShapeMaterializer {
 /// One shape claim, reader, and lease lifecycle. Reconnects always read the cursor from the
 /// materializer, never from process memory, preserving the provider's atomic apply/cursor boundary.
 public actor ShapeSubscriptionCoordinator {
+  /// The engine's "recreate" answer on a create/join whose fall-through it could not perform.
+  private static let goneStatusCode = 410
+  /// A create answered `410` three times running is a standing condition, not a reactivation
+  /// race, and must reach the caller as terminal.
+  private static let maximumGoneRecreates = 2
+  private static let goneRecreateBackoff = Duration.milliseconds(250)
+
   public let stateUpdates: AsyncStream<ShapeSubscriptionState>
   public private(set) var state: ShapeSubscriptionState = .idle
 
@@ -615,7 +622,7 @@ public actor ShapeSubscriptionCoordinator {
       throw MaterializerFailure()
     }
     try Task.checkCancellation()
-    return try await retrying(operation: "create") {
+    return try await recreatingOnGone(operation: "create") {
       switch self.kind {
       case .shape:
         try await self.client.createShape(self.request)
@@ -623,6 +630,55 @@ public actor ShapeSubscriptionCoordinator {
         try await self.client.createSubsetFeed(self.request)
       }
     }
+  }
+
+  /// `POST /v1/shapes` and `POST /v1/subset-feeds` are the only native routes that mint a shape,
+  /// and they are the only routes with a recreate vocabulary. The engine retires a dormant shape
+  /// whose replay is over budget, and abandons a reactivation join past its bound, as a typed
+  /// recreate outcome rather than a server fault (electric-circuits ADR-0011). It normally answers
+  /// that by falling through to a fresh create in the same round trip, returning `2xx` with a NEW
+  /// shape id — the replacement this coordinator already reseeds from. When the fall-through is
+  /// exhausted, or the join timed out, it answers `410 Gone` instead, because `410` is what the
+  /// durable-stream reader already maps to "gone, get a fresh one".
+  ///
+  /// This performs the fall-through the engine could not: a byte-identical re-POST. The request
+  /// carries no shape id — the retired id only ever lived on the server — so the same table,
+  /// predicate, columns, and stable subscription claim are re-sent and the caller's demand
+  /// identity survives. The bound matters because a join that timed out leaves a detached replay
+  /// running: each attempt can cost the engine's full join timeout, and only a later attempt finds
+  /// the shape active. The backoff exists to avoid a hot loop, not to pace that replay.
+  ///
+  /// `404` is deliberately excluded. ADR-0011 keeps it out of the create vocabulary because it is
+  /// ambiguous with an unknown shape id, and these two routes are collection endpoints with no
+  /// shape id at all, so a `404` there is a routing or deploy fault that retrying would mask.
+  /// `408`/`425`/`429`/`5xx` keep their transient `retryableHTTP` classification and the retry
+  /// policy's backoff. Once the recreate bound is spent, the standing `410` reaches the caller as
+  /// the terminal `ClientError.http(status: 410, ...)` it already was.
+  private func recreatingOnGone(
+    operation: String, _ body: @escaping @Sendable () async throws -> ShapeHandle
+  ) async throws -> ShapeHandle {
+    var recreates = 0
+    while true {
+      do { return try await retrying(operation: operation, body) } catch {
+        guard Self.isGone(error), recreates < Self.maximumGoneRecreates else { throw error }
+        recreates += 1
+        transition(
+          .waitingToRetry(
+            operation: "recreate", attempt: recreates, delay: Self.goneRecreateBackoff))
+        try await clock.sleep(for: Self.goneRecreateBackoff)
+        try Task.checkCancellation()
+      }
+    }
+  }
+
+  private static func isGone(_ error: Error) -> Bool {
+    if case ClientError.http(let status, _) = error { return status == goneStatusCode }
+    if case ShapeSubscriptionFailure.client(let client) = error,
+      case .http(let status, _) = client
+    {
+      return status == goneStatusCode
+    }
+    return false
   }
 
   /// Admission occurs inside the shared `startTask`, before materializer preflight or the create
