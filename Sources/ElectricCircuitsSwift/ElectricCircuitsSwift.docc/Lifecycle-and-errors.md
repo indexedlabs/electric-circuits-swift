@@ -23,6 +23,17 @@ acquire a new snapshot and replace its local materialization.
 The coordinator's retry policy handles only classified transient HTTP and transport failures. It is
 not an offline-write queue, conflict resolver, or background-execution scheduler.
 
+## Recreating a shape the engine reports gone
+
+The engine retires a dormant shape whose replay is over budget as a recreate outcome rather than a
+server fault. `POST /v1/shapes` and `POST /v1/subset-feeds` normally answer that by falling through
+to a fresh create in the same round trip; when that fall-through is exhausted they answer `410`. The
+coordinator performs the fall-through itself as a byte-identical re-POST, bounded by
+``ShapeSubscriptionRecreatePolicy``. A recreated join answers with a fresh shape id and is therefore
+reported through the same ``ShapeSubscriptionReseedRequired`` replacement outcome as the engine's own
+fall-through. A standing `410` past the bound, a `404` on a create, and a `410` on any other control
+route are terminal.
+
 ## Error handling
 
 ``ClientError`` retains a public HTTP status/classification without server response data. ``StreamError``

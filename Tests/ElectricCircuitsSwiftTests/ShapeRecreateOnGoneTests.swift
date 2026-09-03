@@ -132,7 +132,8 @@ private func recreateCoordinator(
   transport: any HTTPTransport,
   clock: any ShapeSubscriptionClock,
   maxRetries: Int = 0,
-  kind: ShapeSubscriptionKind = .shape
+  kind: ShapeSubscriptionKind = .shape,
+  recreatePolicy: ShapeSubscriptionRecreatePolicy = .init()
 ) -> ShapeSubscriptionCoordinator {
   ShapeSubscriptionCoordinator(
     client: ElectricCircuitsClient(
@@ -142,7 +143,8 @@ private func recreateCoordinator(
     materializer: InMemoryShapeMaterializer(),
     retryPolicy: .init(maxRetries: maxRetries),
     clock: clock,
-    kind: kind)
+    kind: kind,
+    recreatePolicy: recreatePolicy)
 }
 
 @Suite("Shape recreate on gone")
@@ -268,5 +270,39 @@ struct ShapeRecreateOnGoneTests {
     ) { try await coordinator.stop() }
 
     #expect(await transport.deleteCount == 1)
+  }
+
+  @Test func recreatePolicyDefaultsToTwoRecreatesAndAShortBackoff() {
+    let policy = ShapeSubscriptionRecreatePolicy()
+    #expect(policy.maximumRecreates == 2)
+    #expect(policy.backoff == .milliseconds(250))
+  }
+
+  @Test func aZeroRecreateBoundSurfacesTheFirstGoneAsTerminal() async throws {
+    let transport = FixedCreateStatusTransport(status: 410)
+    let coordinator = recreateCoordinator(
+      transport: transport, clock: RecreateClock(),
+      recreatePolicy: .init(maximumRecreates: 0))
+
+    await #expect(
+      throws: ShapeSubscriptionFailure.client(.http(status: 410, message: "HTTP request failed"))
+    ) { _ = try await coordinator.start() }
+
+    #expect(await transport.postCount == 1)
+  }
+
+  @Test func aWidenedRecreateBoundAndBackoffAreHonoured() async throws {
+    let transport = GoneCreateTransport(goneCreates: 3)
+    let clock = RecreateClock()
+    let coordinator = recreateCoordinator(
+      transport: transport, clock: clock,
+      recreatePolicy: .init(maximumRecreates: 3, backoff: .milliseconds(10)))
+
+    let handle = try await coordinator.start()
+
+    #expect(handle.id == "s1")
+    #expect(await transport.postCount == 4)
+    #expect(await clock.delays == [.milliseconds(10), .milliseconds(10), .milliseconds(10)])
+    try await coordinator.stop()
   }
 }

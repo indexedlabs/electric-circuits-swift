@@ -3,6 +3,17 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
+## Unreleased
+
+- `ShapeSubscriptionCoordinator` now answers `410 Gone` from the two native routes that mint a
+  shape (`POST /v1/shapes`, `POST /v1/subset-feeds`) with a bounded client-side fall-through: a
+  byte-identical re-POST under the same table, predicate, columns, and stable claim. A recreated
+  join reaches the application through the existing replacement/`requireReseed` path. `404` on a
+  create, `410` on any other control route, and the `408`/`425`/`429`/`5xx` retryable
+  classification are unchanged.
+- Add `ShapeSubscriptionRecreatePolicy` (default: 2 recreates, 250 ms backoff) and the defaulted
+  `ShapeSubscriptionCoordinator.init(recreatePolicy:)` parameter. Additive and source-compatible.
+
 ## 0.2.1
 
 - Publish the collection-coordination release from the canonical `main` branch and update release

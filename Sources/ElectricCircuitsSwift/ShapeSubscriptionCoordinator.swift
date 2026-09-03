@@ -54,6 +54,32 @@ public struct ShapeSubscriptionRetryPolicy: Sendable {
   }
 }
 
+/// Bounds the client-side fall-through for a create/join the engine answered `410 Gone`.
+///
+/// The engine retires a dormant shape whose replay is over budget, and abandons a reactivation
+/// join past its own timeout, as a typed recreate outcome rather than a server fault
+/// (electric-circuits ADR-0011, "Dormant reactivation is bounded"). It normally answers that by
+/// falling through to a fresh create in the same round trip; when that fall-through is exhausted
+/// it answers `410` and expects the client to recreate.
+///
+/// The bound matters because a join that timed out leaves a detached replay running on the
+/// engine: each attempt can cost its full join timeout, and only a later attempt finds the shape
+/// active. A create answered `410` past the bound is a standing condition, not a reactivation
+/// race, and reaches the caller as the terminal `ClientError.http(status: 410, ...)` it already
+/// was. The backoff exists to avoid a hot loop, not to pace the engine's replay.
+public struct ShapeSubscriptionRecreatePolicy: Equatable, Sendable {
+  /// Recreates attempted after the first `410`. `0` surfaces the first `410` as terminal.
+  public let maximumRecreates: Int
+  public let backoff: Duration
+
+  public init(maximumRecreates: Int = 2, backoff: Duration = .milliseconds(250)) {
+    precondition(maximumRecreates >= 0)
+    precondition(backoff >= .zero)
+    self.maximumRecreates = maximumRecreates
+    self.backoff = backoff
+  }
+}
+
 /// A caller-owned, shared admission boundary for shape subscription coordinators. Sharing one
 /// instance across coordinators bounds active claims and the stream/retry tasks they own; it does
 /// not queue pending starts.
@@ -194,10 +220,6 @@ private struct CoordinatedMaterializer: ShapeMaterializer {
 public actor ShapeSubscriptionCoordinator {
   /// The engine's "recreate" answer on a create/join whose fall-through it could not perform.
   private static let goneStatusCode = 410
-  /// A create answered `410` three times running is a standing condition, not a reactivation
-  /// race, and must reach the caller as terminal.
-  private static let maximumGoneRecreates = 2
-  private static let goneRecreateBackoff = Duration.milliseconds(250)
 
   public let stateUpdates: AsyncStream<ShapeSubscriptionState>
   public private(set) var state: ShapeSubscriptionState = .idle
@@ -212,6 +234,7 @@ public actor ShapeSubscriptionCoordinator {
   private let responseDecodingLimits: ResponseDecodingLimits
   private let telemetry: TelemetryReporter
   private let kind: ShapeSubscriptionKind
+  private let recreatePolicy: ShapeSubscriptionRecreatePolicy
   private var continuation: AsyncStream<ShapeSubscriptionState>.Continuation?
   private var handle: ShapeHandle?
   private var pendingRelease: [ShapeHandle] = []
@@ -251,7 +274,8 @@ public actor ShapeSubscriptionCoordinator {
     capacity: ShapeSubscriptionCapacity? = nil,
     responseDecodingLimits: ResponseDecodingLimits = .default,
     telemetry: TelemetryReporter = .noop,
-    kind: ShapeSubscriptionKind = .shape
+    kind: ShapeSubscriptionKind = .shape,
+    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init()
   ) {
     self.client = client
     self.transport = transport
@@ -263,6 +287,7 @@ public actor ShapeSubscriptionCoordinator {
     self.responseDecodingLimits = responseDecodingLimits
     self.telemetry = telemetry
     self.kind = kind
+    self.recreatePolicy = recreatePolicy
     let updates = AsyncStream<ShapeSubscriptionState>.makeStream()
     stateUpdates = updates.stream
     continuation = updates.continuation
@@ -653,19 +678,20 @@ public actor ShapeSubscriptionCoordinator {
   /// shape id at all, so a `404` there is a routing or deploy fault that retrying would mask.
   /// `408`/`425`/`429`/`5xx` keep their transient `retryableHTTP` classification and the retry
   /// policy's backoff. Once the recreate bound is spent, the standing `410` reaches the caller as
-  /// the terminal `ClientError.http(status: 410, ...)` it already was.
+  /// the terminal `ClientError.http(status: 410, ...)` it already was. The bound and its backoff
+  /// are `ShapeSubscriptionRecreatePolicy`.
   private func recreatingOnGone(
     operation: String, _ body: @escaping @Sendable () async throws -> ShapeHandle
   ) async throws -> ShapeHandle {
     var recreates = 0
     while true {
       do { return try await retrying(operation: operation, body) } catch {
-        guard Self.isGone(error), recreates < Self.maximumGoneRecreates else { throw error }
+        guard Self.isGone(error), recreates < recreatePolicy.maximumRecreates else { throw error }
         recreates += 1
         transition(
           .waitingToRetry(
-            operation: "recreate", attempt: recreates, delay: Self.goneRecreateBackoff))
-        try await clock.sleep(for: Self.goneRecreateBackoff)
+            operation: "recreate", attempt: recreates, delay: recreatePolicy.backoff))
+        try await clock.sleep(for: recreatePolicy.backoff)
         try Task.checkCancellation()
       }
     }

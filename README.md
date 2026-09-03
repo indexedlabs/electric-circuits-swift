@@ -128,6 +128,35 @@ Network.framework reachability or a generic scheduler to this package. Cancellin
 response leaves the provider's durable cursor unchanged; once the caller allows the same live claim
 to continue, the next poll resumes from that cursor.
 
+The engine retires a dormant shape whose replay is over budget, and abandons a reactivation join
+past its own timeout, as a typed recreate outcome rather than a server fault (electric-circuits
+ADR-0011, *Dormant reactivation is bounded*). The two native routes that mint a shape,
+`POST /v1/shapes` and `POST /v1/subset-feeds`, normally answer that by falling through to a fresh
+create in the same round trip and returning `2xx` with a new shape id. When that fall-through is
+exhausted, they answer `410 Gone` and expect the client to recreate. `ShapeSubscriptionCoordinator`
+performs that fall-through itself: a byte-identical re-POST that carries no shape id — the retired
+id only ever lived on the server — so the same table, predicate, columns, and stable subscription
+claim are re-sent and the caller's demand identity survives. A recreated join answers with a fresh
+shape id, which is the same replacement the engine's own fall-through produces, so it reaches the
+application through the existing `requireReseed` path: the retired identity and the replacement are
+both released under that claim, and one `.reseedRequired` publication carries both ids.
+
+`ShapeSubscriptionRecreatePolicy` bounds that fall-through (2 recreates and a 250 ms backoff by
+default). The bound matters because a join that timed out leaves a detached replay running on the
+engine, so each attempt can cost its full join timeout; the backoff avoids a hot loop rather than
+pacing that replay. Past the bound a standing `410` is terminal
+`ClientError.http(status: 410, …)`. `404` on a create stays terminal — ADR-0011 keeps it out of the
+create vocabulary because it is ambiguous with an unknown shape id, and these are collection
+endpoints with no shape id at all — as does `410` on any other control route, including
+`DELETE /v1/shapes/{id}`. `408`, `425`, `429`, and `5xx` keep their retryable classification.
+
+```swift
+let coordinator = ShapeSubscriptionCoordinator(
+  client: client, transport: transport, request: request, materializer: materializer,
+  recreatePolicy: ShapeSubscriptionRecreatePolicy(
+    maximumRecreates: 2, backoff: .milliseconds(250)))
+```
+
 `stream-closed: true`, `404`, and `410` are terminal **generation** receipts. The coordinator
 releases the old named claim and publishes `.reseedRequired`; it never creates a replacement or
 reuses the old provider cursor automatically. The application must create a fresh

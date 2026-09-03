@@ -51,6 +51,16 @@ when valid, not a server-error-string convention. The coordinator combines that 
 own bounded retry policy, and a caller-owned transport may separately refresh credentials/cookies
 without the core persisting, interpreting, or exporting them.
 
+`410` on `POST /v1/shapes` and `POST /v1/subset-feeds` is the engine's recreate answer for a
+dormant shape it could not fall through to a fresh create in the same round trip, or a
+reactivation join that exceeded its bound (electric-circuits ADR-0011). The client recreates by
+re-POSTing the identical request — those two collection endpoints carry no shape id — bounded by
+`ShapeSubscriptionRecreatePolicy`, and surfaces a standing `410` past that bound as terminal
+`ClientError.http`. `404` is deliberately not part of that vocabulary because it is ambiguous with
+an unknown shape id, and `410` on every other listed endpoint remains terminal. This status is not
+yet in the Rust OpenAPI projection above; the client handling is additive and forward-compatible,
+and the JSON projection gains the status when the engine documents it.
+
 `ClientError.http` preserves a typed status but uses the fixed message `HTTP request failed`.
 Neither it nor stream/coordinator state may retain response bytes, response headers, cookies,
 tokens, or arbitrary provider diagnostics. Telemetry uses only bounded allowlisted attributes.
