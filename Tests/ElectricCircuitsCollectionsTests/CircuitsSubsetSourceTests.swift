@@ -303,6 +303,39 @@ struct CircuitsSubsetSourceTests {
     try await session.stop()
   }
 
+
+  @Test func aZeroBoundSourceSurfacesTheFirstGoneFromItsInitialFeed() async throws {
+    let transport = GoneSubsetFeedTransport(goneCreates: 1)
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let source = CircuitsSubsetSource<NativeIssue, Int64>(
+      client: client,
+      transport: transport,
+      table: "public.issues",
+      retryPolicy: ShapeSubscriptionRetryPolicy(maxRetries: 0),
+      clock: SubsetRecreateClock(),
+      recreatePolicy: ShapeSubscriptionRecreatePolicy(maximumRecreates: 0),
+      decodeRow: NativeIssue.init(row:),
+      decodeKey: { key in
+        guard let id = Int64(key) else { throw CircuitsSubsetSourceError.invalidLiveKey(key) }
+        return id
+      }
+    )
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: CollectionID(rawValue: "issues"), key: \.id)
+    let scope = CollectionScope(principal: "u", authorization: "a", generation: "g")
+    let demand = CollectionDemand<NativeIssue>(unsafePredicateIdentity: "all")
+
+    // A collection deployment that would rather run its own scope handoff must be able to say so.
+    await #expect(throws: ClientError.http(status: 410, message: "HTTP request failed")) {
+      _ = try await source.materialize(
+        demand,
+        identity: demand.identity(for: definition, scope: scope),
+        materializationID: CollectionMaterializationID(rawValue: "issues-all"))
+    }
+    #expect(await transport.subsetFeedCreateCount == 1)
+  }
+
   @Test func limitedDemandFailsBeforeCreatingAnUnmaintainedLiveFeed() async throws {
     let transport = NativeSubsetTransport()
     let client = ElectricCircuitsClient(

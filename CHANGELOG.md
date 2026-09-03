@@ -11,8 +11,13 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   join reaches the application through the existing replacement/`requireReseed` path. `404` on a
   create, `410` on any other control route, and the `408`/`425`/`429`/`5xx` retryable
   classification are unchanged.
-- Add `ShapeSubscriptionRecreatePolicy` (default: 2 recreates, 250 ms backoff) and the defaulted
-  `ShapeSubscriptionCoordinator.init(recreatePolicy:)` parameter. Additive and source-compatible.
+- `CircuitsSubsetSource` routes its initial changes-only feed create through the same bounded
+  recreate, so a persisted materialization ID joining a dormant shape no longer fails collection
+  setup before the frontier HEAD and snapshot query.
+- Add `ShapeSubscriptionRecreatePolicy` (default: 2 recreates, 250 ms backoff), its shared
+  `recreatingOnGone(clock:willRecreate:_:)`/`isGone(_:)`/`goneStatus` seam, and the defaulted
+  `ShapeSubscriptionCoordinator.init(recreatePolicy:)` and
+  `CircuitsSubsetSource.init(recreatePolicy:)` parameters. Additive and source-compatible.
 
 ## 0.2.1
 
