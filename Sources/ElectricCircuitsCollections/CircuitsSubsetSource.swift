@@ -4,6 +4,10 @@ import Foundation
 public enum CircuitsSubsetSourceError: Error, Equatable, Sendable {
   case unsupportedOrderCount(Int)
   case unsupportedLimitedLiveDemand(Int)
+  /// A limited window could not obtain a page at least as fresh as the tail changes it must
+  /// answer within the retry budget; applying an older page would acknowledge those changes
+  /// without reflecting them.
+  case stalePage(required: CollectionSourceVersion, observed: CollectionSourceVersion)
   case invalidSnapshotRow(index: Int)
   case invalidLiveKey(String)
   case invalidSnapshotSourceVersion(String)
@@ -24,6 +28,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   private let columns: [String]?
   private let decodeRow: @Sendable (ChangeRow) throws -> Model
   private let decodeKey: @Sendable (String) throws -> Key
+  private let keyForRow: (@Sendable (Model) throws -> Key)?
   private let retryPolicy: ShapeSubscriptionRetryPolicy
   private let clock: any ShapeSubscriptionClock
   private let capacity: ShapeSubscriptionCapacity?
@@ -44,7 +49,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     telemetry: TelemetryReporter = .noop,
     recreatePolicy: ShapeSubscriptionRecreatePolicy = .init(),
     decodeRow: @escaping @Sendable (ChangeRow) throws -> Model,
-    decodeKey: @escaping @Sendable (String) throws -> Key
+    decodeKey: @escaping @Sendable (String) throws -> Key,
+    keyForRow: (@Sendable (Model) throws -> Key)? = nil
   ) {
     precondition(!table.isEmpty)
     self.client = client
@@ -59,6 +65,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     self.recreatePolicy = recreatePolicy
     self.decodeRow = decodeRow
     self.decodeKey = decodeKey
+    self.keyForRow = keyForRow
     pendingCleanup = PendingSubsetFeedCleanup(client: client)
   }
 
@@ -67,7 +74,10 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     identity: CollectionDemandIdentity,
     materializationID: CollectionMaterializationID
   ) async throws -> CollectionSourceSession<Model, Key> {
-    if let limit = demand.limit {
+    // A limited live demand is a window: the snapshot is the ordered page and every accepted tail
+    // change re-queries that page so membership follows the source. The window needs exactly one
+    // order column to be well defined and a row key to diff the page against the held keys.
+    if let limit = demand.limit, demand.order.count != 1 || keyForRow == nil {
       throw CircuitsSubsetSourceError.unsupportedLimitedLiveDemand(limit)
     }
     guard demand.order.count <= 1 else {
@@ -95,27 +105,56 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       let orderBy = demand.order.first.map {
         SubsetOrderBy(column: $0.sourceName, descending: $0.direction == .descending)
       }
-      let response = try await client.querySubset(
-        SubsetQuery(
-          table: table,
-          where: demand.sourcePredicate,
-          columns: columns,
-          orderBy: orderBy,
-          limit: demand.limit
-        ))
-      let rows = try response.rows.enumerated().map { index, value in
-        guard case .object(let row) = value else {
-          throw CircuitsSubsetSourceError.invalidSnapshotRow(index: index)
+      // A window is positioned by its order column, so a row without one cannot be placed in
+      // the page: SQL sorts NULL sort keys first under DESC and would fill the page with them.
+      // The page therefore requires the sort key while the feed keeps the demand's predicate, so
+      // a row that gains its sort key later still arrives on the tail and re-queries the page.
+      let pagePredicate: ElectricCircuitsSwift.Predicate? =
+        if demand.limit != nil, let orderBy {
+          .and(
+            [demand.sourcePredicate, .isNull(column: orderBy.column, isNull: false)]
+              .compactMap { $0 })
+        } else {
+          demand.sourcePredicate
         }
-        return try decodeRow(row)
+      let pageQuery = SubsetQuery(
+        table: table,
+        where: pagePredicate,
+        columns: columns,
+        orderBy: orderBy,
+        limit: demand.limit
+      )
+      let decodeRow = decodeRow
+      let decodePage: @Sendable (SubsetResponse) throws -> ([Model], CollectionSourceVersion) = {
+        response in
+        let rows = try response.rows.enumerated().map { index, value in
+          guard case .object(let row) = value else {
+            throw CircuitsSubsetSourceError.invalidSnapshotRow(index: index)
+          }
+          return try decodeRow(row)
+        }
+        guard let version = Self.postgresLSN(response.lsn) else {
+          throw CircuitsSubsetSourceError.invalidSnapshotSourceVersion(response.lsn)
+        }
+        return (rows, version)
       }
-      guard let snapshotVersion = Self.postgresLSN(response.lsn) else {
-        throw CircuitsSubsetSourceError.invalidSnapshotSourceVersion(response.lsn)
-      }
+      let (rows, snapshotVersion) = try decodePage(try await client.querySubset(pageQuery))
+      let window: LimitedWindow<Model, Key>? =
+        if demand.limit != nil, let keyForRow {
+          LimitedWindow(
+            keys: Set(try rows.map(keyForRow)),
+            keyForRow: keyForRow,
+            fetchPage: { try await client.querySubset(pageQuery) },
+            decodePage: decodePage
+          )
+        } else {
+          nil
+        }
       let cursor = StreamCursor(offset: frontier.offset, lsn: snapshotVersion.rawValue)
       let lifecycle = CircuitsSubsetSessionLifecycle(client: client, initialHandle: feed)
       let snapshotFence = SnapshotFence(
-        rawValue: Self.snapshotFence(offset: frontier.offset, sourceVersion: response.lsn))
+        rawValue: Self.snapshotFence(
+          offset: frontier.offset, sourceVersion: snapshotVersion.rawValue))
 
       return CollectionSourceSession(
         snapshot: CollectionSnapshot(
@@ -126,6 +165,9 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
             sourceVersion: snapshotVersion,
             decodeRow: decodeRow,
             decodeKey: decodeKey,
+            window: window,
+            retryPolicy: retryPolicy,
+            clock: clock,
             apply: apply
           )
           let coordinator = ShapeSubscriptionCoordinator(
@@ -151,6 +193,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
                 try Task.checkCancellation()
                 switch state {
                 case .failed(let failure):
+                  if let cause = await materializer.takeTerminalFailure() { throw cause }
                   throw CircuitsSubsetSourceError.subscription(failure)
                 case .reseedRequired(let outcome):
                   throw CircuitsSubsetSourceError.subscription(.reseedRequired(outcome))
@@ -284,6 +327,30 @@ private actor CircuitsSubsetSessionLifecycle {
   }
 }
 
+/// The held page of a limited live demand.
+///
+/// The feed carries every change under the base predicate, but a bounded page cannot apply them
+/// positionally: an update can move a row across the page boundary, an insert can push the last
+/// row out, and a delete leaves a slot the feed cannot refill. So the window never applies tail
+/// rows directly — it does not even decode them. Each tail batch that carries an accepted change
+/// re-queries the page and emits the difference: the new page rows as upserts and the held keys
+/// that left the page as deletes, both at the page's LSN. Envelopes below the snapshot LSN still
+/// only advance the offset, as for an unbounded demand.
+///
+/// The page must be causally fresh: acknowledging a batch whose tail reached LSN `n` with a page
+/// snapshotted before `n` would drop a change the feed will never resend (a delete at `n` against
+/// a page that still lists the row). A page older than the batch's accepted maximum is therefore
+/// retried, never applied. Membership is committed only after the store has applied the diff, so
+/// a failed application leaves the held keys describing what the store actually holds.
+private struct LimitedWindow<Model: Sendable, Key: Hashable & Sendable>: Sendable {
+  var keys: Set<Key>
+  let keyForRow: @Sendable (Model) throws -> Key
+  /// The page fetch alone, so the retry loop never re-fetches a page whose only problem is that
+  /// the model cannot decode it.
+  let fetchPage: @Sendable () async throws -> SubsetResponse
+  let decodePage: @Sendable (SubsetResponse) throws -> ([Model], CollectionSourceVersion)
+}
+
 private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable & Sendable>:
   ShapeMaterializer
 {
@@ -292,13 +359,28 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
   private var sourceVersion: CollectionSourceVersion
   private let decodeRow: @Sendable (ChangeRow) throws -> Model
   private let decodeKey: @Sendable (String) throws -> Key
+  private var window: LimitedWindow<Model, Key>?
+  private let retryPolicy: ShapeSubscriptionRetryPolicy
+  private let clock: any ShapeSubscriptionClock
   private let applyBatch: @Sendable (CollectionChangeBatch<Model, Key>) async throws -> Void
+  /// The window error that ended this materializer. The subscription coordinator reports any
+  /// materializer error as `.materializer`, so the source keeps the typed cause here and rethrows
+  /// it from the session instead of the coordinator's summary.
+  private var terminalFailure: (any Error)?
+
+  func takeTerminalFailure() -> (any Error)? {
+    defer { terminalFailure = nil }
+    return terminalFailure
+  }
 
   init(
     cursor: StreamCursor,
     sourceVersion: CollectionSourceVersion,
     decodeRow: @escaping @Sendable (ChangeRow) throws -> Model,
     decodeKey: @escaping @Sendable (String) throws -> Key,
+    window: LimitedWindow<Model, Key>? = nil,
+    retryPolicy: ShapeSubscriptionRetryPolicy = .init(),
+    clock: any ShapeSubscriptionClock = ContinuousShapeSubscriptionClock(),
     apply: @escaping @Sendable (CollectionChangeBatch<Model, Key>) async throws -> Void
   ) {
     self.cursor = cursor
@@ -306,7 +388,62 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
     self.sourceVersion = sourceVersion
     self.decodeRow = decodeRow
     self.decodeKey = decodeKey
+    self.window = window
+    self.retryPolicy = retryPolicy
+    self.clock = clock
     applyBatch = apply
+  }
+
+  /// A page snapshotted no earlier than `notBefore`. Transient page failures and pages that are
+  /// still behind the tail are retried on the subscription's policy; cancellation, decoding and
+  /// non-retryable client errors surface at once, and exhausting the budget on a stale page
+  /// throws `stalePage` rather than acknowledging changes the page does not reflect.
+  private func freshPage(
+    _ window: LimitedWindow<Model, Key>, notBefore: CollectionSourceVersion
+  ) async throws -> ([Model], CollectionSourceVersion) {
+    var retries = 0
+    while true {
+      try Task.checkCancellation()
+      let response: SubsetResponse
+      do {
+        response = try await window.fetchPage()
+      } catch {
+        guard Self.isRetryablePageFailure(error), retries < retryPolicy.maxRetries else {
+          throw error
+        }
+        retries += 1
+        try await clock.sleep(
+          for: retryPolicy.delay(forRetry: retries, retryAfter: Self.retryAfter(for: error)))
+        continue
+      }
+      guard let version = CircuitsSubsetSource<Model, Key>.postgresLSN(response.lsn) else {
+        throw CircuitsSubsetSourceError.invalidSnapshotSourceVersion(response.lsn)
+      }
+      // Decoding sits outside the retry path: a page the model rejects is terminal, and
+      // fetching it again could not change that.
+      if version >= notBefore { return try window.decodePage(response) }
+      let stale = version
+      guard retries < retryPolicy.maxRetries else {
+        throw CircuitsSubsetSourceError.stalePage(required: notBefore, observed: stale)
+      }
+      retries += 1
+      try await clock.sleep(for: retryPolicy.delay(forRetry: retries))
+    }
+  }
+
+  private static func retryAfter(for error: any Error) -> Duration? {
+    guard case ClientError.retryableHTTP(_, let retryAfter) = error else { return nil }
+    return retryAfter
+  }
+
+  private static func isRetryablePageFailure(_ error: any Error) -> Bool {
+    if error is CancellationError { return false }
+    if case ClientError.retryableHTTP = error { return true }
+    if error is ClientError || error is CircuitsSubsetSourceError { return false }
+    if let url = error as? URLError {
+      return url.code != .cancelled && url.code != .badURL && url.code != .unsupportedURL
+    }
+    return true
   }
 
   func currentCursor() async throws -> StreamCursor? { cursor }
@@ -324,7 +461,8 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
         advancingTo: nextCursor
       )
     }
-    var accepted: [CollectionChange<Model, Key>] = []
+    var changes: [CollectionChange<Model, Key>] = []
+    var acceptedCount = 0
     var latest = sourceVersion
     for envelope in batch.envelopes {
       guard let rawVersion = envelope.headers.lsn,
@@ -338,23 +476,54 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
       // disappear. We still advance the durable offset for dropped pre-snapshot overlap.
       guard version >= snapshotSourceVersion else { continue }
       latest = max(latest, version)
+      acceptedCount += 1
+      // A window never applies tail rows, so it does not decode them either: the feed covers the
+      // whole predicate, including rows the page excludes (NULL sort keys among them), and a
+      // model decoder is entitled to reject those. The page is the only source of window rows.
+      guard window == nil else { continue }
       switch envelope.headers.operation {
       case .delete:
-        do { accepted.append(.delete(try decodeKey(envelope.key), sourceVersion: version)) } catch {
+        do { changes.append(.delete(try decodeKey(envelope.key), sourceVersion: version)) } catch {
           throw CircuitsSubsetSourceError.invalidLiveKey(envelope.key)
         }
       case .insert, .update, .upsert:
         guard let value = envelope.value else { throw StreamError.missingValue(key: envelope.key) }
-        accepted.append(.upsert(try decodeRow(value), sourceVersion: version))
+        changes.append(.upsert(try decodeRow(value), sourceVersion: version))
       }
+    }
+    var committedWindowKeys: Set<Key>?
+    if let window, acceptedCount > 0 {
+      let (rows, pageVersion): ([Model], CollectionSourceVersion)
+      do {
+        (rows, pageVersion) = try await freshPage(window, notBefore: latest)
+      } catch {
+        if !(error is CancellationError) { terminalFailure = error }
+        throw error
+      }
+      latest = pageVersion
+      var pageKeys = Set<Key>()
+      pageKeys.reserveCapacity(rows.count)
+      changes = try rows.map { row in
+        pageKeys.insert(try window.keyForRow(row))
+        return .upsert(row, sourceVersion: pageVersion)
+      }
+      for key in window.keys.subtracting(pageKeys) {
+        changes.append(.delete(key, sourceVersion: pageVersion))
+      }
+      committedWindowKeys = pageKeys
     }
     try await applyBatch(
       CollectionChangeBatch(
-        changes: accepted,
+        changes: changes,
         expectedCursor: expectedCursor,
         cursor: StreamCursor(offset: nextCursor.offset, lsn: latest.rawValue),
         sourceVersion: latest
       ))
+    // Window membership, cursor and source version move together, only once the store has
+    // applied the diff: a failed application leaves the held keys describing the store's rows.
+    if let committedWindowKeys {
+      window?.keys = committedWindowKeys
+    }
     cursor = StreamCursor(offset: nextCursor.offset, lsn: latest.rawValue)
     sourceVersion = latest
   }

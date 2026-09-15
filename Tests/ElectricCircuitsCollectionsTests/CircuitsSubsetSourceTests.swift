@@ -31,8 +31,12 @@ private actor NativeSubsetTransport: HTTPTransport {
   private(set) var requests: [URLRequest] = []
   private var streamReads = 0
   private var streamBodies: [String]
+  private var queryBodies: [String]
   private var headFailures: Int
   private var queryFailures: Int
+  private var requeryFailures: Int
+  private let requeryRetryAfter: String?
+  private var servedQueries = 0
   private var deleteFailures: Int
   private var deleteTransportFailures: Int
 
@@ -40,14 +44,20 @@ private actor NativeSubsetTransport: HTTPTransport {
     streamBodies: [String] = [
       #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"Live"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#
     ],
+    queryBodies: [String] = [#"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/10"}"#],
     headFailures: Int = 0,
     queryFailures: Int = 0,
+    requeryFailures: Int = 0,
+    requeryRetryAfter: String? = nil,
     deleteFailures: Int = 0,
     deleteTransportFailures: Int = 0
   ) {
     self.streamBodies = streamBodies
+    self.queryBodies = queryBodies
     self.headFailures = headFailures
     self.queryFailures = queryFailures
+    self.requeryFailures = requeryFailures
+    self.requeryRetryAfter = requeryRetryAfter
     self.deleteFailures = deleteFailures
     self.deleteTransportFailures = deleteTransportFailures
   }
@@ -71,9 +81,17 @@ private actor NativeSubsetTransport: HTTPTransport {
         queryFailures -= 1
         return response("query failed", request: request, status: 503)
       }
-      return response(
-        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/10"}"#,
-        request: request)
+      // Failures scripted for re-queries only start once the snapshot page has been served.
+      if servedQueries > 0, requeryFailures > 0 {
+        requeryFailures -= 1
+        return response(
+          "requery failed", request: request, status: 503,
+          headers: requeryRetryAfter.map { ["Retry-After": $0] } ?? [:])
+      }
+      servedQueries += 1
+      // The last body repeats so a window re-query after the scripted pages stays answerable.
+      let body = queryBodies.count > 1 ? queryBodies.removeFirst() : queryBodies[0]
+      return response(body, request: request)
     case ("GET", "/streams/shape-1"):
       streamReads += 1
       if !streamBodies.isEmpty {
@@ -259,7 +277,6 @@ struct CircuitsSubsetSourceTests {
     #expect(createBodies.allSatisfy { $0.changesOnly == true })
   }
 
-
   @Test func goneOnTheInitialSubsetFeedRecreatesBeforeSnapshotSetup() async throws {
     let transport = GoneSubsetFeedTransport(goneCreates: 2)
     let clock = SubsetRecreateClock()
@@ -303,7 +320,6 @@ struct CircuitsSubsetSourceTests {
     try await session.stop()
   }
 
-
   @Test func aZeroBoundSourceSurfacesTheFirstGoneFromItsInitialFeed() async throws {
     let transport = GoneSubsetFeedTransport(goneCreates: 1)
     let client = ElectricCircuitsClient(
@@ -336,7 +352,9 @@ struct CircuitsSubsetSourceTests {
     #expect(await transport.subsetFeedCreateCount == 1)
   }
 
-  @Test func limitedDemandFailsBeforeCreatingAnUnmaintainedLiveFeed() async throws {
+  /// Without a row key the source cannot diff the page against the held keys, so a limited
+  /// demand is refused before any server resource exists.
+  @Test func limitedDemandWithoutARowKeyFailsBeforeCreatingAnUnmaintainedLiveFeed() async throws {
     let transport = NativeSubsetTransport()
     let client = ElectricCircuitsClient(
       baseURL: URL(string: "https://engine.test")!, transport: transport)
@@ -371,6 +389,373 @@ struct CircuitsSubsetSourceTests {
       )
     }
     #expect(await transport.requests.isEmpty)
+  }
+
+  /// A limited demand is a window over the ordered page. The tail never applies its rows
+  /// positionally: an accepted change re-queries the page and the batch carries the page rows as
+  /// upserts plus the held keys that left the page as deletes, all at the page's LSN, so the store
+  /// drops a row that fell off the window and admits the one that entered it.
+  @Test func limitedDemandReseedsTheWindowFromThePageOnEveryAcceptedTailChange() async throws {
+    let transport = NativeSubsetTransport(
+      streamBodies: [
+        #"[{"type":"public.issues","key":"2","value":{"id":2,"title":"Newer"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#
+      ],
+      queryBodies: [
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/10"}"#,
+        #"{"rows":[{"id":2,"title":"Newer"}],"lsn":"0/21"}"#,
+      ]
+    )
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let source = CircuitsSubsetSource<NativeIssue, Int64>(
+      client: client,
+      transport: transport,
+      table: "public.issues",
+      retryPolicy: ShapeSubscriptionRetryPolicy(maxRetries: 0),
+      decodeRow: NativeIssue.init(row:),
+      decodeKey: { key in
+        guard let id = Int64(key) else { throw CircuitsSubsetSourceError.invalidLiveKey(key) }
+        return id
+      },
+      keyForRow: \.id
+    )
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: CollectionID(rawValue: "issues"), key: \.id)
+    let scope = CollectionScope(
+      principal: "user-1", authorization: "workspace-1", generation: "generation-1")
+    let demand = CollectionDemand<NativeIssue>(
+      unsafePredicateIdentity: "recent",
+      order: [
+        CollectionOrder(
+          unsafeFieldID: "modified", sourceName: "modified_at", direction: .descending)
+      ],
+      limit: 1
+    )
+    let identity = demand.identity(for: definition, scope: scope)
+
+    let session = try await source.materialize(
+      demand, identity: identity, materializationID: CollectionMaterializationID(rawValue: "recent")
+    )
+    #expect(session.snapshot.rows == [NativeIssue(id: 1, title: "Snapshot")])
+
+    let applied = AppliedNativeBatches()
+    let run = Task {
+      try await session.run { batch in await applied.append(batch) }
+    }
+    for _ in 0..<10_000 {
+      if await applied.values().count == 1 { break }
+      await Task.yield()
+    }
+    let batch = try #require(await applied.values().first)
+    #expect(batch.cursor == StreamCursor(offset: "11", lsn: "0/21"))
+    #expect(batch.sourceVersion == .init(rawValue: "0/21", order: 33))
+    #expect(batch.changes.count == 2)
+    guard case .upsert(let entered, let enteredVersion) = try #require(batch.changes.first),
+      case .delete(let left, let leftVersion) = try #require(batch.changes.last)
+    else {
+      Issue.record("expected the page upsert followed by the departed key's delete")
+      try await session.stop()
+      return
+    }
+    #expect(entered == NativeIssue(id: 2, title: "Newer"))
+    #expect(enteredVersion == .init(rawValue: "0/21", order: 33))
+    #expect(left == 1)
+    #expect(leftVersion == .init(rawValue: "0/21", order: 33))
+
+    try await session.stop()
+    try await run.value
+
+    let pageQueries = await transport.requests.filter {
+      $0.httpMethod == "POST" && $0.url?.path == "/v1/subsets/query"
+    }
+    #expect(pageQueries.count == 2)
+    let pageBodies = try pageQueries.map { request in
+      try JSONDecoder().decode(SubsetQuery.self, from: #require(request.httpBody))
+    }
+    #expect(pageBodies.allSatisfy { $0.limit == 1 && $0.orderBy?.column == "modified_at" })
+    #expect(
+      pageBodies.allSatisfy {
+        $0.where == .and([.isNull(column: "modified_at", isNull: false)])
+      })
+    let feedBodies = try await transport.requests
+      .filter { $0.httpMethod == "POST" && $0.url?.path == "/v1/subset-feeds" }
+      .map { try JSONDecoder().decode(ShapeRequest.self, from: #require($0.httpBody)) }
+    #expect(feedBodies.allSatisfy { $0.where == nil })
+  }
+
+  /// A limited source over `public.issues` with a recording clock and a short retry budget, so
+  /// window retries are observable without sleeping.
+  private func makeLimitedSource(
+    _ transport: NativeSubsetTransport, clock: SubsetRecreateClock, maxRetries: Int = 3
+  ) -> CircuitsSubsetSource<NativeIssue, Int64> {
+    CircuitsSubsetSource<NativeIssue, Int64>(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      table: "public.issues",
+      retryPolicy: ShapeSubscriptionRetryPolicy(
+        maxRetries: maxRetries, baseDelay: .milliseconds(1)),
+      clock: clock,
+      decodeRow: NativeIssue.init(row:),
+      decodeKey: { key in
+        guard let id = Int64(key) else { throw CircuitsSubsetSourceError.invalidLiveKey(key) }
+        return id
+      },
+      keyForRow: \.id
+    )
+  }
+
+  private func limitedDemand(limit: Int = 1) -> CollectionDemand<NativeIssue> {
+    CollectionDemand<NativeIssue>(
+      unsafePredicateIdentity: "recent",
+      order: [
+        CollectionOrder(
+          unsafeFieldID: "modified", sourceName: "modified_at", direction: .descending)
+      ],
+      limit: limit
+    )
+  }
+
+  private func materializeLimited(
+    _ source: CircuitsSubsetSource<NativeIssue, Int64>
+  ) async throws -> CollectionSourceSession<NativeIssue, Int64> {
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: CollectionID(rawValue: "issues"), key: \.id)
+    let scope = CollectionScope(
+      principal: "user-1", authorization: "workspace-1", generation: "generation-1")
+    let demand = limitedDemand()
+    return try await source.materialize(
+      demand, identity: demand.identity(for: definition, scope: scope),
+      materializationID: CollectionMaterializationID(rawValue: "recent"))
+  }
+
+  private func collectBatches(
+    _ session: CollectionSourceSession<NativeIssue, Int64>, count: Int
+  ) async throws -> [CollectionChangeBatch<NativeIssue, Int64>] {
+    let applied = AppliedNativeBatches()
+    let run = Task { try await session.run { batch in await applied.append(batch) } }
+    for _ in 0..<20_000 {
+      if await applied.values().count >= count { break }
+      await Task.yield()
+    }
+    try await session.stop()
+    try await run.value
+    return await applied.values()
+  }
+
+  /// Acknowledging a batch whose tail reached `0/20` with a page snapshotted at `0/15` would drop
+  /// the change the feed will never resend. The window retries until the page is at least as
+  /// fresh as the accepted tail, and the batch carries that page's LSN.
+  @Test func limitedWindowRetriesUntilThePageIsAtLeastAsFreshAsTheTail() async throws {
+    let clock = SubsetRecreateClock()
+    let transport = NativeSubsetTransport(
+      streamBodies: [
+        #"[{"type":"public.issues","key":"2","value":{"id":2,"title":"Newer"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#
+      ],
+      queryBodies: [
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/10"}"#,
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/15"}"#,
+        #"{"rows":[{"id":2,"title":"Newer"}],"lsn":"0/21"}"#,
+      ]
+    )
+    let session = try await materializeLimited(makeLimitedSource(transport, clock: clock))
+
+    let batch = try #require(try await collectBatches(session, count: 1).first)
+
+    #expect(batch.cursor == StreamCursor(offset: "11", lsn: "0/21"))
+    #expect(batch.changes.count == 2)
+    guard case .upsert(let entered, let version) = try #require(batch.changes.first) else {
+      Issue.record("expected the fresh page's upsert")
+      return
+    }
+    #expect(entered == NativeIssue(id: 2, title: "Newer"))
+    #expect(version == .init(rawValue: "0/21", order: 33))
+    let pageQueries = await transport.requests.filter { $0.url?.path == "/v1/subsets/query" }
+    #expect(pageQueries.count == 3)
+    #expect(await clock.delays.count == 1)
+  }
+
+  /// A page that never catches up must not be applied: the window gives up with `stalePage`
+  /// after its retry budget instead of acknowledging the tail.
+  @Test func limitedWindowGivesUpOnAPersistentlyStalePage() async throws {
+    let clock = SubsetRecreateClock()
+    let transport = NativeSubsetTransport(
+      streamBodies: [
+        #"[{"type":"public.issues","key":"2","value":{"id":2,"title":"Newer"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#
+      ],
+      queryBodies: [
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/10"}"#,
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/15"}"#,
+      ]
+    )
+    let session = try await materializeLimited(
+      makeLimitedSource(transport, clock: clock, maxRetries: 1))
+
+    let applied = AppliedNativeBatches()
+    await #expect(
+      throws: CircuitsSubsetSourceError.stalePage(
+        required: .init(rawValue: "0/20", order: 32), observed: .init(rawValue: "0/15", order: 21))
+    ) {
+      try await session.run { batch in await applied.append(batch) }
+    }
+    #expect(await applied.values().isEmpty)
+    // The snapshot page, the stale page, and exactly one retry before giving up.
+    let pageQueries = await transport.requests.filter { $0.url?.path == "/v1/subsets/query" }
+    #expect(pageQueries.count == 3)
+    #expect(await clock.delays.count == 1)
+    try? await session.stop()
+  }
+
+  /// Fetching is retried; decoding is not. A page the model cannot decode is terminal at once,
+  /// without re-fetching it on the retry budget.
+  @Test func limitedWindowDoesNotRetryAPageItCannotDecode() async throws {
+    let clock = SubsetRecreateClock()
+    let transport = NativeSubsetTransport(
+      streamBodies: [
+        #"[{"type":"public.issues","key":"2","value":{"id":2,"title":"Newer"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#
+      ],
+      queryBodies: [
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/10"}"#,
+        #"{"rows":[{"id":"not-an-int"}],"lsn":"0/21"}"#,
+      ]
+    )
+    let session = try await materializeLimited(makeLimitedSource(transport, clock: clock))
+
+    let applied = AppliedNativeBatches()
+    await #expect(throws: NativeIssue.DecodeFailure.self) {
+      try await session.run { batch in await applied.append(batch) }
+    }
+    let pageQueries = await transport.requests.filter { $0.url?.path == "/v1/subsets/query" }
+    #expect(pageQueries.count == 2)
+    #expect(await clock.delays.isEmpty)
+    try? await session.stop()
+  }
+
+  /// A throttled re-query honours the server's Retry-After before trying again.
+  @Test func limitedWindowHonoursRetryAfterOnAThrottledRequery() async throws {
+    let clock = SubsetRecreateClock()
+    let transport = NativeSubsetTransport(
+      streamBodies: [
+        #"[{"type":"public.issues","key":"2","value":{"id":2,"title":"Newer"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#
+      ],
+      queryBodies: [
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/10"}"#,
+        #"{"rows":[{"id":2,"title":"Newer"}],"lsn":"0/21"}"#,
+      ],
+      requeryFailures: 1,
+      requeryRetryAfter: "7"
+    )
+    let session = try await materializeLimited(makeLimitedSource(transport, clock: clock))
+
+    let batch = try #require(try await collectBatches(session, count: 1).first)
+
+    #expect(batch.cursor == StreamCursor(offset: "11", lsn: "0/21"))
+    let delays = await clock.delays
+    #expect(delays.count == 1)
+    #expect(delays.first.map { $0 >= .seconds(7) } == true)
+  }
+
+  /// A transient re-query failure is retried on the subscription's policy instead of ending the
+  /// live window; the batch is acknowledged only once a page arrives.
+  @Test func limitedWindowRetriesATransientRequeryFailure() async throws {
+    let clock = SubsetRecreateClock()
+    let transport = NativeSubsetTransport(
+      streamBodies: [
+        #"[{"type":"public.issues","key":"2","value":{"id":2,"title":"Newer"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#
+      ],
+      queryBodies: [
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/10"}"#,
+        #"{"rows":[{"id":2,"title":"Newer"}],"lsn":"0/21"}"#,
+      ],
+      requeryFailures: 1
+    )
+    let session = try await materializeLimited(makeLimitedSource(transport, clock: clock))
+
+    let batch = try #require(try await collectBatches(session, count: 1).first)
+
+    #expect(batch.cursor == StreamCursor(offset: "11", lsn: "0/21"))
+    #expect(batch.changes.count == 2)
+    #expect(await clock.delays.count == 1)
+  }
+
+  /// Consecutive batches chain on the committed cursor: the second batch expects the cursor the
+  /// first one advanced to, and the page LSN — not the tail LSN — is what it carries.
+  @Test func limitedWindowConsecutiveBatchesChainOnTheCommittedCursor() async throws {
+    let clock = SubsetRecreateClock()
+    let transport = NativeSubsetTransport(
+      streamBodies: [
+        #"[{"type":"public.issues","key":"2","value":{"id":2,"title":"Two"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#,
+        #"[{"type":"public.issues","key":"3","value":{"id":3,"title":"Three"},"headers":{"operation":"upsert","lsn":"0/30"}}]"#,
+      ],
+      queryBodies: [
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/10"}"#,
+        #"{"rows":[{"id":2,"title":"Two"}],"lsn":"0/21"}"#,
+        #"{"rows":[{"id":3,"title":"Three"}],"lsn":"0/31"}"#,
+      ]
+    )
+    let session = try await materializeLimited(makeLimitedSource(transport, clock: clock))
+
+    let batches = try await collectBatches(session, count: 2)
+
+    #expect(batches.count == 2)
+    #expect(batches[0].expectedCursor == StreamCursor(offset: "10", lsn: "0/10"))
+    #expect(batches[0].cursor == StreamCursor(offset: "11", lsn: "0/21"))
+    #expect(batches[1].expectedCursor == batches[0].cursor)
+    #expect(batches[1].cursor == StreamCursor(offset: "12", lsn: "0/31"))
+    guard case .upsert(let three, _) = try #require(batches[1].changes.first),
+      case .delete(let departed, _) = try #require(batches[1].changes.last)
+    else {
+      Issue.record("expected the second page's upsert and the departed key's delete")
+      return
+    }
+    #expect(three == NativeIssue(id: 3, title: "Three"))
+    #expect(departed == 2)
+  }
+
+  /// An empty page releases every held key.
+  @Test func limitedWindowEmptyPageReleasesEveryHeldKey() async throws {
+    let clock = SubsetRecreateClock()
+    let transport = NativeSubsetTransport(
+      streamBodies: [
+        #"[{"type":"public.issues","key":"1","headers":{"operation":"delete","lsn":"0/20"}}]"#
+      ],
+      queryBodies: [
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/10"}"#,
+        #"{"rows":[],"lsn":"0/21"}"#,
+      ]
+    )
+    let session = try await materializeLimited(makeLimitedSource(transport, clock: clock))
+
+    let batch = try #require(try await collectBatches(session, count: 1).first)
+
+    guard case .delete(let key, let version) = try #require(batch.changes.first) else {
+      Issue.record("expected the held key's delete")
+      return
+    }
+    #expect(batch.changes.count == 1)
+    #expect(key == 1)
+    #expect(version == .init(rawValue: "0/21", order: 33))
+  }
+
+  /// The feed covers rows the page excludes, so a window must not decode tail rows: a tail value
+  /// the model cannot decode is irrelevant to the page and must not end the window.
+  @Test func limitedWindowDoesNotDecodeTailRows() async throws {
+    let clock = SubsetRecreateClock()
+    let transport = NativeSubsetTransport(
+      streamBodies: [
+        #"[{"type":"public.issues","key":"2","value":{"id":"not-an-int","title":null},"headers":{"operation":"upsert","lsn":"0/20"}}]"#
+      ],
+      queryBodies: [
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/10"}"#,
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/21"}"#,
+      ]
+    )
+    let session = try await materializeLimited(makeLimitedSource(transport, clock: clock))
+
+    let batch = try #require(try await collectBatches(session, count: 1).first)
+
+    #expect(batch.cursor == StreamCursor(offset: "11", lsn: "0/21"))
+    #expect(batch.changes.count == 1)
   }
 
   @Test func overlapBeforeSnapshotAdvancesOffsetWithoutMutatingAndStallsSafely() async throws {
