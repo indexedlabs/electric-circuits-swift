@@ -5,6 +5,23 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 
 ## Unreleased
 
+## 0.3.0
+
+- `CollectionDemand.limit` is now honoured by `CircuitsSubsetSource` as a live window instead of
+  being rejected: the snapshot is the ordered page (`limit` with exactly one `order` column; the
+  page query adds `<order column> IS NOT NULL`), the changes-only feed still covers the whole
+  predicate, and each tail batch carrying an accepted change re-queries the page and applies the
+  difference (page rows as upserts, departed keys as deletes, both at the page LSN). Window rows
+  come only from the page; tail rows are not decoded for a limited demand.
+- The page must be causally fresh: a page whose LSN is behind the batch's accepted maximum is
+  retried on the subscription retry policy (honouring `Retry-After`), and exhausting the budget
+  fails the window with the new `CircuitsSubsetSourceError.stalePage(required:observed:)`, which
+  the session surfaces as the typed cause. Decoding failures are terminal and never re-fetch.
+  Window membership is committed only after the store has applied the batch.
+- Add `CircuitsSubsetSource.init(keyForRow:)`; a limited demand without a row key is still
+  rejected with `unsupportedLimitedLiveDemand` before any server resource exists. Additive and
+  source-compatible for unlimited demands.
+
 - `ShapeSubscriptionCoordinator` now answers `410 Gone` from the two native routes that mint a
   shape (`POST /v1/shapes`, `POST /v1/subset-feeds`) with a bounded client-side fall-through: a
   byte-identical re-POST under the same table, predicate, columns, and stable claim. A recreated

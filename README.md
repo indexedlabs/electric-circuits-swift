@@ -50,10 +50,19 @@ let lease = await coordinator.acquire(demand)
 try await lease.release()
 ```
 
-`CollectionDemand.limit` is part of the provider-neutral demand identity, but
-`CircuitsSubsetSource` rejects limited live demands until a source adapter can maintain the ordered
-window across inserts, updates, deletes, and boundary refill. Use the one-shot `querySubset` API for
-a limited snapshot; do not treat an unbounded changes feed as a live top-N materialization.
+`CollectionDemand.limit` turns a demand into a live window: the snapshot is the ordered page
+(`limit` with exactly one `order` column; the page query adds `<order column> IS NOT NULL`, so rows
+without a sort key are never window members even when fewer than `limit` rows qualify), the
+changes-only feed still covers the whole predicate, and each tail batch that carries an accepted
+change re-queries the page and applies the difference (page rows as upserts, departed keys as
+deletes, both at the page LSN). The page must be at least as fresh as the batch it answers; an
+older page is retried on the subscription's retry policy and, if the budget is exhausted, the
+window fails with `stalePage` rather than acknowledging changes it does not reflect. Construct
+`CircuitsSubsetSource` with `keyForRow:` to enable it (for example `keyForRow: \.id`); it must
+return the same stable identity the collection definition and store key rows by, and a limited
+demand without it is rejected before any server resource exists. Rows that leave the window are
+released from the materialization's claim, so hold a separate demand for anything that must stay
+local beyond the page.
 
 ```swift
 let client = ElectricCircuitsClient(baseURL: URL(string: "https://engine.example")!)
@@ -200,11 +209,11 @@ wire contract, public API, and provider-schema release rules are explicit in
 [Policies/SUPPORT.md](Policies/SUPPORT.md) and [Policies/SEMVER.md](Policies/SEMVER.md). The DocC
 catalog begins at `ElectricCircuitsSwift` in Xcode's documentation viewer.
 
-## Install 0.2.1
+## Install 0.3.0
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.2.1"),
+  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.3.0"),
 ]
 ```
 
