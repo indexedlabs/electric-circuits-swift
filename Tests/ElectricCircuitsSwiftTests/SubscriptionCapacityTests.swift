@@ -354,6 +354,31 @@ private actor HeldCreateAndDeleteTransport: HTTPTransport {
   }
 }
 
+/// Forces stop() to publish its task before finishStop() can capture the in-flight create.
+private actor StopEntryGate {
+  private var entered = false
+  private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+  private var continuation: CheckedContinuation<Void, Never>?
+
+  func wait() async {
+    entered = true
+    let waiters = entryWaiters
+    entryWaiters.removeAll()
+    for waiter in waiters { waiter.resume() }
+    await withCheckedContinuation { continuation = $0 }
+  }
+
+  func waitForEntry() async {
+    guard !entered else { return }
+    await withCheckedContinuation { entryWaiters.append($0) }
+  }
+
+  func open() {
+    continuation?.resume()
+    continuation = nil
+  }
+}
+
 private struct CancelledStartReturn: Sendable {
   let wasCancelled: Bool
   let capacity: ShapeSubscriptionCapacity.Snapshot
@@ -525,6 +550,35 @@ struct SubscriptionCapacityTests {
     _ = try await reusable.start()
     try await reusable.stop()
     #expect(await capacity.snapshot() == .init(limit: 1, active: 0, admitted: 3, rejected: 0))
+  }
+
+  @Test func stopRetainsACreateThatLandsBeforeCleanupCapturesIt() async throws {
+    let transport = HeldCreateAndDeleteTransport()
+    let capacity = ShapeSubscriptionCapacity(maximumActiveSubscriptions: 1)
+    let coordinator = capacityCoordinator(
+      transport: transport, materializer: InMemoryShapeMaterializer(), capacity: capacity,
+      subscription: "stop-before-create-capture")
+    let stopGate = StopEntryGate()
+    await coordinator.setBeforeStopForTesting { await stopGate.wait() }
+
+    let start = Task { try await coordinator.start() }
+    await transport.waitForCreate()
+    let stop = Task { try await coordinator.stop() }
+    await stopGate.waitForEntry()
+
+    // startImpl resumes after stopTask exists, but before finishStop has captured startTask.
+    // It must reject the public start without discarding the landed claim's release authority.
+    await transport.openCreate()
+    await #expect(throws: CancellationError.self) { _ = try await start.value }
+    #expect(await transport.deleteRequests == 0)
+    #expect(await capacity.snapshot().active == 1)
+
+    // Open DELETE first so a lost claim fails an assertion instead of hanging this regression.
+    await transport.openDelete()
+    await stopGate.open()
+    try await stop.value
+    #expect(await transport.deleteRequests == 1)
+    #expect(await capacity.snapshot().active == 0)
   }
 
   @Test func cancelledStartWaitsForLandedClaimReleaseAndPermitReturnBeforeItReturns() async throws {

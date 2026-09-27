@@ -5,6 +5,9 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 
 ## Unreleased
 
+- Retain an in-flight shape create until shutdown captures its result when `stop()` races with
+  creation. This prevents a landed claim from losing its release request and hanging cancellation.
+
 - Fix OTTO-5133: subset pages decode optional `snapshot` and `horizon` fields and position feed
   changes by PostgreSQL transaction visibility, preserving commits the page did not see even when
   their LSN is below the page LSN. Retain LSN positioning for older engines.

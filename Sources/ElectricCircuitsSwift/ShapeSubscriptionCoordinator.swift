@@ -300,6 +300,7 @@ public actor ShapeSubscriptionCoordinator {
   private var cancellationAcknowledgements: [UInt64: [CheckedContinuation<Void, Never>]] = [:]
   private var startCancellationCleanupTask: Task<Void, Error>?
   #if DEBUG
+    private var beforeStopForTesting: (@Sendable () async -> Void)?
     private var initialStartWaiterCountWaiters:
       [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var heldStartReturnWaiters: Set<UInt64> = []
@@ -397,16 +398,19 @@ public actor ShapeSubscriptionCoordinator {
     startTask = task
     do {
       let created = try await task.value
-      startTask = nil
+      // stopTask can exist before finishStop captures the in-flight create. Leave its result
+      // owned by startTask until shutdown consumes it; otherwise a landed claim loses its DELETE.
       guard isAcceptingOperations else { throw CancellationError() }
+      startTask = nil
       handle = created
       currentClaimAcknowledged = false
       generation &+= 1
       launchStream(for: created, generation: generation)
       return created
     } catch {
+      guard isAcceptingOperations else { throw error }
       startTask = nil
-      if !isAcceptingOperations || error is CancellationError { throw error }
+      if error is CancellationError { throw error }
       let failure = failure(for: error)
       transition(.failed(failure))
       throw failure
@@ -483,6 +487,10 @@ public actor ShapeSubscriptionCoordinator {
   }
 
   #if DEBUG
+    func setBeforeStopForTesting(_ operation: @escaping @Sendable () async -> Void) {
+      beforeStopForTesting = operation
+    }
+
     func holdStartReturnForTesting(_ waiterID: UInt64) {
       heldStartReturnWaiters.insert(waiterID)
     }
@@ -587,6 +595,9 @@ public actor ShapeSubscriptionCoordinator {
   }
 
   private func finishStop() async throws {
+    #if DEBUG
+      if let beforeStopForTesting { await beforeStopForTesting() }
+    #endif
     if !stopping {
       stopping = true
       generation &+= 1
