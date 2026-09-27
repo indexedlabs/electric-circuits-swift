@@ -5,6 +5,15 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 
 ## Unreleased
 
+- Fix OTTO-5133: subset pages decode optional `snapshot` and `horizon` fields and position feed
+  changes by PostgreSQL transaction visibility, preserving commits the page did not see even when
+  their LSN is below the page LSN. Retain LSN positioning for older engines.
+- Add snapshot and transaction metadata to `CollectionSourceVersion`, plus `supersedes(_:)` for
+  canonical row and tombstone comparisons across materializations. Custom providers must persist
+  these optional fields and use that comparison; older persisted versions still decode.
+- Limited windows retry until the page includes every accepted transaction. Serialize page fetch
+  and store application, keeping cursor LSNs monotonic.
+
 ## 0.3.0
 
 - `CollectionDemand.limit` is now honoured by `CircuitsSubsetSource` as a live window instead of

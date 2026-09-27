@@ -201,6 +201,78 @@ private actor AppliedNativeBatches {
 
 @Suite("Native Circuits subset source")
 struct CircuitsSubsetSourceTests {
+  @Test func snapshotVisibilityPositionsTailAndStore() async throws {
+    let transport = NativeSubsetTransport(
+      streamBodies: [
+        #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"Committed during snapshot"},"headers":{"operation":"update","lsn":"0/FF","txid":"4294967401"}}]"#,
+        #"[{"type":"public.issues","key":"2","value":{"id":2,"title":"Already seen"},"headers":{"operation":"upsert","lsn":"0/120","txid":"104"}}]"#,
+        #"[{"type":"public.issues","key":"3","value":{"id":3,"title":"At horizon"},"headers":{"operation":"upsert","lsn":"0/180","txid":"99"}}]"#,
+        #"[{"type":"public.issues","key":"4","value":{"id":4,"title":"Past horizon"},"headers":{"operation":"upsert","lsn":"0/190","txid":"99"}}]"#,
+      ],
+      queryBodies: [
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/100","snapshot":"100:110:105","horizon":"0/180"}"#
+      ])
+    let source = makeLimitedSource(transport, clock: SubsetRecreateClock())
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: .init(rawValue: "issues"), key: \.id)
+    let demand = CollectionDemand<NativeIssue>(unsafePredicateIdentity: "all")
+    let identity = demand.identity(
+      for: definition, scope: .init(principal: "u", authorization: "a", generation: "g"))
+    let id = CollectionMaterializationID(rawValue: "visibility")
+    let session = try await source.materialize(demand, identity: identity, materializationID: id)
+    let store = InMemoryCollectionStore<NativeIssue, Int64>(key: \.id)
+    try await store.replaceSnapshot(session.snapshot, materializationID: id, demand: identity)
+    let batches = try await collectBatches(session, count: 4)
+    #expect(batches.count == 4)
+    #expect(batches.map { $0.changes.count } == [1, 0, 1, 1])
+    for batch in batches { try await store.apply(batch, to: id) }
+    let rows = await store.rows()
+    #expect(rows[1]?.title == "Committed during snapshot")
+    #expect(rows[2] == nil)
+    #expect(rows[3]?.title == "At horizon")
+    #expect(rows[4]?.title == "Past horizon")
+  }
+
+  @Test func limitedWindowRetriesSnapshotThatStillExcludesAnyAcceptedTransaction() async throws {
+    let clock = SubsetRecreateClock()
+    let transport = NativeSubsetTransport(
+      streamBodies: [
+        #"[{"type":"public.issues","key":"1","headers":{"operation":"delete","lsn":"0/FE","txid":"105"}},{"type":"public.issues","key":"2","headers":{"operation":"delete","lsn":"0/FF","txid":"106"}}]"#
+      ],
+      queryBodies: [
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/100","snapshot":"100:110:105,106","horizon":"0/180"}"#,
+        #"{"rows":[{"id":1,"title":"Still invisible"}],"lsn":"0/200","snapshot":"100:110:105","horizon":"0/210"}"#,
+        #"{"rows":[],"lsn":"0/200","snapshot":"107:110:","horizon":"0/210"}"#,
+      ])
+    let session = try await materializeLimited(makeLimitedSource(transport, clock: clock))
+    let batch = try #require(try await collectBatches(session, count: 1).first)
+    #expect(await clock.delays.count == 1)
+    guard case .delete(let key, let version) = try #require(batch.changes.first) else {
+      Issue.record("expected snapshot-visible deletion")
+      return
+    }
+    #expect(key == 1)
+    #expect(version.snapshot?.xmin == 107)
+  }
+
+  @Test func limitedWindowAcceptsVisibleTransactionAbovePageLSN() async throws {
+    let clock = SubsetRecreateClock()
+    let transport = NativeSubsetTransport(
+      streamBodies: [
+        #"[{"type":"public.issues","key":"1","headers":{"operation":"delete","lsn":"0/120","txid":"105"}}]"#
+      ],
+      queryBodies: [
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/100","snapshot":"100:110:105","horizon":"0/180"}"#,
+        #"{"rows":[],"lsn":"0/110","snapshot":"106:110:","horizon":"0/180"}"#,
+      ])
+    let session = try await materializeLimited(makeLimitedSource(transport, clock: clock))
+    let batch = try #require(try await collectBatches(session, count: 1).first)
+    #expect(await clock.delays.isEmpty)
+    #expect(batch.changes.count == 1)
+    #expect(batch.sourceVersion.order == 0x120)
+    #expect(batch.cursor.lsn == "0/120")
+  }
+
   @Test func snapshotFenceThenAwaitedLiveTailUsesStableSubsetFeedClaim() async throws {
     let transport = NativeSubsetTransport()
     let client = ElectricCircuitsClient(
