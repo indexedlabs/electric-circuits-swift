@@ -31,11 +31,19 @@ implement the same contract with GRDB or another store.
 Each `CollectionChange` carries its own `CollectionSourceVersion`; a `CollectionChangeBatch`
 `sourceVersion` is only the batch high-water mark and cursor record. Custom collection stores must
 persist versioned upserts and tombstones per change so a lower-LSN sibling in a coalesced batch
-cannot overwrite or resurrect a newer canonical row.
+cannot overwrite or resurrect a newer canonical row. Persist the optional `snapshot` and
+`transactionID` metadata in `CollectionSourceVersion` and use `incoming.supersedes(existing)` for
+row comparisons; `order` and `Comparable` remain LSN high-water marks. A page snapshot may exclude
+a transaction that committed below its LSN. Overlapping materializations compare page visibility,
+so a late page cannot regress a feed change or a newer snapshot.
 
 `CircuitsSubsetSource` performs the native on-demand handoff in causal order: establish a named
 changes-only feed, read its durable frontier, query the subset snapshot, commit it, then consume live
-batches with awaited store application. It renews the same subset-feed claim through
+batches with awaited store application. When the engine returns `snapshot` and `horizon`, overlap
+is skipped only for transactions visible to that snapshot below its WAL insert horizon, using
+32-bit xid wraparound ordering. The gate retires when the tail reaches the horizon. Engines without
+these fields retain LSN positioning; an unparseable or missing feed txid also uses the LSN fallback
+below the horizon. It renews the same subset-feed claim through
 `ShapeSubscriptionCoordinator`, and the producer cannot advance its local cursor until the consumer's
 atomic store callback returns.
 
@@ -55,9 +63,12 @@ try await lease.release()
 without a sort key are never window members even when fewer than `limit` rows qualify), the
 changes-only feed still covers the whole predicate, and each tail batch that carries an accepted
 change re-queries the page and applies the difference (page rows as upserts, departed keys as
-deletes, both at the page LSN). The page must be at least as fresh as the batch it answers; an
-older page is retried on the subscription's retry policy and, if the budget is exhausted, the
-window fails with `stalePage` rather than acknowledging changes it does not reflect. Construct
+deletes, both versioned by the page snapshot when available). The page must reflect every accepted
+transaction in the batch it answers, falling back to the batch LSN on older engines. An older page
+is retried on the subscription's retry policy and, if the budget is exhausted, the
+window fails with `stalePage` rather than acknowledging changes it does not reflect. Page fetches
+and store applications are serialized per materialization, and cursor LSN high-water marks never
+regress even when a lower-LSN page already includes the batch's transactions. Construct
 `CircuitsSubsetSource` with `keyForRow:` to enable it (for example `keyForRow: \.id`); it must
 return the same stable identity the collection definition and store key rows by, and a limited
 demand without it is rejected before any server resource exists. Rows that leave the window are

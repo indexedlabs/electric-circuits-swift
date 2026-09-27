@@ -114,7 +114,7 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     }
     for row in snapshot.rows {
       let rowKey = CanonicalKey(domain: domain, key: key(row))
-      if let existing = nextRows[rowKey], existing.version.order > snapshot.sourceVersion.order {
+      if let existing = nextRows[rowKey], !snapshot.sourceVersion.supersedes(existing.version) {
         continue
       }
       nextRows[rowKey] = (row, snapshot.sourceVersion)
@@ -167,7 +167,7 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
       case .upsert(let row, let sourceVersion):
         let rowKey = key(row)
         let canonicalKey = CanonicalKey(domain: domain, key: rowKey)
-        if nextRows[canonicalKey].map({ $0.version.order <= sourceVersion.order }) ?? true {
+        if nextRows[canonicalKey].map({ sourceVersion.supersedes($0.version) }) ?? true {
           nextRows[canonicalKey] = (row, sourceVersion)
         }
         materializationClaims.insert(rowKey)
@@ -180,7 +180,7 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
       guard case .delete(let rowKey, let sourceVersion) = change else { continue }
       if !isClaimed(rowKey, in: nextClaims, domain: domain, bindings: demandByMaterialization) {
         let canonicalKey = CanonicalKey(domain: domain, key: rowKey)
-        if nextRows[canonicalKey].map({ $0.version.order <= sourceVersion.order }) ?? true {
+        if nextRows[canonicalKey].map({ sourceVersion.supersedes($0.version) }) ?? true {
           nextRows[canonicalKey] = (nil, sourceVersion)
         }
       }
@@ -264,7 +264,8 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     rows = rows.filter { canonicalKey, value in
       guard value.row == nil else { return true }
       return records.contains { demand, record in
-        domain(for: demand) == canonicalKey.domain && record.sourceVersion < value.version
+        domain(for: demand) == canonicalKey.domain
+          && !record.sourceVersion.supersedes(value.version)
       }
     }
   }

@@ -250,18 +250,26 @@ public struct SnapshotFence: RawRepresentable, Codable, Equatable, Hashable, Sen
   }
 }
 
-/// A source-provided, totally ordered row-state version. Stores persist both values and compare
-/// `order`; they never infer an order from a transport cursor. Sources must reject values they
-/// cannot translate to this contract before mutating a collection.
+/// A source LSN with optional PostgreSQL row-positioning metadata. `Comparable` and equality
+/// describe the LSN high-water mark only. Providers must persist all fields and use `supersedes`
+/// for canonical rows: a page's LSN does not prove it saw a concurrent commit.
 public struct CollectionSourceVersion: Codable, Equatable, Hashable, Comparable, Sendable {
-  private enum CodingKeys: String, CodingKey { case rawValue, order }
+  private enum CodingKeys: String, CodingKey { case rawValue, order, snapshot, transactionID }
   public let rawValue: String
   public let order: UInt64
 
-  public init(rawValue: String, order: UInt64) {
+  public let snapshot: CollectionPageSnapshot?
+  public let transactionID: UInt32?
+
+  public init(
+    rawValue: String, order: UInt64, snapshot: CollectionPageSnapshot? = nil,
+    transactionID: UInt32? = nil
+  ) {
     precondition(!rawValue.isEmpty)
     self.rawValue = rawValue
     self.order = order
+    self.snapshot = snapshot
+    self.transactionID = transactionID
   }
 
   public init(from decoder: Decoder) throws {
@@ -273,6 +281,20 @@ public struct CollectionSourceVersion: Codable, Equatable, Hashable, Comparable,
     }
     self.rawValue = rawValue
     self.order = order
+    snapshot = try container.decodeIfPresent(CollectionPageSnapshot.self, forKey: .snapshot)
+    transactionID = try container.decodeIfPresent(UInt32.self, forKey: .transactionID)
+  }
+
+  /// Whether this incoming row state may replace an existing canonical row or tombstone.
+  public func supersedes(_ existing: Self) -> Bool {
+    if let snapshot {
+      if let previous = existing.snapshot { return snapshot.includes(previous) }
+      return snapshot.includes(lsn: existing.order, transactionID: existing.transactionID)
+    }
+    if let previous = existing.snapshot {
+      return !previous.includes(lsn: order, transactionID: transactionID)
+    }
+    return order >= existing.order
   }
 
   public static func == (lhs: Self, rhs: Self) -> Bool {

@@ -291,9 +291,14 @@ public struct SubsetQuery: Codable, Equatable, Sendable {
 public struct SubsetResponse: Codable, Equatable, Sendable {
   public var rows: [JSONValue]
   public var lsn: String
-  public init(rows: [JSONValue], lsn: String) {
+  public var snapshot: String?
+  public var horizon: String?
+
+  public init(rows: [JSONValue], lsn: String, snapshot: String? = nil, horizon: String? = nil) {
     self.rows = rows
     self.lsn = lsn
+    self.snapshot = snapshot
+    self.horizon = horizon
   }
 }
 

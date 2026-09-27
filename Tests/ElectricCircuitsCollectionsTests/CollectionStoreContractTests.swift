@@ -38,6 +38,83 @@ private func assertDataCorrupted<T: Decodable>(_ type: T.Type, _ json: String) {
 
 @Suite("Collection store contract")
 struct CollectionStoreContractTests {
+  @Test func overlappingPagesCannotRegressAnInvisibleCommitOrANewerSnapshot() async throws {
+    let store = InMemoryCollectionStore<TestIssue, Int>(key: \.id)
+    let a = CollectionMaterializationID(rawValue: "a")
+    let b = CollectionMaterializationID(rawValue: "b")
+    let oldSnapshot = try #require(
+      CollectionPageSnapshot(
+        lsn: 0x100, snapshot: "100:110:105", horizon: "0/180"))
+    let oldPage = CollectionSourceVersion(
+      rawValue: "0/100", order: 0x100,
+      snapshot: oldSnapshot)
+    let live = CollectionSourceVersion(rawValue: "0/FF", order: 0xFF, transactionID: 105)
+    try await store.replaceSnapshot(
+      .init(
+        rows: [TestIssue(id: 1, title: "Page")], fence: .init(rawValue: "a"),
+        sourceVersion: oldPage,
+        cursor: .init(offset: "a0")), materializationID: a, demand: demand("a"))
+    try await store.apply(
+      .init(
+        changes: [.upsert(TestIssue(id: 1, title: "Commit"), sourceVersion: live)],
+        expectedCursor: .init(offset: "a0"), cursor: .init(offset: "a1"), sourceVersion: live),
+      to: a)
+    #expect(await store.rows()[1]?.title == "Commit")
+    try await store.replaceSnapshot(
+      .init(
+        rows: [TestIssue(id: 1, title: "Stale overlapping page")], fence: .init(rawValue: "b"),
+        sourceVersion: oldPage, cursor: .init(offset: "b0")), materializationID: b,
+      demand: demand("b"))
+    #expect(await store.rows()[1]?.title == "Commit")
+    let freshSnapshot = try #require(
+      CollectionPageSnapshot(
+        lsn: 0x100, snapshot: "106:110:", horizon: "0/180"))
+    let freshPage = CollectionSourceVersion(
+      rawValue: "0/100", order: 0x100,
+      snapshot: freshSnapshot)
+    try await store.replaceSnapshot(
+      .init(
+        rows: [TestIssue(id: 1, title: "Fresh overlapping page")], fence: .init(rawValue: "b1"),
+        sourceVersion: freshPage, cursor: .init(offset: "b1")), materializationID: b,
+      demand: demand("b"))
+    try await store.replaceSnapshot(
+      .init(
+        rows: [TestIssue(id: 1, title: "Late old page")], fence: .init(rawValue: "a2"),
+        sourceVersion: oldPage, cursor: .init(offset: "a2")), materializationID: a,
+      demand: demand("a"))
+    #expect(await store.rows()[1]?.title == "Fresh overlapping page")
+  }
+
+  @Test func invisibleDeleteKeepsTombstoneUntilOtherSnapshotCatchesUp() async throws {
+    let store = InMemoryCollectionStore<TestIssue, Int>(key: \.id)
+    let a = CollectionMaterializationID(rawValue: "a")
+    let b = CollectionMaterializationID(rawValue: "b")
+    let snapshot = try #require(
+      CollectionPageSnapshot(
+        lsn: 0x100, snapshot: "100:110:105", horizon: "0/180"))
+    let page = CollectionSourceVersion(
+      rawValue: "0/100", order: 0x100,
+      snapshot: snapshot)
+    for (id, name) in [(a, "a"), (b, "b")] {
+      try await store.replaceSnapshot(
+        .init(
+          rows: [], fence: .init(rawValue: name), sourceVersion: page, cursor: .init(offset: "0")),
+        materializationID: id, demand: demand(name))
+    }
+    let live = CollectionSourceVersion(rawValue: "0/FF", order: 0xFF, transactionID: 105)
+    try await store.apply(
+      .init(
+        changes: [.delete(1, sourceVersion: live)], expectedCursor: .init(offset: "0"),
+        cursor: .init(offset: "1"), sourceVersion: live), to: a)
+    #expect(await store.tombstoneCount(for: demand("a")) == 1)
+    try await store.replaceSnapshot(
+      .init(
+        rows: [TestIssue(id: 1, title: "Pre-delete page")], fence: .init(rawValue: "b1"),
+        sourceVersion: page, cursor: .init(offset: "b1")), materializationID: b, demand: demand("b")
+    )
+    #expect(await store.rows()[1] == nil)
+  }
+
   @Test func persistedIdentityAndVersionValuesRejectEmptyComponentsAndRoundTrip() throws {
     assertDataCorrupted(CollectionID.self, #"""#)
     assertDataCorrupted(

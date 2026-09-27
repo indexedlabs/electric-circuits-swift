@@ -133,7 +133,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
           }
           return try decodeRow(row)
         }
-        guard let version = Self.postgresLSN(response.lsn) else {
+        guard let version = Self.pageVersion(response) else {
           throw CircuitsSubsetSourceError.invalidSnapshotSourceVersion(response.lsn)
         }
         return (rows, version)
@@ -239,6 +239,14 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       .joined(separator: "|")
   }
 
+  fileprivate static func pageVersion(_ response: SubsetResponse) -> CollectionSourceVersion? {
+    guard let lsn = postgresLSN(response.lsn) else { return nil }
+    return CollectionSourceVersion(
+      rawValue: lsn.rawValue, order: lsn.order,
+      snapshot: CollectionPageSnapshot(
+        lsn: lsn.order, snapshot: response.snapshot, horizon: response.horizon))
+  }
+
   /// PostgreSQL LSNs are two unsigned hexadecimal 32-bit words. A `UInt64` sort key is portable
   /// to Indexed/GRDB stores and avoids trusting lexicographic wire strings.
   fileprivate static func postgresLSN(_ value: String) -> CollectionSourceVersion? {
@@ -334,14 +342,12 @@ private actor CircuitsSubsetSessionLifecycle {
 /// row out, and a delete leaves a slot the feed cannot refill. So the window never applies tail
 /// rows directly — it does not even decode them. Each tail batch that carries an accepted change
 /// re-queries the page and emits the difference: the new page rows as upserts and the held keys
-/// that left the page as deletes, both at the page's LSN. Envelopes below the snapshot LSN still
-/// only advance the offset, as for an unbounded demand.
+/// that left the page as deletes, versioned by the page snapshot (or its LSN on an old engine).
+/// Only changes already visible to the snapshot are skipped.
 ///
-/// The page must be causally fresh: acknowledging a batch whose tail reached LSN `n` with a page
-/// snapshotted before `n` would drop a change the feed will never resend (a delete at `n` against
-/// a page that still lists the row). A page older than the batch's accepted maximum is therefore
-/// retried, never applied. Membership is committed only after the store has applied the diff, so
-/// a failed application leaves the held keys describing what the store actually holds.
+/// The page must reflect every accepted transaction, including commits below its LSN that were
+/// still invisible during the query. Older pages are retried, never applied. Membership is committed
+/// only after the store has applied the diff, so a failed application leaves the held keys unchanged.
 private struct LimitedWindow<Model: Sendable, Key: Hashable & Sendable>: Sendable {
   var keys: Set<Key>
   let keyForRow: @Sendable (Model) throws -> Key
@@ -355,7 +361,13 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
   ShapeMaterializer
 {
   private var cursor: StreamCursor?
-  private let snapshotSourceVersion: CollectionSourceVersion
+  private var snapshotSourceVersion: CollectionSourceVersion
+  private var passedSnapshotHorizon = false
+  private var rowVersions: [String: CollectionSourceVersion] = [:]
+  // Actors are reentrant across page fetch and store application. Hold this FIFO permit across
+  // both awaits so a second application cannot fetch/commit against the same window or cursor.
+  private var applying = false
+  private var applicationWaiters: [CheckedContinuation<Void, Never>] = []
   private var sourceVersion: CollectionSourceVersion
   private let decodeRow: @Sendable (ChangeRow) throws -> Model
   private let decodeKey: @Sendable (String) throws -> Key
@@ -394,12 +406,14 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
     applyBatch = apply
   }
 
-  /// A page snapshotted no earlier than `notBefore`. Transient page failures and pages that are
-  /// still behind the tail are retried on the subscription's policy; cancellation, decoding and
+  /// A page that reflects every accepted change, or the LSN floor on an older engine. Transient
+  /// failures and pages still behind the tail are retried on the subscription's policy; cancellation,
+  /// decoding and
   /// non-retryable client errors surface at once, and exhausting the budget on a stale page
   /// throws `stalePage` rather than acknowledging changes the page does not reflect.
   private func freshPage(
-    _ window: LimitedWindow<Model, Key>, notBefore: CollectionSourceVersion
+    _ window: LimitedWindow<Model, Key>, notBefore: CollectionSourceVersion,
+    reflecting changes: [CollectionSourceVersion]
   ) async throws -> ([Model], CollectionSourceVersion) {
     var retries = 0
     while true {
@@ -416,12 +430,16 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
           for: retryPolicy.delay(forRetry: retries, retryAfter: Self.retryAfter(for: error)))
         continue
       }
-      guard let version = CircuitsSubsetSource<Model, Key>.postgresLSN(response.lsn) else {
+      guard let version = CircuitsSubsetSource<Model, Key>.pageVersion(response) else {
         throw CircuitsSubsetSourceError.invalidSnapshotSourceVersion(response.lsn)
       }
       // Decoding sits outside the retry path: a page the model rejects is terminal, and
       // fetching it again could not change that.
-      if version >= notBefore { return try window.decodePage(response) }
+      let fresh =
+        version.snapshot.map { snapshot in
+          changes.allSatisfy { snapshot.includes(lsn: $0.order, transactionID: $0.transactionID) }
+        } ?? (version >= notBefore)
+      if fresh { return try window.decodePage(response) }
       let stale = version
       guard retries < retryPolicy.maxRetries else {
         throw CircuitsSubsetSourceError.stalePage(required: notBefore, observed: stale)
@@ -453,6 +471,19 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
     expecting expectedCursor: StreamCursor?,
     advancingTo nextCursor: StreamCursor
   ) async throws {
+    if applying {
+      await withCheckedContinuation { applicationWaiters.append($0) }
+    } else {
+      applying = true
+    }
+    defer {
+      if applicationWaiters.isEmpty {
+        applying = false
+      } else {
+        applicationWaiters.removeFirst().resume()
+      }
+    }
+    try Task.checkCancellation()
     if cursor == nextCursor { return }
     guard cursor == expectedCursor else {
       throw StreamError.cursorConflict(
@@ -462,25 +493,42 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
       )
     }
     var changes: [CollectionChange<Model, Key>] = []
-    var acceptedCount = 0
+    var acceptedVersions: [CollectionSourceVersion] = []
+    var nextRowVersions = rowVersions
+    var passedHorizon = passedSnapshotHorizon
     var latest = sourceVersion
     for envelope in batch.envelopes {
       guard let rawVersion = envelope.headers.lsn,
-        let version = CircuitsSubsetSource<Model, Key>.postgresLSN(rawVersion)
+        let lsn = CircuitsSubsetSource<Model, Key>.postgresLSN(rawVersion)
       else {
         throw CircuitsSubsetSourceError.invalidLiveSourceVersion(envelope.headers.lsn)
       }
-      // The feed starts before the subset snapshot. The snapshot LSN is an immutable lower bound:
-      // changes at that LSN are part of the same source transaction and must all apply. Do not use
-      // the moving high-water mark as a per-envelope filter or sibling changes sharing one LSN
-      // disappear. We still advance the durable offset for dropped pre-snapshot overlap.
-      guard version >= snapshotSourceVersion else { continue }
+      let version = CollectionSourceVersion(
+        rawValue: lsn.rawValue, order: lsn.order,
+        transactionID: envelope.headers.txid.flatMap(CollectionPageSnapshot.xid32))
+      if let snapshot = snapshotSourceVersion.snapshot, version.order >= snapshot.horizon {
+        passedHorizon = true
+      }
+      if let rowVersion = nextRowVersions[envelope.key] {
+        guard version.supersedes(rowVersion) else { continue }
+      } else if passedHorizon {
+        // The ordered tail has retired the snapshot gate permanently.
+      } else if let snapshot = snapshotSourceVersion.snapshot {
+        if snapshot.includes(lsn: version.order, transactionID: version.transactionID) {
+          continue
+        }
+      } else {
+        guard version >= snapshotSourceVersion else { continue }
+      }
       latest = max(latest, version)
-      acceptedCount += 1
+      acceptedVersions.append(version)
       // A window never applies tail rows, so it does not decode them either: the feed covers the
       // whole predicate, including rows the page excludes (NULL sort keys among them), and a
       // model decoder is entitled to reject those. The page is the only source of window rows.
       guard window == nil else { continue }
+      if snapshotSourceVersion.snapshot != nil || passedHorizon {
+        nextRowVersions[envelope.key] = version
+      }
       switch envelope.headers.operation {
       case .delete:
         do { changes.append(.delete(try decodeKey(envelope.key), sourceVersion: version)) } catch {
@@ -492,15 +540,18 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
       }
     }
     var committedWindowKeys: Set<Key>?
-    if let window, acceptedCount > 0 {
+    var committedPageVersion: CollectionSourceVersion?
+    if let window, !acceptedVersions.isEmpty {
       let (rows, pageVersion): ([Model], CollectionSourceVersion)
       do {
-        (rows, pageVersion) = try await freshPage(window, notBefore: latest)
+        (rows, pageVersion) = try await freshPage(
+          window, notBefore: latest, reflecting: acceptedVersions)
       } catch {
         if !(error is CancellationError) { terminalFailure = error }
         throw error
       }
-      latest = pageVersion
+      latest = max(latest, pageVersion)
+      committedPageVersion = pageVersion
       var pageKeys = Set<Key>()
       pageKeys.reserveCapacity(rows.count)
       changes = try rows.map { row in
@@ -523,8 +574,19 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
     // applied the diff: a failed application leaves the held keys describing the store's rows.
     if let committedWindowKeys {
       window?.keys = committedWindowKeys
+      if let committedPageVersion {
+        snapshotSourceVersion = committedPageVersion
+        passedHorizon = false
+      }
     }
     cursor = StreamCursor(offset: nextCursor.offset, lsn: latest.rawValue)
     sourceVersion = latest
+    rowVersions = nextRowVersions
+    passedSnapshotHorizon = committedPageVersion == nil ? passedHorizon : false
+    if passedSnapshotHorizon {
+      // Release the gate's xip; persisted canonical row versions retain their own visibility.
+      snapshotSourceVersion = CollectionSourceVersion(
+        rawValue: snapshotSourceVersion.rawValue, order: snapshotSourceVersion.order)
+    }
   }
 }
