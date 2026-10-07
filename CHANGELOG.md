@@ -3,7 +3,7 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
-## 0.4.1
+## 0.5.0
 
 - Add an app-gated stale revalidation pass to `CollectionCoordinator`. It re-runs at most two
   marked materializations at a time, smallest claim count first, using the existing acquire,

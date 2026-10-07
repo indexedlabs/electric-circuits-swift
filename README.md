@@ -35,7 +35,7 @@ only while foreground and online. The pass shares ordinary leases, re-runs at mo
 subscriptions at a time (smallest first), and retries failures with capped backoff. Held leases,
 including leases retained by the app's warm pool, clear without another request. A missing
 rebuilder or a nil result removes the stale materialization. Cancel and await the task when
-retiring its scope or generation. The store protocol is unchanged in 0.4.1.
+retiring its scope or generation. The store protocol is unchanged in 0.5.0.
 
 Each `CollectionChange` carries its own `CollectionSourceVersion`; a `CollectionChangeBatch`
 `sourceVersion` is only the batch high-water mark and cursor record. Custom collection stores must
@@ -229,7 +229,7 @@ wire contract, public API, and provider-schema release rules are explicit in
 [Policies/SUPPORT.md](Policies/SUPPORT.md) and [Policies/SEMVER.md](Policies/SEMVER.md). The DocC
 catalog begins at `ElectricCircuitsSwift` in Xcode's documentation viewer.
 
-## Install 0.4.1
+## Install 0.5.0
 
 Custom `CollectionStore` providers must implement `staleMaterializations()` and
 `clearStale(_:ifMarkedAt:)`. A snapshot omission or feed delete of a held row releases only that
@@ -247,7 +247,7 @@ dependencies.
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.4.1"),
+  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.5.0"),
 ]
 ```
 
