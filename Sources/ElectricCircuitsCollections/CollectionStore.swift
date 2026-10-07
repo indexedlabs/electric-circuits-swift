@@ -1,6 +1,21 @@
 import ElectricCircuitsSwift
 import Foundation
 
+/// A marked materialization, its drop position and its current number of row claims.
+public struct CollectionStaleMaterialization: Sendable, Equatable {
+  public let record: CollectionMaterializationRecord
+  public let markedAt: CollectionSourceVersion
+  public let claimCount: Int
+
+  public init(
+    record: CollectionMaterializationRecord, markedAt: CollectionSourceVersion, claimCount: Int
+  ) {
+    self.record = record
+    self.markedAt = markedAt
+    self.claimCount = claimCount
+  }
+}
+
 /// Atomic persistence boundary for canonical rows, materialization row claims, snapshot fences and
 /// live cursors. A conforming durable provider must commit each mutating method as one transaction.
 public protocol CollectionStore<Model, Key>: Sendable {
@@ -12,10 +27,7 @@ public protocol CollectionStore<Model, Key>: Sendable {
 
   /// Every marked materialization, its drop position and its current number of row claims.
   /// Claims without a materialization are never marked. Results have no prescribed order.
-  func staleMaterializations() async throws
-    -> [(
-      record: CollectionMaterializationRecord, markedAt: CollectionSourceVersion, claimCount: Int
-    )]
+  func staleMaterializations() async throws -> [CollectionStaleMaterialization]
 
   /// Clears only a mark still at the supplied position, preserving a later drop's mark.
   func clearStale(
@@ -100,14 +112,10 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     recordsByDemand[demand]
   }
 
-  public func staleMaterializations() async throws
-    -> [(
-      record: CollectionMaterializationRecord, markedAt: CollectionSourceVersion, claimCount: Int
-    )]
-  {
+  public func staleMaterializations() async throws -> [CollectionStaleMaterialization] {
     recordsByDemand.values.compactMap { record in
       guard let position = staleMarks[record.id] else { return nil }
-      return (record, position, claims[record.id]?.count ?? 0)
+      return .init(record: record, markedAt: position, claimCount: claims[record.id]?.count ?? 0)
     }
   }
 

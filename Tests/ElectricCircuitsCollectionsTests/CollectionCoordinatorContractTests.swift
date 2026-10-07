@@ -175,11 +175,7 @@ private actor LiveApplyFailingStore: CollectionStore {
     try await base.materialization(for: demand)
   }
 
-  func staleMaterializations() async throws
-    -> [(
-      record: CollectionMaterializationRecord, markedAt: CollectionSourceVersion, claimCount: Int
-    )]
-  {
+  func staleMaterializations() async throws -> [CollectionStaleMaterialization] {
     try await base.staleMaterializations()
   }
 
@@ -236,11 +232,7 @@ private actor EvictionGateStore: CollectionStore {
     try await base.materialization(for: demand)
   }
 
-  func staleMaterializations() async throws
-    -> [(
-      record: CollectionMaterializationRecord, markedAt: CollectionSourceVersion, claimCount: Int
-    )]
-  {
+  func staleMaterializations() async throws -> [CollectionStaleMaterialization] {
     try await base.staleMaterializations()
   }
 

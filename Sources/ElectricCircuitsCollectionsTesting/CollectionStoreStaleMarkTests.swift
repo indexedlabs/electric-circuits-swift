@@ -69,6 +69,35 @@ public struct CollectionStoreStaleMarkTests<Store: CollectionStore>: Sendable {
     #expect(try await storedKeys(store, demand("deck")) == [key(1)])
   }
 
+  public func reloadOmissionDoesNotMarkOtherScopesOrCollections() async throws {
+    let store = try await makeStore()
+    let push = demand("push")
+    let otherScope = CollectionDemandIdentity(
+      collection: definition.id,
+      scope: .init(
+        principal: scope.principal + "-other", authorization: scope.authorization,
+        generation: scope.generation),
+      canonicalDemand: push.canonicalDemand)
+    let otherCollection = CollectionDemandIdentity(
+      collection: .init(rawValue: definition.id.rawValue + "-other"), scope: scope,
+      canonicalDemand: push.canonicalDemand)
+    try await snapshot(store, "deck", rows: [1])
+    try await snapshot(store, "push", rows: [1])
+    try await snapshot(store, "other-scope", rows: [1], demand: otherScope)
+    try await snapshot(store, "other-collection", rows: [1], demand: otherCollection)
+    #expect(try await claimedKeys(store, id("other-scope")) == [key(1)])
+    #expect(try await claimedKeys(store, id("other-collection")) == [key(1)])
+    #expect(try await store.staleMaterializations().isEmpty)
+
+    try await snapshot(store, "deck", rows: [], at: 10)
+
+    try await expectMarks(store, owners: ["push"], at: 10)
+    #expect(try await claimedKeys(store, id("other-scope")) == [key(1)])
+    #expect(try await claimedKeys(store, id("other-collection")) == [key(1)])
+    #expect(try await storedKeys(store, otherScope) == [key(1)])
+    #expect(try await storedKeys(store, otherCollection) == [key(1)])
+  }
+
   public func dropReleasesOnlyItsOwnClaim() async throws {
     let store = try await makeStore()
     try await snapshot(store, "deck", rows: [1])
@@ -114,6 +143,9 @@ public struct CollectionStoreStaleMarkTests<Store: CollectionStore>: Sendable {
     #expect(marks.first { $0.record.id == id("push") }?.markedAt == version(20))
     // Dropping its own row did not clear chat's existing mark.
     #expect(marks.first { $0.record.id == id("chat") }?.markedAt == version(10))
+    try await store.clearStale(id("push"), ifMarkedAt: version(30))
+    let afterNewerClear = try await store.staleMaterializations()
+    #expect(afterNewerClear.first { $0.record.id == id("push") }?.markedAt == version(20))
   }
 
   public func currentPositionClearRemovesMark() async throws {
@@ -121,6 +153,7 @@ public struct CollectionStoreStaleMarkTests<Store: CollectionStore>: Sendable {
     try await snapshot(store, "deck", rows: [1])
     try await snapshot(store, "push", rows: [1])
     try await snapshot(store, "deck", rows: [], at: 10)
+    try await expectMarks(store, owners: ["push"], at: 10)
     let record = try await store.materialization(for: demand("push"))
     try await store.clearStale(id("push"), ifMarkedAt: version(10))
     #expect(try await store.staleMaterializations().isEmpty)
@@ -134,6 +167,7 @@ public struct CollectionStoreStaleMarkTests<Store: CollectionStore>: Sendable {
     try await snapshot(store, "deck", rows: [1])
     try await snapshot(store, "push", rows: [1])
     try await snapshot(store, "deck", rows: [], at: 10)
+    try await expectMarks(store, owners: ["push"], at: 10)
     try await store.removeMaterialization(id("push"))
     #expect(try await store.staleMaterializations().isEmpty)
     #expect(try await store.materialization(for: demand("push")) == nil)
@@ -141,6 +175,23 @@ public struct CollectionStoreStaleMarkTests<Store: CollectionStore>: Sendable {
     #expect(try await storedKeys(store, demand("deck")).isEmpty)
     try await snapshot(store, "push", rows: [1], at: 20)
     #expect(try await store.staleMaterializations().isEmpty)
+  }
+
+  public func removingMaterializationDoesNotMarkOtherHolders() async throws {
+    let store = try await makeStore()
+    try await snapshot(store, "deck", rows: [1])
+    try await snapshot(store, "push", rows: [1])
+    #expect(try await claimedKeys(store, id("deck")) == [key(1)])
+    #expect(try await claimedKeys(store, id("push")) == [key(1)])
+    #expect(try await store.staleMaterializations().isEmpty)
+
+    try await store.removeMaterialization(id("deck"))
+
+    #expect(try await store.staleMaterializations().isEmpty)
+    #expect(try await store.materialization(for: demand("deck")) == nil)
+    #expect(try await claimedKeys(store, id("deck")).isEmpty)
+    #expect(try await claimedKeys(store, id("push")) == [key(1)])
+    #expect(try await storedKeys(store, demand("push")) == [key(1)])
   }
 
   public func topNAndSubqueryHoldersAreMarked() async throws {
@@ -266,7 +317,7 @@ public struct CollectionStoreStaleMarkTests<Store: CollectionStore>: Sendable {
   }
 
   private func expectMarks(_ store: Store, owners: Set<String>, at order: UInt64) async throws {
-    let marks = try await store.staleMaterializations()
+    let marks: [CollectionStaleMaterialization] = try await store.staleMaterializations()
     #expect(marks.count == owners.count)
     #expect(Set(marks.map { $0.record.id.rawValue }) == owners)
     for mark in marks {
