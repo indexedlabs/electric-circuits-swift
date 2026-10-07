@@ -411,6 +411,8 @@ public final class TelemetryReporter: @unchecked Sendable {
   private static let allowedAttributes: Set<String> = [
     "http.method", "http.status_code", "http.route", "electric.operation", "electric.table",
     "electric.stream_path", "error.type",
+    "sync.subscription_kind", "sync.outcome", "sync.rows_returned", "sync.claims_released",
+    "sync.seconds_since_mark", "sync.duration_seconds",
   ]
   private static func sanitize(_ attributes: [String: String]) -> [String: String] {
     var result: [String: String] = [:]

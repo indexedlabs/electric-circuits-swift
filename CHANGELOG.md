@@ -3,6 +3,22 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
+## 0.4.1
+
+- Add an app-gated stale revalidation pass to `CollectionCoordinator`. It re-runs at most two
+  marked materializations at a time, smallest claim count first, using the existing acquire,
+  snapshot and release lifecycle. Held demands clear without another request; a later drop's
+  mark survives a conditional clear. Existing stored marks are discovered after relaunch.
+- Add optional `CollectionDefinition.rebuildDemand` and `subscriptionKind` values. A missing
+  rebuilder, or one returning nil, removes the stale materialization and releases its claims.
+- Retry failed runs with capped exponential backoff through the injected clock, retaining marks
+  and refused-release authority. Closing the gate or cancelling the app-owned pass task cancels
+  its work without clearing unfinished marks; a screen joining a re-run shares its lease.
+- Emit `sync.revalidate` spans with table, kind, outcome, rows returned, claims released, mark age
+  and duration. Claims released measures net decrease for refreshed snapshots (clamped at zero),
+  the observed claim count for removed materializations, and zero for held or failed runs.
+  Mark age starts when this coordinator first observes the mark in this process.
+
 ## 0.4.0
 
 - Breaking: custom `CollectionStore` implementations must implement `staleMaterializations()`

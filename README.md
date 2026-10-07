@@ -28,6 +28,15 @@ typed `CollectionPredicate` values compile logical field IDs into native Circuit
 fences, and live cursors. `InMemoryCollectionStore` is the reference provider; applications can
 implement the same contract with GRDB or another store.
 
+To revalidate stored stale marks, provide the definition's optional `rebuildDemand` closure and
+`subscriptionKind` label, and run `startStaleRevalidation(clock:telemetry:)` in an app-owned task.
+The gate starts closed: call `setStaleRevalidationGate(isOpen:)` after first paint, keeping it open
+only while foreground and online. The pass shares ordinary leases, re-runs at most two unheld
+subscriptions at a time (smallest first), and retries failures with capped backoff. Held leases,
+including leases retained by the app's warm pool, clear without another request. A missing
+rebuilder or a nil result removes the stale materialization. Cancel and await the task when
+retiring its scope or generation. The store protocol is unchanged in 0.4.1.
+
 Each `CollectionChange` carries its own `CollectionSourceVersion`; a `CollectionChangeBatch`
 `sourceVersion` is only the batch high-water mark and cursor record. Custom collection stores must
 persist versioned upserts and tombstones per change so a lower-LSN sibling in a coalesced batch
@@ -220,7 +229,7 @@ wire contract, public API, and provider-schema release rules are explicit in
 [Policies/SUPPORT.md](Policies/SUPPORT.md) and [Policies/SEMVER.md](Policies/SEMVER.md). The DocC
 catalog begins at `ElectricCircuitsSwift` in Xcode's documentation viewer.
 
-## Install 0.4.0
+## Install 0.4.1
 
 Custom `CollectionStore` providers must implement `staleMaterializations()` and
 `clearStale(_:ifMarkedAt:)`. A snapshot omission or feed delete of a held row releases only that
@@ -238,7 +247,7 @@ dependencies.
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.4.0"),
+  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.4.1"),
 ]
 ```
 
