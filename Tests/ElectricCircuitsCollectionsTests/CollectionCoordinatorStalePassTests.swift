@@ -457,6 +457,150 @@ private actor StaleCompletion {
 
 @Suite("Collection coordinator stale pass", .timeLimit(.minutes(1)))
 struct CollectionCoordinatorStalePassTests {
+  @Test func cleanupOnlyReopenDrainsVanishedPredecessorsBeforeExplicitRead() async throws {
+    let f = StaleFixture()
+    let next = StaleFixture(source: f.source, collectionID: "other")
+    try await f.mark(["one", "two"])
+    await f.source.failStops(Int.max)
+    try await f.withPass {
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 2 })
+      await f.source.succeed(0)
+      await f.source.succeed(1)
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.stopAttempts.count == 2 })
+      await f.coordinator.setStaleRevalidationGate(isOpen: false)
+      // Native-store takeover can remove these predecessor records before DELETE succeeds.
+      for owner in ["one", "two"] { try await f.store.removeMaterialization(f.id(owner)) }
+      try await f.mark(["three"])
+      await f.source.failStops(0)
+      await f.source.holdStops()
+      let completion = StaleCompletion()
+      let handoff = Task {
+        let ready = await f.coordinator.resumeAndDrainStaleRevalidation()
+        await completion.finish()
+        return ready
+      }
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.stopAttempts.count == 4 })
+      #expect(await completion.finished == false)
+      #expect(await f.source.requests.count == 2)
+      #expect(await f.source.maximumActive == 2)
+      await f.source.resumeStops()
+      #expect(await handoff.value)
+      #expect(Set(await f.source.stopped) == [0, 1])
+      #expect(await f.source.requests.count == 2)
+      // A true handoff permits an explicit repair under the same app-wide source budget.
+      let explicit = await next.coordinator.acquire(next.demand("one"))
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 3 })
+      await f.source.succeed(2)
+      try #require(
+        try await f.eventually(advancingClock: false) { await explicit.state() == .live })
+      #expect(await f.source.maximumActive == 2)
+      #expect(try await f.marks().map(\.record.id) == [f.id("three")])
+      try await explicit.release()
+    }
+    await next.telemetry.shutdown()
+  }
+
+  @Test func reopeningAdmissionCountsRetainedLeasesMissingFromTheListing() async throws {
+    let f = StaleFixture()
+    try await f.mark(["one", "two"])
+    await f.source.failStops(Int.max)
+    try await f.withPass {
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 2 })
+      await f.source.succeed(0)
+      await f.source.succeed(1)
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.stopAttempts.count == 2 })
+      await f.coordinator.setStaleRevalidationGate(isOpen: false)
+      for owner in ["one", "two"] { try await f.store.removeMaterialization(f.id(owner)) }
+      try await f.mark(["three"])
+      await f.coordinator.setStaleRevalidationGate(isOpen: true)
+      try #require(
+        try await f.eventually(advancingClock: false) {
+          await f.clock.pendingDelays.filter { $0 == .milliseconds(250) }.count == 2
+        })
+      #expect(await f.source.stopAttempts.count == 4)
+      #expect(await f.source.requests.count == 2)
+      await f.source.failStops(0)
+      await f.clock.advance(by: .milliseconds(250))
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 3 })
+      #expect(await f.source.maximumActive == 2)
+      try #require(
+        try await f.eventually(advancingClock: false) { Set(await f.source.stopped) == [0, 1] })
+      await f.source.succeed(2)
+      try #require(try await f.eventually(advancingClock: false) { try await f.marks().isEmpty })
+    }
+  }
+
+  enum CleanupInterruption: CaseIterable { case caller, lifecycle, retirement }
+
+  @Test(arguments: CleanupInterruption.allCases)
+  func interruptedCleanupOnlyHandoffNeverGrantsAdmission(_ interruption: CleanupInterruption)
+    async throws
+  {
+    let f = StaleFixture()
+    try await f.mark()
+    await f.source.failStops(Int.max)
+    await f.coordinator.setStaleRevalidationGate(isOpen: true)
+    let pass = Task { await f.coordinator.startStaleRevalidation(clock: f.clock) }
+    do {
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 1 })
+      await f.source.succeed(0)
+      try #require(
+        try await f.eventually(advancingClock: false) {
+          await f.clock.pendingDelays.contains(.milliseconds(250))
+        })
+      await f.coordinator.setStaleRevalidationGate(isOpen: false)
+      let handoff = Task { await f.coordinator.resumeAndDrainStaleRevalidation() }
+      try #require(
+        try await f.eventually(advancingClock: false) {
+          await f.clock.pendingDelays == [.milliseconds(250)]
+        })
+      switch interruption {
+      case .caller: handoff.cancel()
+      case .lifecycle: await f.coordinator.setStaleRevalidationGate(isOpen: false)
+      case .retirement: pass.cancel()
+      }
+      // Permanent refusal remains in force. Cancellation must not need a fake-clock tick.
+      #expect(await handoff.value == false)
+      if interruption == .retirement { await pass.value }
+      #expect(await f.clock.pendingDelays.isEmpty)
+      let attempts = await f.source.stopAttempts.count
+      #expect(attempts == (interruption == .retirement ? 3 : 2))
+      await f.clock.advance(by: .seconds(60))
+      #expect(await f.source.stopAttempts.count == attempts)
+      #expect(await f.source.requests.count == 1)
+      if interruption == .retirement {
+        // A stopped pass cannot certify retained authority as drained.
+        #expect(await f.coordinator.resumeAndDrainStaleRevalidation() == false)
+      } else {
+        await f.source.failStops(0)
+        #expect(await f.coordinator.resumeAndDrainStaleRevalidation())
+        #expect(await f.source.stopped == [0])
+        #expect(await f.source.requests.count == 1)
+      }
+    } catch {
+      await f.stopPass(pass)
+      await f.telemetry.shutdown()
+      throw error
+    }
+    await f.stopPass(pass)
+    await f.telemetry.shutdown()
+  }
+
+  @Test func cleanupOnlyHandoffWithoutPassOrRetainedWorkIsReady() async {
+    let f = StaleFixture()
+    #expect(await f.coordinator.resumeAndDrainStaleRevalidation())
+    #expect(await f.source.requests.isEmpty)
+    await f.telemetry.shutdown()
+  }
+
   @Test func drainingLongSnapshotPausesAdmissionWithoutCancelling() async throws {
     let f = StaleFixture()
     for (index, owner) in ["one", "two", "three"].enumerated() {

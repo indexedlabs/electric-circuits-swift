@@ -40,7 +40,7 @@ in the current generation; after successful replacement, the old materialization
 its claims cannot retain stale rows. Other principals and authorization scopes are excluded.
 Idle listings run every five seconds; opening the gate, local snapshot/feed writes, completed
 runs and retry expiry wake the pass immediately. Cancel and await the task when
-retiring its scope or generation. The store protocol is unchanged in 0.6.0.
+retiring its scope or generation. The store protocol is unchanged in 0.7.0.
 
 For app-wide scheduling across collections, await `drainStaleRevalidation()` before opening the
 next collection's gate or starting an explicit repair read. Drain closes admission and lets
@@ -50,6 +50,16 @@ until `setStaleRevalidationGate(isOpen: true)`. Lifecycle gate closure and task 
 precedence over drain: they cancel snapshots and release-retry backoff. Closure retains refused
 release authority for reopening; retirement makes one final best-effort release without an
 endless DELETE retry loop. The app owns the global budget across coordinators.
+
+After a foreground or online transition, call `resumeAndDrainStaleRevalidation()` before any new
+repair admission, and proceed only if it returns `true`. This reopens lifecycle permission with
+admission closed and resumes cleanup directly from retained lease IDs, including predecessors
+that disappeared from the stale listing during snapshot takeover. Refused releases still occupy
+the two-slot budget. A `false` result means closure, retirement, cancellation or a concurrent
+admission reopen interrupted the handoff; retry on a later eligible transition. Cancelling this
+call closes its lifecycle gate and stops retry backoff. With no running pass and no retained work
+it returns `true`; retained work without a live pass returns `false`. Screen-held leases remain
+owned by their callers. Only explicitly opening the gate admits another background stale read.
 
 A definition can supply `subscriptionKindForDemand` to classify each original stored demand
 into a fixed, content-free label such as `push_read` or `thread`. The classifier takes precedence
@@ -247,7 +257,7 @@ wire contract, public API, and provider-schema release rules are explicit in
 [Policies/SUPPORT.md](Policies/SUPPORT.md) and [Policies/SEMVER.md](Policies/SEMVER.md). The DocC
 catalog begins at `ElectricCircuitsSwift` in Xcode's documentation viewer.
 
-## Install 0.6.0
+## Install 0.7.0
 
 Custom `CollectionStore` providers must implement `staleMaterializations()` and
 `clearStale(_:ifMarkedAt:)`. A snapshot omission or feed delete of a held row releases only that
@@ -265,7 +275,7 @@ dependencies.
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.6.0"),
+  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.7.0"),
 ]
 ```
 
