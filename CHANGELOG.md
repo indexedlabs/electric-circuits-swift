@@ -3,6 +3,19 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
+## 0.7.0
+
+- Add `CollectionCoordinator.resumeAndDrainStaleRevalidation() async -> Bool` to reopen lifecycle
+  permission while keeping admission closed. A true result certifies all admitted stale work and
+  retained release authority are drained; interruptions return false. Caller cancellation closes
+  the lifecycle gate and stops cleanup retry backoff only while that invocation still owns it;
+  a superseded caller cannot close a newer gate. Existing drain callers remain source-compatible.
+- Fix retained refused-release leases disappearing from scheduler accounting after gate closure
+  (OTTO-6384). Cleanup resumes from retained IDs even if snapshot takeover removed their old
+  materializations from the stale listing; those leases continue to occupy the two-slot budget.
+  Lifecycle closure and retirement still stop retries promptly without a detached retry loop.
+- This minor release adds no store protocol, persisted schema, or HTTP changes.
+
 ## 0.6.0
 
 - Add `CollectionCoordinator.drainStaleRevalidation()` to pause background admission and await
