@@ -243,17 +243,21 @@ public actor CollectionCoordinator<
   /// Updates the app's foreground/online/first-paint gate. No runs proceed while it is closed.
   public func setStaleRevalidationGate(isOpen: Bool) async {
     if isOpen {
-      if !staleGateOpen || !staleAdmissionOpen {
-        staleGateOpen = true
-        staleAdmissionOpen = true
-        staleDrainToken = nil
-        wakeStaleDrains()
-        stalePassWake?.yield(())
-      }
+      openStaleRevalidationGate()
       return
     }
     let running = closeStaleRevalidationGate()
     for task in running { await task.value }
+  }
+
+  func openStaleRevalidationGate() {
+    if !staleGateOpen || !staleAdmissionOpen {
+      staleGateOpen = true
+      staleAdmissionOpen = true
+      staleDrainToken = nil
+      wakeStaleDrains()
+      stalePassWake?.yield(())
+    }
   }
 
   /// Pauses background admission and waits for already admitted work to release its leases.
@@ -270,8 +274,8 @@ public actor CollectionCoordinator<
     stalePassWake?.yield(())
     let admitted = Array(staleRuns.values)
     for task in admitted { await task.value }
-    if let token = stalePassToken, let clock = stalePassClock {
-      _ = await drainRetainedStaleLeases(token: token, clock: clock, revision: staleGateRevision)
+    if let token = stalePassToken {
+      _ = await drainRetainedStaleLeases(token: token, revision: staleGateRevision)
     }
     // No state changes here: a lifecycle close or explicit reopen during the await wins.
   }
@@ -302,10 +306,10 @@ public actor CollectionCoordinator<
       if staleDrainToken == drainToken { staleDrainToken = nil }
     }
     return await withTaskCancellationHandler {
-      guard let token = stalePassToken, let clock = stalePassClock else {
+      guard let token = stalePassToken else {
         return staleRuns.isEmpty && staleLeaseIDs.isEmpty && !Task.isCancelled
       }
-      let drained = await drainRetainedStaleLeases(token: token, clock: clock, revision: revision)
+      let drained = await drainRetainedStaleLeases(token: token, revision: revision)
       // AsyncStream cancellation can win before the cancellation handler reaches this actor.
       if Task.isCancelled { cancelStaleDrain(drainToken) }
       return drained
@@ -319,9 +323,7 @@ public actor CollectionCoordinator<
     _ = closeStaleRevalidationGate()
   }
 
-  private func drainRetainedStaleLeases(
-    token: UUID, clock: any ShapeSubscriptionClock, revision: UUID
-  ) async -> Bool {
+  private func drainRetainedStaleLeases(token: UUID, revision: UUID) async -> Bool {
     let waiter = UUID()
     let wake = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
     staleDrainWaiters[waiter] = wake.continuation
@@ -334,7 +336,7 @@ public actor CollectionCoordinator<
       guard stalePassMayRun(token), !staleAdmissionOpen, staleGateRevision == revision else {
         return false
       }
-      resumeRetainedStaleLeases(token: token, clock: clock)
+      resumeRetainedStaleLeases()
       if staleRuns.isEmpty { return staleLeaseIDs.isEmpty }
     }
     return false
@@ -377,7 +379,7 @@ public actor CollectionCoordinator<
   ) async throws {
     // Retained authority is independent of the store listing: a snapshot can replace its
     // predecessor materialization before its remote lease release is accepted.
-    resumeRetainedStaleLeases(token: token, clock: clock)
+    resumeRetainedStaleLeases()
     // A job can finish while the store is listing. Do not re-admit its old list entry after
     // completion removes it from staleRuns; the next listing will see its conditional clear.
     let occupiedAtRead = Set(staleRuns.keys).union(staleRetries.keys).union(staleLeaseIDs.keys)
@@ -410,8 +412,10 @@ public actor CollectionCoordinator<
     }
   }
 
-  private func resumeRetainedStaleLeases(token: UUID, clock: any ShapeSubscriptionClock) {
-    guard stalePassMayRun(token) else { return }
+  func resumeRetainedStaleLeases() {
+    guard let token = stalePassToken, let clock = stalePassClock, stalePassMayRun(token) else {
+      return
+    }
     for id in staleLeaseIDs.keys where staleRuns[id] == nil {
       staleRuns[id] = Task {
         defer {
@@ -419,6 +423,7 @@ public actor CollectionCoordinator<
           self.wakeStaleDrains()
           if self.stalePassToken == token { self.stalePassWake?.yield(()) }
         }
+        guard self.stalePassMayRun(token) else { return }
         await self.finishStaleLeaseRelease(id, token: token, clock: clock)
       }
     }

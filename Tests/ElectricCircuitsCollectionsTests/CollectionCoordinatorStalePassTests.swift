@@ -621,6 +621,52 @@ struct CollectionCoordinatorStalePassTests {
     await f.telemetry.shutdown()
   }
 
+  // Hold the actor for the entire enqueue/close sequence, so the cancelled cleanup task
+  // cannot begin its body between scheduling and gate closure.
+  private func enqueueCleanupAndClose(
+    _ coordinator: isolated StaleFixture.Coordinator
+  ) -> [Task<Void, Never>] {
+    coordinator.openStaleRevalidationGate()
+    coordinator.resumeRetainedStaleLeases()
+    return coordinator.closeStaleRevalidationGate()
+  }
+
+  @Test func cleanupCancelledBeforeItsBodyDoesNotRetryRelease() async throws {
+    let f = StaleFixture()
+    try await f.mark()
+    await f.source.failStops(Int.max)
+    await f.coordinator.setStaleRevalidationGate(isOpen: true)
+    let pass = Task { await f.coordinator.startStaleRevalidation(clock: f.clock) }
+    do {
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 1 })
+      await f.source.succeed(0)
+      try #require(
+        try await f.eventually(advancingClock: false) {
+          await f.clock.pendingDelays.contains(.milliseconds(250))
+        })
+      await f.coordinator.setStaleRevalidationGate(isOpen: false)
+      #expect(await f.source.stopAttempts == [0])
+      let cancelled = await enqueueCleanupAndClose(f.coordinator)
+      #expect(cancelled.count == 1)
+      for task in cancelled { await task.value }
+      // Enqueuing really happened, but cancellation preceded the first instruction.
+      #expect(await f.source.stopAttempts == [0])
+      #expect(await f.clock.pendingDelays.isEmpty)
+      pass.cancel()
+      await pass.value
+      // Retirement still owns exactly one final best-effort attempt after the original refusal.
+      #expect(await f.source.stopAttempts == [0, 0])
+      #expect(await f.source.stopped.isEmpty)
+    } catch {
+      await f.stopPass(pass)
+      await f.telemetry.shutdown()
+      throw error
+    }
+    await f.source.finish()
+    await f.telemetry.shutdown()
+  }
+
   @Test func drainingLongSnapshotPausesAdmissionWithoutCancelling() async throws {
     let f = StaleFixture()
     for (index, owner) in ["one", "two", "three"].enumerated() {
