@@ -10,8 +10,16 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   snapshot omission or feed delete releases a held row. Marks advance with later drops and clear
   only conditionally or when their materialization is removed. `InMemoryCollectionStore`
   implements the contract; stale subscriptions are not re-run yet.
+- Breaking: custom `CollectionStore` implementations must now return
+  `[CollectionStaleMaterialization]` from `staleMaterializations()` instead of a tuple array.
+  The public `Sendable`, `Equatable` result contains `record: CollectionMaterializationRecord`,
+  `markedAt: CollectionSourceVersion`, and `claimCount: Int`; construct each result with
+  `CollectionStaleMaterialization(record:markedAt:claimCount:)`.
 - Add `ElectricCircuitsCollectionsTesting`, a shared stale-mark contract suite that accepts a
   store factory and provider-specific fixture callbacks for in-memory and durable stores.
+- Strengthen the shared stale-mark suite to check collection and scope boundaries, preserve a
+  mark when a clear supplies a newer position, and ensure eviction does not mark other holders.
+  Clear and removal cases now assert that a mark exists before testing its removal.
 
 - Retain an in-flight shape create until shutdown captures its result when `stop()` races with
   creation. This prevents a landed claim from losing its release request and hanging cancellation.

@@ -29,6 +29,10 @@ struct CollectionStoreStaleMarkContractTests {
     try await contract.feedDeleteMarksOtherHolders()
   }
 
+  @Test func reloadOmissionDoesNotMarkOtherScopesOrCollections() async throws {
+    try await contract.reloadOmissionDoesNotMarkOtherScopesOrCollections()
+  }
+
   @Test func dropReleasesOnlyItsOwnClaim() async throws {
     try await contract.dropReleasesOnlyItsOwnClaim()
   }
@@ -51,6 +55,10 @@ struct CollectionStoreStaleMarkContractTests {
 
   @Test func removingMaterializationDropsItsMark() async throws {
     try await contract.removingMaterializationDropsItsMark()
+  }
+
+  @Test func removingMaterializationDoesNotMarkOtherHolders() async throws {
+    try await contract.removingMaterializationDoesNotMarkOtherHolders()
   }
 
   @Test func topNAndSubqueryHoldersAreMarked() async throws {
