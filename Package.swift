@@ -7,6 +7,8 @@ let package = Package(
   products: [
     .library(name: "ElectricCircuitsSwift", targets: ["ElectricCircuitsSwift"]),
     .library(name: "ElectricCircuitsCollections", targets: ["ElectricCircuitsCollections"]),
+    .library(
+      name: "ElectricCircuitsCollectionsTesting", targets: ["ElectricCircuitsCollectionsTesting"]),
     .executable(
       name: "ElectricCircuitsSwiftRealStack", targets: ["ElectricCircuitsSwiftRealStack"]),
     .executable(
@@ -19,6 +21,10 @@ let package = Package(
       name: "ElectricCircuitsCollections",
       dependencies: ["ElectricCircuitsSwift"],
       path: "Sources/ElectricCircuitsCollections"
+    ),
+    .target(
+      name: "ElectricCircuitsCollectionsTesting",
+      dependencies: ["ElectricCircuitsCollections"]
     ),
     .executableTarget(
       name: "ElectricCircuitsSwiftRealStack",
@@ -35,7 +41,7 @@ let package = Package(
       path: "Tests/ElectricCircuitsSwiftTests"),
     .testTarget(
       name: "ElectricCircuitsCollectionsTests",
-      dependencies: ["ElectricCircuitsCollections"],
+      dependencies: ["ElectricCircuitsCollections", "ElectricCircuitsCollectionsTesting"],
       path: "Tests/ElectricCircuitsCollectionsTests"),
   ]
 )

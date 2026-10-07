@@ -10,19 +10,40 @@ public protocol CollectionStore<Model, Key>: Sendable {
   func materialization(for demand: CollectionDemandIdentity) async throws
     -> CollectionMaterializationRecord?
 
+  /// Every marked materialization, its drop position and its current number of row claims.
+  /// Claims without a materialization are never marked. Results have no prescribed order.
+  func staleMaterializations() async throws
+    -> [(
+      record: CollectionMaterializationRecord, markedAt: CollectionSourceVersion, claimCount: Int
+    )]
+
+  /// Clears only a mark still at the supplied position, preserving a later drop's mark.
+  func clearStale(
+    _ materializationID: CollectionMaterializationID, ifMarkedAt position: CollectionSourceVersion
+  ) async throws
+
+  /// Replaces this request's claims. Each omitted, previously held row marks every other
+  /// materialization still claiming it in the same transaction, at the snapshot's source version.
+  /// Marking ignores request limits, subqueries and liveness, and preserves other holders' claims.
+  /// Later drops advance marks using source-version ordering. Snapshots never clear marks.
+  /// Durable providers persist marks with the materialization in the same write as the drop.
   func replaceSnapshot(
     _ snapshot: CollectionSnapshot<Model>,
     materializationID: CollectionMaterializationID,
     demand: CollectionDemandIdentity
   ) async throws
 
+  /// A feed delete of a held row releases this request's claim and marks every other
+  /// materialization still claiming the row in the same transaction, at that delete's source
+  /// version. The same marking rules as `replaceSnapshot` apply; batches never clear marks.
   func apply(
     _ batch: CollectionChangeBatch<Model, Key>,
     to materializationID: CollectionMaterializationID
   ) async throws
 
   /// Explicit bounded-cache lifecycle. Providers remove the materialization's claims and any
-  /// now-unclaimed canonical rows in the same transaction.
+  /// now-unclaimed canonical rows and its stale mark in the same transaction. Only this method
+  /// and `clearStale(_:ifMarkedAt:)` clear marks; eviction does not mark other holders.
   func removeMaterialization(_ materializationID: CollectionMaterializationID) async throws
 }
 
@@ -63,6 +84,7 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
   private var recordsByDemand: [CollectionDemandIdentity: CollectionMaterializationRecord] = [:]
   private var demandByMaterialization: [CollectionMaterializationID: CollectionDemandIdentity] = [:]
   private var claims: [CollectionMaterializationID: Set<Key>] = [:]
+  private var staleMarks: [CollectionMaterializationID: CollectionSourceVersion] = [:]
 
   private func domain(for demand: CollectionDemandIdentity) -> Domain {
     Domain(collection: demand.collection, scope: demand.scope)
@@ -76,6 +98,25 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     -> CollectionMaterializationRecord?
   {
     recordsByDemand[demand]
+  }
+
+  public func staleMaterializations() async throws
+    -> [(
+      record: CollectionMaterializationRecord, markedAt: CollectionSourceVersion, claimCount: Int
+    )]
+  {
+    recordsByDemand.values.compactMap { record in
+      guard let position = staleMarks[record.id] else { return nil }
+      return (record, position, claims[record.id]?.count ?? 0)
+    }
+  }
+
+  public func clearStale(
+    _ materializationID: CollectionMaterializationID, ifMarkedAt position: CollectionSourceVersion
+  ) async throws {
+    if staleMarks[materializationID] == position {
+      staleMarks.removeValue(forKey: materializationID)
+    }
   }
 
   public func replaceSnapshot(
@@ -101,11 +142,15 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     var nextRows = canonicalRows
     var nextClaims = claims
     var nextRecords = recordsByDemand
+    var nextMarks = staleMarks
     var nextDemandByMaterialization = demandByMaterialization
     nextDemandByMaterialization[materializationID] = demand
     nextClaims[materializationID] = newClaims
 
     for oldKey in oldClaims.subtracting(newClaims) {
+      markOtherHolders(
+        of: oldKey, dropping: materializationID, domain: domain,
+        at: snapshot.sourceVersion, marks: &nextMarks)
       if !isClaimed(oldKey, in: nextClaims, domain: domain, bindings: nextDemandByMaterialization),
         nextRows[CanonicalKey(domain: domain, key: oldKey)]?.row != nil
       {
@@ -134,6 +179,7 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     claims = nextClaims
     recordsByDemand = nextRecords
     demandByMaterialization = nextDemandByMaterialization
+    staleMarks = nextMarks
   }
 
   public func apply(
@@ -158,6 +204,7 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     var nextRows = canonicalRows
     var nextClaims = claims
     var nextRecords = recordsByDemand
+    var nextMarks = staleMarks
     var materializationClaims = nextClaims[materializationID] ?? []
     // Claims are membership facts, not a row-byte version. An older overlapping feed cannot
     // replace newer canonical bytes, but it still proves that its materialization owns the key.
@@ -171,8 +218,12 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
           nextRows[canonicalKey] = (row, sourceVersion)
         }
         materializationClaims.insert(rowKey)
-      case .delete(let rowKey, _):
-        materializationClaims.remove(rowKey)
+      case .delete(let rowKey, let sourceVersion):
+        if materializationClaims.remove(rowKey) != nil {
+          markOtherHolders(
+            of: rowKey, dropping: materializationID, domain: domain,
+            at: sourceVersion, marks: &nextMarks)
+        }
       }
     }
     nextClaims[materializationID] = materializationClaims
@@ -199,6 +250,17 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     canonicalRows = nextRows
     claims = nextClaims
     recordsByDemand = nextRecords
+    staleMarks = nextMarks
+  }
+
+  /// Internal fixture seam for the shared contract's materialization-less retention owner.
+  /// It deliberately creates no materialization record or stale mark.
+  func seedClaimWithoutMaterialization(
+    _ rowKey: Key, owner: CollectionMaterializationID, demand: CollectionDemandIdentity
+  ) {
+    precondition(demandByMaterialization[owner] == nil && recordsByDemand[demand] == nil)
+    demandByMaterialization[owner] = demand
+    claims[owner] = [rowKey]
   }
 
   /// Convenience inspection for one-domain test stores. Production providers should expose their
@@ -231,6 +293,7 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
   public func removeMaterialization(
     _ materializationID: CollectionMaterializationID
   ) async throws {
+    staleMarks.removeValue(forKey: materializationID)
     guard let demand = demandByMaterialization[materializationID] else {
       return
     }
@@ -274,6 +337,19 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     of current: CollectionSourceVersion, and received: CollectionSourceVersion
   ) -> CollectionSourceVersion {
     received.order >= current.order ? received : current
+  }
+
+  private func markOtherHolders(
+    of rowKey: Key, dropping materializationID: CollectionMaterializationID,
+    domain: Domain, at position: CollectionSourceVersion,
+    marks: inout [CollectionMaterializationID: CollectionSourceVersion]
+  ) {
+    for (demand, record) in recordsByDemand
+    where record.id != materializationID && self.domain(for: demand) == domain
+      && claims[record.id]?.contains(rowKey) == true
+    {
+      marks[record.id] = marks[record.id].map { later(of: $0, and: position) } ?? position
+    }
   }
 
   private func isClaimed(

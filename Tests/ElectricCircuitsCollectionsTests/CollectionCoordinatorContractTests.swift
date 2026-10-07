@@ -175,6 +175,20 @@ private actor LiveApplyFailingStore: CollectionStore {
     try await base.materialization(for: demand)
   }
 
+  func staleMaterializations() async throws
+    -> [(
+      record: CollectionMaterializationRecord, markedAt: CollectionSourceVersion, claimCount: Int
+    )]
+  {
+    try await base.staleMaterializations()
+  }
+
+  func clearStale(
+    _ materializationID: CollectionMaterializationID, ifMarkedAt position: CollectionSourceVersion
+  ) async throws {
+    try await base.clearStale(materializationID, ifMarkedAt: position)
+  }
+
   func replaceSnapshot(
     _ snapshot: CollectionSnapshot<CoordinatorIssue>,
     materializationID: CollectionMaterializationID,
@@ -220,6 +234,20 @@ private actor EvictionGateStore: CollectionStore {
     -> CollectionMaterializationRecord?
   {
     try await base.materialization(for: demand)
+  }
+
+  func staleMaterializations() async throws
+    -> [(
+      record: CollectionMaterializationRecord, markedAt: CollectionSourceVersion, claimCount: Int
+    )]
+  {
+    try await base.staleMaterializations()
+  }
+
+  func clearStale(
+    _ materializationID: CollectionMaterializationID, ifMarkedAt position: CollectionSourceVersion
+  ) async throws {
+    try await base.clearStale(materializationID, ifMarkedAt: position)
   }
 
   func replaceSnapshot(
