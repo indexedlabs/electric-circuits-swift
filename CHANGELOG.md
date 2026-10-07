@@ -7,8 +7,9 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 
 - Add `CollectionCoordinator.drainStaleRevalidation()` to pause background admission and await
   admitted work through release without cancelling long snapshots or closing foreground leases.
-  Refused releases retain ownership and their slot until cleanup succeeds. Lifecycle cancellation
-  still wins, and admission resumes only when the app explicitly opens the gate.
+  Refused releases retain ownership and their slot while draining. Lifecycle closure cancels
+  cleanup backoff and retains authority for reopening; retirement makes one final best-effort
+  release instead of retrying forever. Admission resumes only when the app opens the gate.
 - Add optional `CollectionDefinition.subscriptionKindForDemand` for fixed per-demand revalidation
   labels, evaluated against the original stored identity with the static kind as fallback.
   This minor release preserves source compatibility and the existing store protocol.

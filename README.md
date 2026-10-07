@@ -46,8 +46,10 @@ For app-wide scheduling across collections, await `drainStaleRevalidation()` bef
 next collection's gate or starting an explicit repair read. Drain closes admission and lets
 admitted snapshots finish through lease release, including retrying a refused release. It does
 not wait for ordinary request-retry timers or release screen-held leases. Admission stays closed
-until `setStaleRevalidationGate(isOpen: true)`; lifecycle gate closure and task retirement still
-cancel in-flight snapshots. The app owns the global budget across coordinators.
+until `setStaleRevalidationGate(isOpen: true)`. Lifecycle gate closure and task retirement take
+precedence over drain: they cancel snapshots and release-retry backoff. Closure retains refused
+release authority for reopening; retirement makes one final best-effort release without an
+endless DELETE retry loop. The app owns the global budget across coordinators.
 
 A definition can supply `subscriptionKindForDemand` to classify each original stored demand
 into a fixed, content-free label such as `push_read` or `thread`. The classifier takes precedence

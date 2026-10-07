@@ -425,17 +425,7 @@ private struct StaleFixture: Sendable {
   func stopPass(_ task: Task<Void, Never>) async {
     task.cancel()
     await source.finish()
-    // Release cleanup deliberately outlives cancellation. Unblock its injected-clock sleeps
-    // during fixture teardown as well, including when a failed assertion ends the test early.
-    let wakeCleanup = Task {
-      while !Task.isCancelled {
-        await clock.advance()
-        await Task.yield()
-      }
-    }
     await task.value
-    wakeCleanup.cancel()
-    await wakeCleanup.value
   }
 
   func expectSpans(_ outcomes: [String], released: [String], returned: [String]) async throws {
@@ -669,10 +659,11 @@ struct CollectionCoordinatorStalePassTests {
     await f.telemetry.shutdown()
   }
 
-  @Test func lifecycleCancellationDoesNotAbandonRefusedReleaseDuringDrain() async throws {
+  @Test func lifecycleClosureStopsRefusedReleaseRetriesAndReopenUsesRetainedAuthority() async throws
+  {
     let f = StaleFixture()
     try await f.mark()
-    await f.source.failStops(1)
+    await f.source.failStops(Int.max)
     try await f.withPass {
       try #require(
         try await f.eventually(advancingClock: false) { await f.source.requests.count == 1 })
@@ -681,25 +672,74 @@ struct CollectionCoordinatorStalePassTests {
         try await f.eventually(advancingClock: false) {
           await f.clock.pendingDelays.contains(.milliseconds(250))
         })
-      let completed = StaleCompletion()
-      let drain = Task {
-        await f.coordinator.drainStaleRevalidation()
-        await completed.finish()
-      }
-      // Close synchronously to establish cancellation before advancing release-retry time.
-      let cancelled = await f.coordinator.closeStaleRevalidationGate()
-      #expect(await completed.finished == false)
-      #expect(await f.source.stopped.isEmpty)
-      await f.clock.advance(by: .milliseconds(250))
-      for task in cancelled { await task.value }
+      let drain = Task { await f.coordinator.drainStaleRevalidation() }
+      try #require(
+        try await f.eventually(advancingClock: false) {
+          await f.clock.pendingDelays == [.milliseconds(250)]
+        })
+      // No clock advance, stop-success override or source.finish can unblock either call.
+      await f.coordinator.setStaleRevalidationGate(isOpen: false)
       await drain.value
-      #expect(await f.source.stopped == [0])
+      #expect(await f.source.stopAttempts == [0])
+      #expect(await f.source.stopped.isEmpty)
       #expect(await f.store.clears.isEmpty)
       #expect(try await f.marks().count == 1)
-      #expect(await f.source.requests.count == 1)
-      // Cancellation wins: cleanup must not schedule another acquisition or reopen admission.
-      #expect(await f.clock.pendingDelays.contains(.milliseconds(250)) == false)
+      #expect(await f.clock.pendingDelays.isEmpty)
+      await f.clock.advance(by: .seconds(60))
+      #expect(await f.source.stopAttempts == [0])
+      // This generation is still alive. Reopening must release the old authority before
+      // acquiring a replacement, rather than forgetting the refused lease on gate closure.
+      await f.source.failStops(0)
+      await f.coordinator.setStaleRevalidationGate(isOpen: true)
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 2 })
+      #expect(await f.source.stopped == [0])
+      #expect(await f.source.stopAttempts == [0, 0])
+      await f.source.succeed(1)
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.store.clears.count == 1 })
+      #expect(await f.source.stopped == [0, 1])
     }
+  }
+
+  @Test func accountRetirementStopsPermanentReleaseRefusalAfterOneFinalAttempt() async throws {
+    let f = StaleFixture()
+    try await f.mark()
+    await f.source.failStops(Int.max)
+    await f.coordinator.setStaleRevalidationGate(isOpen: true)
+    let pass = Task { await f.coordinator.startStaleRevalidation(clock: f.clock) }
+    do {
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 1 })
+      await f.source.succeed(0)
+      try #require(
+        try await f.eventually(advancingClock: false) {
+          await f.clock.pendingDelays.contains(.milliseconds(250))
+        })
+      let drain = Task { await f.coordinator.drainStaleRevalidation() }
+      try #require(
+        try await f.eventually(advancingClock: false) {
+          await f.clock.pendingDelays == [.milliseconds(250)]
+        })
+      pass.cancel()
+      // Await retirement with DELETE still permanently refused, without driving fake time.
+      await pass.value
+      await drain.value
+      #expect(await f.source.stopAttempts == [0, 0])
+      #expect(await f.source.stopped.isEmpty)
+      #expect(await f.store.clears.isEmpty)
+      #expect(try await f.marks().count == 1)
+      #expect(await f.clock.pendingDelays.isEmpty)
+      await f.clock.advance(by: .seconds(60))
+      #expect(await f.source.stopAttempts == [0, 0])
+    } catch {
+      await f.stopPass(pass)
+      await f.telemetry.shutdown()
+      throw error
+    }
+    // Fixture cleanup is strictly after the retirement assertions above.
+    await f.source.finish()
+    await f.telemetry.shutdown()
   }
 
   @Test func drainingSharedRerunLeavesScreenLeaseLive() async throws {
