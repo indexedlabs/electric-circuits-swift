@@ -220,11 +220,25 @@ wire contract, public API, and provider-schema release rules are explicit in
 [Policies/SUPPORT.md](Policies/SUPPORT.md) and [Policies/SEMVER.md](Policies/SEMVER.md). The DocC
 catalog begins at `ElectricCircuitsSwift` in Xcode's documentation viewer.
 
-## Install 0.3.0
+## Install 0.4.0
+
+Custom `CollectionStore` providers must implement `staleMaterializations()` and
+`clearStale(_:ifMarkedAt:)`. A snapshot omission or feed delete of a held row releases only that
+request's claim and atomically marks every other materialization still holding the row. Marks
+advance with later drops and survive snapshots and feed applications; only a matching conditional
+clear or removal of the materialization clears them. The store does not re-run stale requests.
+
+Add the `ElectricCircuitsCollectionsTesting` product to a provider's test target to run the shared
+`CollectionStoreStaleMarkTests` cases. Supply a fresh store factory, a collection definition and
+scope, a row factory with distinct keys, and callbacks to inspect stored keys and claims and seed a
+claim without a materialization. Call each case from its own `@Test` function, as in
+[`CollectionStoreStaleMarkContractTests`](Tests/ElectricCircuitsCollectionsTests/CollectionStoreStaleMarkContractTests.swift).
+The test-support product uses Swift Testing; the two production libraries keep their existing
+dependencies.
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.3.0"),
+  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.4.0"),
 ]
 ```
 

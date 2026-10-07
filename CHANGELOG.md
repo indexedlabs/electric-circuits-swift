@@ -3,7 +3,15 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
-## Unreleased
+## 0.4.0
+
+- Breaking: custom `CollectionStore` implementations must implement `staleMaterializations()`
+  and `clearStale(_:ifMarkedAt:)`, and atomically mark every other materialized holder when a
+  snapshot omission or feed delete releases a held row. Marks advance with later drops and clear
+  only conditionally or when their materialization is removed. `InMemoryCollectionStore`
+  implements the contract; stale subscriptions are not re-run yet.
+- Add `ElectricCircuitsCollectionsTesting`, a shared stale-mark contract suite that accepts a
+  store factory and provider-specific fixture callbacks for in-memory and durable stores.
 
 - Retain an in-flight shape create until shutdown captures its result when `stop()` races with
   creation. This prevents a landed claim from losing its release request and hanging cancellation.
