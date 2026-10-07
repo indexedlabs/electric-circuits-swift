@@ -1,3 +1,4 @@
+import ElectricCircuitsSwift
 import Foundation
 
 public enum CollectionLoadFailure: Equatable, Sendable {
@@ -135,6 +136,32 @@ public actor CollectionCoordinator<
     self.scope = scope
     self.source = source
     self.store = store
+  }
+
+  /// Runs the stale pass for this collection and scope until the calling task is cancelled.
+  /// The app owns that task and cancels and awaits it when retiring a scope or generation.
+  /// The gate starts closed; the app opens it after first paint while foreground and online.
+  /// At most two unheld demands are re-run concurrently, smallest claim count first.
+  ///
+  /// Each run emits `sync.revalidate`: `electric.table` (the definition ID),
+  /// `sync.subscription_kind`, `sync.outcome`, `sync.rows_returned`,
+  /// `sync.claims_released`, `sync.seconds_since_mark`, and `sync.duration_seconds`.
+  /// Seconds since the mark measures monotonic elapsed time since this coordinator first
+  /// listed that mark in this process, not elapsed time since the store wrote it.
+  /// Claims released is the net decrease in the materialization's claims: for `refreshed`,
+  /// max(0, claimCount read with the mark before the run - rows the snapshot returned).
+  /// A run that both drops and gains rows reports only the net. For `unrebuildable`, it is
+  /// the claimCount read with the mark; for `held` and `failed`, it is zero.
+  public func startStaleRevalidation(
+    clock: any ShapeSubscriptionClock = ContinuousShapeSubscriptionClock(),
+    telemetry: TelemetryReporter = .noop
+  ) async {
+    // Tests-first stub: the pass is implemented after the orchestrator's red test run.
+  }
+
+  /// Updates the app's foreground/online/first-paint gate. No runs proceed while it is closed.
+  public func setStaleRevalidationGate(isOpen: Bool) async {
+    // Tests-first stub.
   }
 
   public func acquire(_ demand: CollectionDemand<Model>) -> CollectionLease {
