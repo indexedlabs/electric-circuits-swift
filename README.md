@@ -34,8 +34,26 @@ The gate starts closed: call `setStaleRevalidationGate(isOpen:)` after first pai
 only while foreground and online. The pass shares ordinary leases, re-runs at most two unheld
 subscriptions at a time (smallest first), and retries failures with capped backoff. Held leases,
 including leases retained by the app's warm pool, clear without another request. A missing
-rebuilder or a nil result removes the stale materialization. Cancel and await the task when
-retiring its scope or generation. The store protocol is unchanged in 0.5.0.
+rebuilder, a nil result, or a rebuilt demand with a different normalized identity removes the
+stale materialization. Earlier-launch marks in the same principal and authorization are rebuilt
+in the current generation; after successful replacement, the old materialization is removed so
+its claims cannot retain stale rows. Other principals and authorization scopes are excluded.
+Idle listings run every five seconds; opening the gate, local snapshot/feed writes, completed
+runs and retry expiry wake the pass immediately. Cancel and await the task when
+retiring its scope or generation. The store protocol is unchanged in 0.6.0.
+
+For app-wide scheduling across collections, await `drainStaleRevalidation()` before opening the
+next collection's gate or starting an explicit repair read. Drain closes admission and lets
+admitted snapshots finish through lease release, including retrying a refused release. It does
+not wait for ordinary request-retry timers or release screen-held leases. Admission stays closed
+until `setStaleRevalidationGate(isOpen: true)`. Lifecycle gate closure and task retirement take
+precedence over drain: they cancel snapshots and release-retry backoff. Closure retains refused
+release authority for reopening; retirement makes one final best-effort release without an
+endless DELETE retry loop. The app owns the global budget across coordinators.
+
+A definition can supply `subscriptionKindForDemand` to classify each original stored demand
+into a fixed, content-free label such as `push_read` or `thread`. The classifier takes precedence
+over the static `subscriptionKind`; the attribute is omitted when neither is configured.
 
 Each `CollectionChange` carries its own `CollectionSourceVersion`; a `CollectionChangeBatch`
 `sourceVersion` is only the batch high-water mark and cursor record. Custom collection stores must
@@ -229,7 +247,7 @@ wire contract, public API, and provider-schema release rules are explicit in
 [Policies/SUPPORT.md](Policies/SUPPORT.md) and [Policies/SEMVER.md](Policies/SEMVER.md). The DocC
 catalog begins at `ElectricCircuitsSwift` in Xcode's documentation viewer.
 
-## Install 0.5.0
+## Install 0.6.0
 
 Custom `CollectionStore` providers must implement `staleMaterializations()` and
 `clearStale(_:ifMarkedAt:)`. A snapshot omission or feed delete of a held row releases only that
@@ -247,7 +265,7 @@ dependencies.
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.5.0"),
+  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.6.0"),
 ]
 ```
 

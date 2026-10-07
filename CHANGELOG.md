@@ -3,6 +3,25 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
+## 0.6.0
+
+- Add `CollectionCoordinator.drainStaleRevalidation()` to pause background admission and await
+  admitted work through release without cancelling long snapshots or closing foreground leases.
+  Refused releases retain ownership and their slot while draining. Lifecycle closure cancels
+  cleanup backoff and retains authority for reopening; retirement makes one final best-effort
+  release instead of retrying forever. Admission resumes only when the app opens the gate.
+- Add optional `CollectionDefinition.subscriptionKindForDemand` for fixed per-demand revalidation
+  labels, evaluated against the original stored identity with the static kind as fallback.
+  This minor release preserves source compatibility and the existing store protocol.
+- Fix stale revalidation accepting mismatched rebuilt identities (OTTO-6318). Mismatches now
+  remove the stored materialization as unrebuildable instead of permanently occupying a slot.
+- Preserve a screen's shared request when it joins during stale-pass gate closure (OTTO-6319).
+  Attempt cancellation and restart remain owned by the ordinary final-release lifecycle.
+- Poll idle stale listings every five seconds, with immediate wakes for gate opening, local
+  writes, completed runs and retry expiry, retaining bounded failure backoff (OTTO-6320).
+- Discover earlier-launch marks for the same principal and authorization. Rebuild under the
+  current generation and retire the old materialization after success, releasing old row claims.
+
 ## 0.5.0
 
 - Add an app-gated stale revalidation pass to `CollectionCoordinator`. It re-runs at most two
