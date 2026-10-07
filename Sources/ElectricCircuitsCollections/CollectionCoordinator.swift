@@ -1,3 +1,4 @@
+import ElectricCircuitsSwift
 import Foundation
 
 public enum CollectionLoadFailure: Equatable, Sendable {
@@ -23,7 +24,7 @@ public enum CollectionEvictionError: Error, Equatable, Sendable {
 public actor CollectionLease {
   public nonisolated let stateUpdates: AsyncStream<CollectionLoadState>
 
-  private let id: UUID
+  fileprivate nonisolated let id: UUID
   private let stateAction: @Sendable (UUID) async -> CollectionLoadState
   private let refreshAction: @Sendable (UUID) async -> Void
   private let releaseAction: @Sendable (UUID) async throws -> Void
@@ -115,6 +116,7 @@ public actor CollectionCoordinator<
     var releaseToken: UUID?
     var releaseTask: Task<Void, Error>?
     var awaitsEviction: Bool
+    var snapshotRowCount: Int?
   }
 
   private let definition: CollectionDefinition<Model, Key>
@@ -124,6 +126,22 @@ public actor CollectionCoordinator<
   private var entries: [CollectionDemandIdentity: Entry] = [:]
   private var demandByLease: [UUID: CollectionDemandIdentity] = [:]
   private var evictionTasks: [CollectionDemandIdentity: Task<Void, Error>] = [:]
+
+  private struct StaleObservation {
+    let position: CollectionSourceVersion
+    let firstSeen: ContinuousClock.Instant
+  }
+
+  private var staleGateOpen = false
+  private var stalePassToken: UUID?
+  private var stalePassStopping = false
+  private var staleRuns: [CollectionMaterializationID: Task<Void, Never>] = [:]
+  private var staleRetries: [CollectionMaterializationID: Task<Void, Never>] = [:]
+  private var staleFailures: [CollectionMaterializationID: Int] = [:]
+  private var staleObservations: [CollectionMaterializationID: StaleObservation] = [:]
+  // Keep release authority after a refused release without retaining a lease actor that captures
+  // this coordinator. These IDs are excluded when deciding whether a screen holds the demand.
+  private var staleLeaseIDs: [CollectionMaterializationID: UUID] = [:]
 
   public init(
     definition: CollectionDefinition<Model, Key>,
@@ -135,6 +153,246 @@ public actor CollectionCoordinator<
     self.scope = scope
     self.source = source
     self.store = store
+  }
+
+  /// Runs the stale pass for this collection and scope until the calling task is cancelled.
+  /// The app owns that task and cancels and awaits it when retiring a scope or generation.
+  /// The gate starts closed; the app opens it after first paint while foreground and online.
+  /// At most two unheld demands are re-run concurrently, smallest claim count first.
+  ///
+  /// Each run emits `sync.revalidate`: `electric.table` (the definition ID),
+  /// `sync.subscription_kind`, `sync.outcome`, `sync.rows_returned`,
+  /// `sync.claims_released`, `sync.seconds_since_mark`, and `sync.duration_seconds`.
+  /// Seconds since the mark measures monotonic elapsed time since this coordinator first
+  /// listed that mark in this process, not elapsed time since the store wrote it.
+  /// Claims released is the net decrease in the materialization's claims: for `refreshed`,
+  /// max(0, claimCount read with the mark before the run - rows the snapshot returned).
+  /// A run that both drops and gains rows reports only the net. For `unrebuildable`, it is
+  /// the claimCount read with the mark; for `held` and `failed`, it is zero.
+  public func startStaleRevalidation(
+    clock: any ShapeSubscriptionClock = ContinuousShapeSubscriptionClock(),
+    telemetry: TelemetryReporter = .noop
+  ) async {
+    // One app-owned loop per coordinator, even if a second caller tries to start it.
+    guard stalePassToken == nil, !Task.isCancelled else { return }
+    let token = UUID()
+    stalePassToken = token
+    stalePassStopping = false
+    await withTaskCancellationHandler {
+      var listingFailures = 0
+      while !Task.isCancelled && stalePassToken == token && !stalePassStopping {
+        var delay = Duration.milliseconds(250)
+        if staleGateOpen {
+          do {
+            try await scheduleStaleRuns(token: token, clock: clock, telemetry: telemetry)
+            listingFailures = 0
+          } catch is CancellationError {
+            break
+          } catch {
+            listingFailures = min(listingFailures + 1, 64)
+            delay = ShapeSubscriptionRetryPolicy(jitterRatio: 0).delay(forRetry: listingFailures)
+          }
+        }
+        do {
+          try await clock.sleep(for: delay)
+        } catch {
+          break
+        }
+      }
+      cancelStalePass(token)
+      let pending = Array(staleRuns.values) + Array(staleRetries.values)
+      for task in pending { await task.value }
+      // A release failure may have left an owned lease between attempts. Retirement still
+      // attempts its release, but never clears its durable mark or starts another request.
+      for id in Array(staleLeaseIDs.keys) {
+        try? await releaseStaleLease(id)
+      }
+      if stalePassToken == token {
+        stalePassToken = nil
+        stalePassStopping = false
+      }
+    } onCancel: {
+      Task { await self.cancelStalePass(token) }
+    }
+  }
+
+  /// Updates the app's foreground/online/first-paint gate. No runs proceed while it is closed.
+  public func setStaleRevalidationGate(isOpen: Bool) async {
+    staleGateOpen = isOpen
+    guard !isOpen else { return }
+    let running = Array(staleRuns.values)
+    for task in running { task.cancel() }
+    cancelUnsharedStaleAttempts()
+    for task in running { await task.value }
+  }
+
+  private func stalePassMayRun(_ token: UUID) -> Bool {
+    stalePassToken == token && !stalePassStopping && staleGateOpen && !Task.isCancelled
+  }
+
+  private func cancelStalePass(_ token: UUID) {
+    guard stalePassToken == token else { return }
+    stalePassStopping = true
+    for task in staleRuns.values { task.cancel() }
+    for task in staleRetries.values { task.cancel() }
+    cancelUnsharedStaleAttempts()
+  }
+
+  private func cancelUnsharedStaleAttempts() {
+    for leaseID in staleLeaseIDs.values {
+      guard let identity = demandByLease[leaseID], let entry = entries[identity],
+        entry.leases.count == 1, entry.leases[leaseID] != nil
+      else { continue }
+      entry.task?.cancel()
+    }
+  }
+
+  private func scheduleStaleRuns(
+    token: UUID, clock: any ShapeSubscriptionClock, telemetry: TelemetryReporter
+  ) async throws {
+    // A job can finish while the store is listing. Do not re-admit its old list entry after
+    // completion removes it from staleRuns; the next listing will see its conditional clear.
+    let occupiedAtRead = Set(staleRuns.keys).union(staleRetries.keys)
+    let marks = try await store.staleMaterializations().filter {
+      $0.record.demand.collection == definition.id && $0.record.demand.scope == scope
+    }
+    guard stalePassMayRun(token) else { return }
+    let markedIDs = Set(marks.map { $0.record.id })
+    staleObservations = staleObservations.filter { markedIDs.contains($0.key) }
+    staleFailures = staleFailures.filter { markedIDs.contains($0.key) }
+    for mark in marks {
+      let id = mark.record.id
+      if staleObservations[id]?.position != mark.markedAt {
+        staleObservations[id] = .init(position: mark.markedAt, firstSeen: ContinuousClock.now)
+      }
+    }
+    for mark in marks.sorted(by: { $0.claimCount < $1.claimCount }) {
+      guard staleRuns.count < 2 else { break }
+      let id = mark.record.id
+      guard !occupiedAtRead.contains(id), staleRuns[id] == nil, staleRetries[id] == nil,
+        evictionTasks[mark.record.demand] == nil, let observation = staleObservations[id]
+      else { continue }
+      staleRuns[id] = Task {
+        await self.revalidate(
+          mark, firstSeen: observation.firstSeen, token: token,
+          clock: clock, telemetry: telemetry)
+      }
+    }
+  }
+
+  private func releaseStaleLease(_ id: CollectionMaterializationID) async throws {
+    guard let leaseID = staleLeaseIDs[id] else { return }
+    try await release(leaseID: leaseID)
+    if staleLeaseIDs[id] == leaseID { staleLeaseIDs.removeValue(forKey: id) }
+  }
+
+  private struct StaleSnapshotFailure: Error {}
+
+  private func staleSnapshotRowCount(
+    for lease: CollectionLease, identity: CollectionDemandIdentity
+  ) async throws -> Int {
+    for await state in lease.stateUpdates {
+      try Task.checkCancellation()
+      switch state {
+      case .live, .cached:
+        // Initial cached readiness is not the new snapshot. The count is set only after
+        // replaceSnapshot commits, and before that attempt publishes live readiness.
+        if let count = entries[identity]?.snapshotRowCount { return count }
+      case .failed:
+        throw StaleSnapshotFailure()
+      case .unavailable, .refreshing:
+        continue
+      }
+    }
+    try Task.checkCancellation()
+    throw StaleSnapshotFailure()
+  }
+
+  private func revalidate(
+    _ mark: CollectionStaleMaterialization, firstSeen: ContinuousClock.Instant,
+    token: UUID, clock: any ShapeSubscriptionClock, telemetry: TelemetryReporter
+  ) async {
+    let id = mark.record.id
+    defer { staleRuns.removeValue(forKey: id) }
+    guard stalePassMayRun(token) else { return }
+    let started = ContinuousClock.now
+    let span = telemetry.beginSpan(name: "sync.revalidate", kind: .internalSpan)
+    var outcome = "failed"
+    var rowsReturned = 0
+    var claimsReleased = 0
+    var attemptedRelease = false
+    defer {
+      var attributes = [
+        "electric.table": definition.id.rawValue,
+        "sync.outcome": outcome,
+        "sync.rows_returned": String(rowsReturned),
+        "sync.claims_released": String(claimsReleased),
+        "sync.seconds_since_mark": String(staleSeconds(firstSeen.duration(to: started))),
+        "sync.duration_seconds": String(staleSeconds(started.duration(to: ContinuousClock.now))),
+      ]
+      if let kind = definition.subscriptionKind { attributes["sync.subscription_kind"] = kind }
+      telemetry.endSpan(span, attributes: attributes)
+    }
+    do {
+      // Retry a refused release with the same authority before attempting a new acquisition.
+      if staleLeaseIDs[id] != nil {
+        attemptedRelease = true
+        try await releaseStaleLease(id)
+        attemptedRelease = false
+      }
+      guard stalePassMayRun(token) else { throw CancellationError() }
+      let identity = mark.record.demand
+      if let entry = entries[identity], !entry.leases.isEmpty {
+        try await store.clearStale(id, ifMarkedAt: mark.markedAt)
+        outcome = "held"
+      } else if let demand = definition.rebuildDemand?(identity) {
+        let lease = acquire(demand)
+        staleLeaseIDs[id] = lease.id
+        rowsReturned = try await staleSnapshotRowCount(for: lease, identity: identity)
+        guard stalePassMayRun(token) else { throw CancellationError() }
+        attemptedRelease = true
+        try await lease.release()
+        staleLeaseIDs.removeValue(forKey: id)
+        guard stalePassMayRun(token) else { throw CancellationError() }
+        try await store.clearStale(id, ifMarkedAt: mark.markedAt)
+        outcome = "refreshed"
+        claimsReleased = max(0, mark.claimCount - rowsReturned)
+      } else {
+        // Use the existing eviction fence so an acquire arriving during removal waits for it.
+        let removal: Task<Void, Error>
+        if let existing = evictionTasks[identity] {
+          removal = existing
+        } else {
+          removal = Task { try await self.performEviction(identity) }
+          evictionTasks[identity] = removal
+        }
+        try await removal.value
+        outcome = "unrebuildable"
+        claimsReleased = mark.claimCount
+      }
+      staleFailures.removeValue(forKey: id)
+    } catch {
+      if !attemptedRelease {
+        // Do not lose a lease after source/snapshot failure. If this release also fails, retain
+        // its ID for the next backoff attempt rather than treating our own entry as held.
+        try? await releaseStaleLease(id)
+      }
+      guard stalePassMayRun(token) else { return }
+      let failures = min((staleFailures[id] ?? 0) + 1, 64)
+      staleFailures[id] = failures
+      let delay = ShapeSubscriptionRetryPolicy(jitterRatio: 0).delay(forRetry: failures)
+      staleRetries[id] = Task {
+        defer { self.staleRetries.removeValue(forKey: id) }
+        // Backoff occupies no request slot. Failures have no attempt limit; marks survive
+        // process restart, while the process-local backoff starts afresh after restart.
+        try? await clock.sleep(for: delay)
+      }
+    }
+  }
+
+  private func staleSeconds(_ duration: Duration) -> Double {
+    let components = duration.components
+    return max(0, Double(components.seconds) + Double(components.attoseconds) / 1e18)
   }
 
   public func acquire(_ demand: CollectionDemand<Model>) -> CollectionLease {
@@ -174,7 +432,8 @@ public actor CollectionCoordinator<
         refreshTask: nil,
         releaseToken: nil,
         releaseTask: nil,
-        awaitsEviction: evictionTasks[identity] != nil
+        awaitsEviction: evictionTasks[identity] != nil,
+        snapshotRowCount: nil
       )
       updates.continuation.yield(.unavailable)
       if evictionTasks[identity] == nil {
@@ -217,6 +476,7 @@ public actor CollectionCoordinator<
       await self.run(identity: identity, attempt: attempt)
     }
     entry.task = task
+    entry.snapshotRowCount = nil
     entries[identity] = entry
   }
 
@@ -284,6 +544,14 @@ public actor CollectionCoordinator<
       return
     }
 
+    guard var snapshotted = entries[identity], snapshotted.attempt == attempt,
+      !Task.isCancelled
+    else {
+      _ = await cleanup(stop, identity: identity, attempt: attempt)
+      return
+    }
+    snapshotted.snapshotRowCount = session.snapshot.rows.count
+    entries[identity] = snapshotted
     guard updateEntry(identity: identity, attempt: attempt, state: .live) else {
       _ = await cleanup(stop, identity: identity, attempt: attempt)
       return

@@ -126,10 +126,21 @@ public struct CollectionDemand<Model: Sendable>: Sendable {
 public struct CollectionDefinition<Model: Sendable, Key: Hashable & Sendable>: Sendable {
   public let id: CollectionID
   public let key: @Sendable (Model) -> Key
+  /// A fixed, content-free subscription-kind label for revalidation telemetry.
+  public let subscriptionKind: String?
+  /// Rebuilds a stored demand, or returns nil when its identity is no longer understood.
+  public let rebuildDemand: (@Sendable (CollectionDemandIdentity) -> CollectionDemand<Model>?)?
 
-  public init(id: CollectionID, key: @escaping @Sendable (Model) -> Key) {
+  public init(
+    id: CollectionID,
+    subscriptionKind: String? = nil,
+    rebuildDemand: (@Sendable (CollectionDemandIdentity) -> CollectionDemand<Model>?)? = nil,
+    key: @escaping @Sendable (Model) -> Key
+  ) {
     self.id = id
     self.key = key
+    self.subscriptionKind = subscriptionKind
+    self.rebuildDemand = rebuildDemand
   }
 }
 
