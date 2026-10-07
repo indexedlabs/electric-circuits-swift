@@ -42,6 +42,17 @@ Idle listings run every five seconds; opening the gate, local snapshot/feed writ
 runs and retry expiry wake the pass immediately. Cancel and await the task when
 retiring its scope or generation. The store protocol is unchanged in 0.5.0.
 
+For app-wide scheduling across collections, await `drainStaleRevalidation()` before opening the
+next collection's gate or starting an explicit repair read. Drain closes admission and lets
+admitted snapshots finish through lease release, including retrying a refused release. It does
+not wait for ordinary request-retry timers or release screen-held leases. Admission stays closed
+until `setStaleRevalidationGate(isOpen: true)`; lifecycle gate closure and task retirement still
+cancel in-flight snapshots. The app owns the global budget across coordinators.
+
+A definition can supply `subscriptionKindForDemand` to classify each original stored demand
+into a fixed, content-free label such as `push_read` or `thread`. The classifier takes precedence
+over the static `subscriptionKind`; the attribute is omitted when neither is configured.
+
 Each `CollectionChange` carries its own `CollectionSourceVersion`; a `CollectionChangeBatch`
 `sourceVersion` is only the batch high-water mark and cursor record. Custom collection stores must
 persist versioned upserts and tombstones per change so a lower-LSN sibling in a coalesced batch

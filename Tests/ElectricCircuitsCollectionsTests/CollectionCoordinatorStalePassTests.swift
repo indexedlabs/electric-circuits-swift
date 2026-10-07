@@ -23,6 +23,19 @@ private actor StaleSource: CollectionSourceAdapter {
   private(set) var maximumActive = 0
   private var active: Set<Int> = []
   private var holdsCancellation = false
+  private var holdsStops = false
+  private var stopWaiters: [CheckedContinuation<Void, Never>] = []
+  private var stopFailures = 0
+  private(set) var stopAttempts: [Int] = []
+
+  func holdStops() { holdsStops = true }
+  func failStops(_ count: Int) { stopFailures = count }
+  func resumeStops() {
+    holdsStops = false
+    let waiting = stopWaiters
+    stopWaiters.removeAll()
+    for continuation in waiting { continuation.resume() }
+  }
   private var cancelledSnapshots: [CheckedContinuation<CollectionSnapshot<StaleRow>, any Error>] =
     []
 
@@ -62,7 +75,7 @@ private actor StaleSource: CollectionSourceAdapter {
       run: { apply in
         for try await batch in stream.stream { try await apply(batch) }
       },
-      stop: { await self.stop(index) })
+      stop: { try await self.stop(index) })
   }
 
   func succeed(_ index: Int, rows: [Int] = [], at order: UInt64 = 100) {
@@ -89,7 +102,16 @@ private actor StaleSource: CollectionSourceAdapter {
     }
   }
 
-  private func stop(_ index: Int) {
+  private func stop(_ index: Int) async throws {
+    guard feeds[index] != nil else { return }
+    stopAttempts.append(index)
+    if stopFailures > 0 {
+      stopFailures -= 1
+      throw Failure()
+    }
+    if holdsStops {
+      await withCheckedContinuation { stopWaiters.append($0) }
+    }
     guard let feed = feeds.removeValue(forKey: index) else { return }
     active.remove(index)
     stopped.append(index)
@@ -97,10 +119,12 @@ private actor StaleSource: CollectionSourceAdapter {
   }
 
   /// Also unblocks fixtures when an assertion aborts a test before normal lease release.
-  func finish() {
+  func finish() async {
     resumeCancellation()
+    resumeStops()
+    stopFailures = 0
     for index in Array(pending.keys) { cancel(index) }
-    for index in Array(feeds.keys) { stop(index) }
+    for index in Array(feeds.keys) { try? await stop(index) }
   }
 
   private struct Failure: Error {}
@@ -284,14 +308,16 @@ private struct StaleFixture: Sendable {
 
   init(
     rebuilder: Rebuilder = .known, scope: CollectionScope = staleScope,
-    source: StaleSource = StaleSource(), store: StaleStore? = nil
+    source: StaleSource = StaleSource(), store: StaleStore? = nil,
+    collectionID: String = "items", subscriptionKind: String? = "push_read",
+    subscriptionKindForDemand: (@Sendable (CollectionDemandIdentity) -> String)? = nil
   ) {
     self.scope = scope
     self.rebuilder = rebuilder
     self.source = source
     let store = store ?? StaleStore(source: source)
     self.store = store
-    let bare = CollectionDefinition<StaleRow, Int>(id: .init(rawValue: "items"), key: \.id)
+    let bare = CollectionDefinition<StaleRow, Int>(id: .init(rawValue: collectionID), key: \.id)
     let known = Dictionary(
       uniqueKeysWithValues: ["one", "two", "three", "four", "five", "dropper", "later"].map {
         name in
@@ -326,7 +352,8 @@ private struct StaleFixture: Sendable {
     case .returnsNil: rebuild = { _ in nil }
     }
     let definition = CollectionDefinition<StaleRow, Int>(
-      id: bare.id, subscriptionKind: "push_read", rebuildDemand: rebuild, key: \.id)
+      id: bare.id, subscriptionKind: subscriptionKind,
+      subscriptionKindForDemand: subscriptionKindForDemand, rebuildDemand: rebuild, key: \.id)
     self.definition = definition
     coordinator = Coordinator(definition: definition, scope: scope, source: source, store: store)
     telemetry = TelemetryReporter(
@@ -387,16 +414,28 @@ private struct StaleFixture: Sendable {
     do {
       try await body()
     } catch {
-      task.cancel()
-      await source.finish()
-      await task.value
+      await stopPass(task)
       await telemetry.shutdown()
       throw error
     }
+    await stopPass(task)
+    await telemetry.shutdown()
+  }
+
+  func stopPass(_ task: Task<Void, Never>) async {
     task.cancel()
     await source.finish()
+    // Release cleanup deliberately outlives cancellation. Unblock its injected-clock sleeps
+    // during fixture teardown as well, including when a failed assertion ends the test early.
+    let wakeCleanup = Task {
+      while !Task.isCancelled {
+        await clock.advance()
+        await Task.yield()
+      }
+    }
     await task.value
-    await telemetry.shutdown()
+    wakeCleanup.cancel()
+    await wakeCleanup.value
   }
 
   func expectSpans(_ outcomes: [String], released: [String], returned: [String]) async throws {
@@ -421,8 +460,323 @@ private struct StaleFixture: Sendable {
   }
 }
 
+private actor StaleCompletion {
+  private(set) var finished = false
+  func finish() { finished = true }
+}
+
 @Suite("Collection coordinator stale pass", .timeLimit(.minutes(1)))
 struct CollectionCoordinatorStalePassTests {
+  @Test func drainingLongSnapshotPausesAdmissionWithoutCancelling() async throws {
+    let f = StaleFixture()
+    for (index, owner) in ["one", "two", "three"].enumerated() {
+      try await f.seed(owner, rows: Array(1...(index + 1)).map { $0 + index * 10 })
+    }
+    try await f.seed("dropper", rows: [1, 11, 12, 21, 22, 23])
+    try await f.seed("dropper", rows: [], at: 10)
+    try await f.withPass {
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 2 })
+      try #require(
+        try await f.eventually(advancingClock: false) {
+          await f.clock.pendingDelays == [.seconds(5)]
+        })
+      let completed = StaleCompletion()
+      let drain = Task {
+        await f.coordinator.drainStaleRevalidation()
+        await completed.finish()
+      }
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.clock.pendingDelays.isEmpty })
+      await f.clock.advance(by: .seconds(60))
+      #expect(await f.source.cancelled.isEmpty)
+      #expect(await completed.finished == false)
+      #expect(await f.source.requests.count == 2)
+      await f.source.succeed(0)
+      await f.source.succeed(1)
+      await drain.value
+      #expect(await f.source.stopped.count == 2)
+      #expect(await f.store.clears.count == 2)
+      #expect(await f.source.requests.count == 2)
+      #expect(try await f.marks().count == 1)
+      await f.coordinator.setStaleRevalidationGate(isOpen: true)
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 3 })
+      await f.source.succeed(2)
+      try #require(try await f.eventually(advancingClock: false) { try await f.marks().isEmpty })
+    }
+  }
+
+  @Test func nextTableOpensOnlyAfterDrainFinishesLeaseRelease() async throws {
+    let source = StaleSource()
+    let first = StaleFixture(source: source)
+    let next = StaleFixture(source: source, collectionID: "next_table")
+    try await first.mark()
+    try await next.mark()
+    await source.holdStops()
+    try await first.withPass {
+      try await next.withPass(gateOpen: false) {
+        try #require(
+          try await first.eventually(advancingClock: false) { await source.requests.count == 1 })
+        let rotation = Task {
+          await first.coordinator.drainStaleRevalidation()
+          await next.coordinator.setStaleRevalidationGate(isOpen: true)
+        }
+        await source.succeed(0)
+        try #require(
+          try await first.eventually(advancingClock: false) { await source.stopAttempts == [0] })
+        #expect(await source.requests.count == 1)
+        #expect(await source.stopped.isEmpty)
+        await source.resumeStops()
+        await rotation.value
+        try #require(
+          try await next.eventually(advancingClock: false) { await source.requests.count == 2 })
+        #expect(await source.requests[1].identity.collection == next.definition.id)
+        #expect(await source.stopped == [0])
+        #expect(await source.maximumActive == 1)
+        await source.succeed(1)
+        try #require(
+          try await next.eventually(advancingClock: false) { await next.store.clears.count == 1 })
+      }
+    }
+  }
+
+  @Test func drainKeepsRefusedReleaseOwnedUntilRetryActuallyReleases() async throws {
+    let f = StaleFixture()
+    try await f.mark()
+    await f.source.failStops(2)
+    try await f.withPass {
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 1 })
+      await f.source.succeed(0)
+      try #require(
+        try await f.eventually(advancingClock: false) {
+          await f.clock.pendingDelays.contains(.milliseconds(250))
+        })
+      let completed = StaleCompletion()
+      let drain = Task {
+        await f.coordinator.drainStaleRevalidation()
+        await completed.finish()
+      }
+      try #require(
+        try await f.eventually(advancingClock: false) {
+          await f.clock.pendingDelays == [.milliseconds(250)]
+        })
+      #expect(await completed.finished == false)
+      #expect(await f.source.stopped.isEmpty)
+      await f.clock.advance(by: .milliseconds(250))
+      try #require(
+        try await f.eventually(advancingClock: false) {
+          await f.clock.pendingDelays == [.milliseconds(500)]
+        })
+      #expect(await completed.finished == false)
+      #expect(await f.source.stopAttempts == [0, 0])
+      await f.clock.advance(by: .milliseconds(500))
+      await drain.value
+      #expect(await f.source.stopped == [0])
+      #expect(await f.source.requests.count == 1)
+      #expect(await f.store.clears.isEmpty)
+      #expect(try await f.marks().count == 1)
+      // A failed run can retain an ordinary retry timer; drain does not await that timer.
+      try #require(
+        try await f.eventually(advancingClock: false) {
+          await f.clock.pendingDelays.contains(.milliseconds(250))
+        })
+    }
+  }
+
+  @Test func drainDoesNotWaitForRequestRetryTimer() async throws {
+    let f = StaleFixture()
+    try await f.mark()
+    try await f.withPass {
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 1 })
+      await f.source.fail(0)
+      try #require(
+        try await f.eventually(advancingClock: false) {
+          await f.clock.pendingDelays.contains(.milliseconds(250))
+        })
+      await f.coordinator.drainStaleRevalidation()
+      #expect(await f.source.requests.count == 1)
+      await f.clock.advance(by: .seconds(30))
+      #expect(await f.source.requests.count == 1)
+      #expect(try await f.marks().count == 1)
+      await f.coordinator.setStaleRevalidationGate(isOpen: true)
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 2 })
+      await f.source.succeed(1)
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.store.clears.count == 1 })
+    }
+  }
+
+  @Test func lifecycleClosureCancelsDrainingSnapshotAndDrainNeverReopens() async throws {
+    let f = StaleFixture()
+    try await f.mark()
+    try await f.withPass {
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 1 })
+      try #require(
+        try await f.eventually(advancingClock: false) {
+          await f.clock.pendingDelays == [.seconds(5)]
+        })
+      let drain = Task { await f.coordinator.drainStaleRevalidation() }
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.clock.pendingDelays.isEmpty })
+      await f.coordinator.setStaleRevalidationGate(isOpen: false)
+      await drain.value
+      #expect(await f.source.cancelled == [0])
+      #expect(await f.store.clears.isEmpty)
+      #expect(try await f.marks().count == 1)
+      await f.clock.advance(by: .seconds(60))
+      #expect(await f.source.requests.count == 1)
+      await f.coordinator.setStaleRevalidationGate(isOpen: true)
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 2 })
+      await f.source.succeed(1)
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.store.clears.count == 1 })
+    }
+  }
+
+  @Test func accountRetirementCancelsSnapshotDuringDrain() async throws {
+    let f = StaleFixture()
+    try await f.mark()
+    await f.coordinator.setStaleRevalidationGate(isOpen: true)
+    let pass = Task { await f.coordinator.startStaleRevalidation(clock: f.clock) }
+    do {
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 1 })
+      try #require(
+        try await f.eventually(advancingClock: false) {
+          await f.clock.pendingDelays == [.seconds(5)]
+        })
+      let drain = Task { await f.coordinator.drainStaleRevalidation() }
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.clock.pendingDelays.isEmpty })
+      pass.cancel()
+      await drain.value
+      await pass.value
+      #expect(await f.source.cancelled == [0])
+      #expect(await f.store.clears.isEmpty)
+      #expect(try await f.marks().count == 1)
+      #expect(await f.source.requests.count == 1)
+    } catch {
+      await f.stopPass(pass)
+      await f.telemetry.shutdown()
+      throw error
+    }
+    await f.telemetry.shutdown()
+  }
+
+  @Test func lifecycleCancellationDoesNotAbandonRefusedReleaseDuringDrain() async throws {
+    let f = StaleFixture()
+    try await f.mark()
+    await f.source.failStops(1)
+    try await f.withPass {
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 1 })
+      await f.source.succeed(0)
+      try #require(
+        try await f.eventually(advancingClock: false) {
+          await f.clock.pendingDelays.contains(.milliseconds(250))
+        })
+      let completed = StaleCompletion()
+      let drain = Task {
+        await f.coordinator.drainStaleRevalidation()
+        await completed.finish()
+      }
+      // Close synchronously to establish cancellation before advancing release-retry time.
+      let cancelled = await f.coordinator.closeStaleRevalidationGate()
+      #expect(await completed.finished == false)
+      #expect(await f.source.stopped.isEmpty)
+      await f.clock.advance(by: .milliseconds(250))
+      for task in cancelled { await task.value }
+      await drain.value
+      #expect(await f.source.stopped == [0])
+      #expect(await f.store.clears.isEmpty)
+      #expect(try await f.marks().count == 1)
+      #expect(await f.source.requests.count == 1)
+      // Cancellation wins: cleanup must not schedule another acquisition or reopen admission.
+      #expect(await f.clock.pendingDelays.contains(.milliseconds(250)) == false)
+    }
+  }
+
+  @Test func drainingSharedRerunLeavesScreenLeaseLive() async throws {
+    let f = StaleFixture()
+    try await f.mark()
+    try await f.withPass {
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 1 })
+      let screen = await f.coordinator.acquire(f.demand("one"))
+      let drain = Task { await f.coordinator.drainStaleRevalidation() }
+      await f.source.succeed(0)
+      await drain.value
+      #expect(await screen.state() == .live)
+      #expect(await f.source.stopped.isEmpty)
+      #expect(await f.source.requests.count == 1)
+      #expect(await f.store.clears.count == 1)
+      try await screen.release()
+      #expect(await f.source.stopped == [0])
+    }
+  }
+
+  @Test(arguments: [true, false])
+  func demandKindClassifierUsesOriginalStoredIdentity(classified: Bool) async throws {
+    let old = StaleFixture()
+    try await old.mark()
+    let expected = old.identity("one")
+    let classifier: (@Sendable (CollectionDemandIdentity) -> String)?
+    if classified {
+      classifier = { @Sendable identity in identity == expected ? "thread" : "other" }
+    } else {
+      classifier = nil
+    }
+    let f = StaleFixture(
+      scope: .init(principal: "user", authorization: "authorized", generation: "next-launch"),
+      source: old.source, store: old.store, subscriptionKind: "push_read",
+      subscriptionKindForDemand: classifier)
+    try await f.withPass {
+      try #require(
+        try await f.eventually(advancingClock: false) { await f.source.requests.count == 1 })
+      await f.source.succeed(0)
+      try #require(try await f.eventually { await f.sink.revalidations().count == 1 })
+      #expect(
+        await f.sink.revalidations().first?.attributes["sync.subscription_kind"]
+          == (classified ? "thread" : "push_read"))
+    }
+    await old.telemetry.shutdown()
+  }
+
+  @Test func classifierDistinguishesDemandsWithinOneCollection() async throws {
+    let reference = StaleFixture()
+    let thread = reference.identity("one")
+    let f = StaleFixture(
+      rebuilder: .absent, subscriptionKind: "fallback",
+      subscriptionKindForDemand: { $0 == thread ? "thread" : "discuss" })
+    try await f.seed("one", rows: [1])
+    try await f.seed("two", rows: [2])
+    try await f.seed("dropper", rows: [1, 2])
+    try await f.seed("dropper", rows: [], at: 10)
+    try await f.withPass {
+      try #require(try await f.eventually { await f.sink.revalidations().count == 2 })
+      let spans = await f.sink.revalidations()
+      #expect(
+        Set(spans.compactMap { $0.attributes["sync.subscription_kind"] }) == ["thread", "discuss"])
+      #expect(spans.allSatisfy { $0.attributes["sync.outcome"] == "unrebuildable" })
+    }
+    await reference.telemetry.shutdown()
+  }
+
+  @Test func missingKindClassifierAndStaticLabelOmitsAttribute() async throws {
+    let f = StaleFixture(rebuilder: .absent, subscriptionKind: nil)
+    try await f.mark()
+    try await f.withPass {
+      try #require(try await f.eventually { await f.sink.revalidations().count == 1 })
+      #expect(await f.sink.revalidations().first?.attributes["sync.subscription_kind"] == nil)
+    }
+  }
+
   // Keep gate closure and the screen acquire in one actor turn. This exercises the exact
   // interval before the cancelled stale run can release its lease, without scheduler luck.
   private func closeAndAcquire(

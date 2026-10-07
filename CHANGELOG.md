@@ -5,6 +5,14 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 
 ## Unreleased
 
+- Add `CollectionCoordinator.drainStaleRevalidation()` to pause background admission and await
+  admitted work through release without cancelling long snapshots or closing foreground leases.
+  Refused releases retain ownership and their slot until cleanup succeeds. Lifecycle cancellation
+  still wins, and admission resumes only when the app explicitly opens the gate.
+- Add optional `CollectionDefinition.subscriptionKindForDemand` for fixed per-demand revalidation
+  labels, evaluated against the original stored identity with the static kind as fallback.
+  These additive APIs require a minor release under the versioning policy.
+
 - Fix stale revalidation accepting mismatched rebuilt identities (OTTO-6318). Mismatches now
   remove the stored materialization as unrebuildable instead of permanently occupying a slot.
 - Preserve a screen's shared request when it joins during stale-pass gate closure (OTTO-6319).

@@ -133,6 +133,7 @@ public actor CollectionCoordinator<
   }
 
   private var staleGateOpen = false
+  private var staleAdmissionOpen = false
   private var stalePassToken: UUID?
   private var stalePassStopping = false
   private var stalePassWake: AsyncStream<Void>.Continuation?
@@ -188,7 +189,7 @@ public actor CollectionCoordinator<
       for await _ in wake.stream {
         idle?.cancel()
         guard stalePassToken == token, !stalePassStopping, !Task.isCancelled else { break }
-        guard staleGateOpen else { continue }
+        guard staleGateOpen && staleAdmissionOpen else { continue }
         do {
           try await scheduleStaleRuns(token: token, clock: clock, telemetry: telemetry)
           listingFailures = 0
@@ -202,7 +203,7 @@ public actor CollectionCoordinator<
           wake.continuation.yield(())
           continue
         }
-        guard staleGateOpen else { continue }
+        guard staleGateOpen && staleAdmissionOpen else { continue }
         // External writers have no notification seam. Poll slowly, while local writes,
         // completed runs, retry expiry and opening the gate wake this same serialized loop.
         idle = Task {
@@ -218,10 +219,10 @@ public actor CollectionCoordinator<
       cancelStalePass(token)
       let pending = Array(staleRuns.values) + Array(staleRetries.values)
       for task in pending { await task.value }
-      // A release failure may have left an owned lease between attempts. Retirement still
-      // attempts its release, but never clears its durable mark or starts another request.
+      // Retirement retains release authority until cleanup succeeds; it never clears marks
+      // or starts another acquisition to dispose of an owned lease.
       for id in Array(staleLeaseIDs.keys) {
-        try? await releaseStaleLease(id)
+        await finishStaleLeaseRelease(id, clock: clock)
       }
       if stalePassToken == token {
         stalePassToken = nil
@@ -236,8 +237,9 @@ public actor CollectionCoordinator<
   /// Updates the app's foreground/online/first-paint gate. No runs proceed while it is closed.
   public func setStaleRevalidationGate(isOpen: Bool) async {
     if isOpen {
-      if !staleGateOpen {
+      if !staleGateOpen || !staleAdmissionOpen {
         staleGateOpen = true
+        staleAdmissionOpen = true
         stalePassWake?.yield(())
       }
       return
@@ -246,11 +248,26 @@ public actor CollectionCoordinator<
     for task in running { await task.value }
   }
 
+  /// Pauses background admission and waits for already admitted work to release its leases.
+  /// Long snapshots continue, and foreground leases are never released by this operation.
+  /// Ordinary request-retry timers are not awaited. A refused lease release retains its
+  /// admitted slot and retries cleanup with capped backoff until its authority is released.
+  /// Lifecycle gate closure or pass retirement still cancels in-flight snapshots. Admission
+  /// stays closed until an explicit `setStaleRevalidationGate(isOpen: true)` call.
+  public func drainStaleRevalidation() async {
+    staleAdmissionOpen = false
+    stalePassWake?.yield(())
+    let admitted = Array(staleRuns.values)
+    for task in admitted { await task.value }
+    // No state changes here: a lifecycle close or explicit reopen during the await wins.
+  }
+
   // Keep cancellation in one actor turn, separate from awaiting release. In particular, do
   // not cancel the shared entry's attempt: final release owns cancellation and restarts an
   // attempt if a foreground lease joins during cleanup.
   func closeStaleRevalidationGate() -> [Task<Void, Never>] {
     staleGateOpen = false
+    staleAdmissionOpen = false
     stalePassWake?.yield(())
     let running = Array(staleRuns.values)
     for task in running { task.cancel() }
@@ -280,7 +297,7 @@ public actor CollectionCoordinator<
         && $0.record.demand.scope.principal == scope.principal
         && $0.record.demand.scope.authorization == scope.authorization
     }
-    guard stalePassMayRun(token) else { return }
+    guard stalePassMayRun(token), staleAdmissionOpen else { return }
     let markedIDs = Set(marks.map { $0.record.id })
     staleObservations = staleObservations.filter { markedIDs.contains($0.key) }
     staleFailures = staleFailures.filter { markedIDs.contains($0.key) }
@@ -308,6 +325,31 @@ public actor CollectionCoordinator<
     guard let leaseID = staleLeaseIDs[id] else { return }
     try await release(leaseID: leaseID)
     if staleLeaseIDs[id] == leaseID { staleLeaseIDs.removeValue(forKey: id) }
+  }
+
+  private func finishStaleLeaseRelease(
+    _ id: CollectionMaterializationID, clock: any ShapeSubscriptionClock,
+    retrying: Bool = false
+  ) async {
+    guard staleLeaseIDs[id] != nil else { return }
+    // Cancellation revokes snapshot/acquisition permission, not release authority. This
+    // uncancelled cleanup task remains part of the admitted run awaited by drain, so a
+    // refused stop cannot hand a live background request's slot to another collection.
+    let cleanup = Task {
+      var failures = retrying ? 1 : 0
+      while self.staleLeaseIDs[id] != nil {
+        if failures > 0 {
+          let delay = ShapeSubscriptionRetryPolicy(jitterRatio: 0).delay(forRetry: failures)
+          try? await clock.sleep(for: delay)
+        }
+        do {
+          try await self.releaseStaleLease(id)
+        } catch {
+          failures = min(failures + 1, 64)
+        }
+      }
+    }
+    await cleanup.value
   }
 
   private struct StaleSnapshotFailure: Error {}
@@ -357,7 +399,11 @@ public actor CollectionCoordinator<
         "sync.seconds_since_mark": String(staleSeconds(firstSeen.duration(to: started))),
         "sync.duration_seconds": String(staleSeconds(started.duration(to: ContinuousClock.now))),
       ]
-      if let kind = definition.subscriptionKind { attributes["sync.subscription_kind"] = kind }
+      if let kind = definition.subscriptionKindForDemand?(mark.record.demand)
+        ?? definition.subscriptionKind
+      {
+        attributes["sync.subscription_kind"] = kind
+      }
       telemetry.endSpan(span, attributes: attributes)
     }
     do {
@@ -408,11 +454,9 @@ public actor CollectionCoordinator<
       }
       staleFailures.removeValue(forKey: id)
     } catch {
-      if !attemptedRelease {
-        // Do not lose a lease after source/snapshot failure. If this release also fails, retain
-        // its ID for the next backoff attempt rather than treating our own entry as held.
-        try? await releaseStaleLease(id)
-      }
+      // Keep this admitted run (and drain) pending until its lease authority is released,
+      // including when lifecycle cancellation interrupts a snapshot or a stop is refused.
+      await finishStaleLeaseRelease(id, clock: clock, retrying: attemptedRelease)
       guard stalePassMayRun(token) else { return }
       let failures = min((staleFailures[id] ?? 0) + 1, 64)
       staleFailures[id] = failures

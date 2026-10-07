@@ -20,7 +20,7 @@ Each run records a `sync.revalidate` span with these scalar attributes:
 | Attribute | Meaning |
 | --- | --- |
 | `electric.table` | The collection definition's ID |
-| `sync.subscription_kind` | The definition's optional fixed kind label; omitted when absent |
+| `sync.subscription_kind` | Fixed label from `subscriptionKindForDemand` applied to the original stored identity, falling back to `subscriptionKind`; omitted if neither exists |
 | `sync.outcome` | `refreshed`, `held`, `failed`, or `unrebuildable` |
 | `sync.rows_returned` | Rows returned by the committed re-run snapshot, or zero if none landed |
 | `sync.claims_released` | The observed net claim decrease described below |
