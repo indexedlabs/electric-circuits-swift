@@ -11,10 +11,12 @@ public struct CollectionStoreStaleMarkTests<Store: CollectionStore>: Sendable {
   private let scope: CollectionScope
   private let row: @Sendable (Int) -> Store.Model
   private let storedKeys: @Sendable (Store, CollectionDemandIdentity) async throws -> Set<Store.Key>
-  private let claimedKeys: @Sendable (Store, CollectionMaterializationID) async throws -> Set<Store.Key>
-  private let seedClaim: @Sendable (
-    Store, Store.Key, CollectionMaterializationID, CollectionDemandIdentity
-  ) async throws -> Void
+  private let claimedKeys:
+    @Sendable (Store, CollectionMaterializationID) async throws -> Set<Store.Key>
+  private let seedClaim:
+    @Sendable (
+      Store, Store.Key, CollectionMaterializationID, CollectionDemandIdentity
+    ) async throws -> Void
 
   /// `row` must produce distinct keys for distinct integers. `seedClaimWithoutMaterialization`
   /// retains an existing row under the supplied owner and domain, without creating a record.
@@ -23,11 +25,14 @@ public struct CollectionStoreStaleMarkTests<Store: CollectionStore>: Sendable {
     definition: CollectionDefinition<Store.Model, Store.Key>,
     scope: CollectionScope,
     row: @escaping @Sendable (Int) -> Store.Model,
-    storedKeys: @escaping @Sendable (Store, CollectionDemandIdentity) async throws -> Set<Store.Key>,
-    claimedKeys: @escaping @Sendable (Store, CollectionMaterializationID) async throws -> Set<Store.Key>,
-    seedClaimWithoutMaterialization: @escaping @Sendable (
-      Store, Store.Key, CollectionMaterializationID, CollectionDemandIdentity
-    ) async throws -> Void
+    storedKeys:
+      @escaping @Sendable (Store, CollectionDemandIdentity) async throws -> Set<Store.Key>,
+    claimedKeys:
+      @escaping @Sendable (Store, CollectionMaterializationID) async throws -> Set<Store.Key>,
+    seedClaimWithoutMaterialization:
+      @escaping @Sendable (
+        Store, Store.Key, CollectionMaterializationID, CollectionDemandIdentity
+      ) async throws -> Void
   ) {
     self.makeStore = makeStore
     self.definition = definition
@@ -216,7 +221,8 @@ public struct CollectionStoreStaleMarkTests<Store: CollectionStore>: Sendable {
     try await snapshot(store, "push", rows: [1], at: 20)
     try await expectMarks(store, owners: ["push"], at: 10)
     try await store.apply(
-      .init(changes: [.upsert(row(2), sourceVersion: version(30))], expectedCursor: nil,
+      .init(
+        changes: [.upsert(row(2), sourceVersion: version(30))], expectedCursor: nil,
         cursor: .init(offset: "30"), sourceVersion: version(30)), to: id("push"))
     try await expectMarks(store, owners: ["push"], at: 10)
   }
@@ -241,7 +247,8 @@ public struct CollectionStoreStaleMarkTests<Store: CollectionStore>: Sendable {
     demand identity: CollectionDemandIdentity? = nil
   ) async throws {
     try await store.replaceSnapshot(
-      .init(rows: rows.map(row), fence: .init(rawValue: "snapshot-\(order)"),
+      .init(
+        rows: rows.map(row), fence: .init(rawValue: "snapshot-\(order)"),
         sourceVersion: version(order)),
       materializationID: id(owner), demand: identity ?? demand(owner))
   }
@@ -252,7 +259,8 @@ public struct CollectionStoreStaleMarkTests<Store: CollectionStore>: Sendable {
   ) async throws {
     let record = try #require(await store.materialization(for: demand(owner)))
     try await store.apply(
-      .init(changes: [.delete(key(number), sourceVersion: version(order))],
+      .init(
+        changes: [.delete(key(number), sourceVersion: version(order))],
         expectedCursor: record.cursor, cursor: .init(offset: "delete-\(order)"),
         sourceVersion: version(frontier ?? order)), to: id(owner))
   }

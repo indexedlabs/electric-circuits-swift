@@ -176,7 +176,9 @@ private actor LiveApplyFailingStore: CollectionStore {
   }
 
   func staleMaterializations() async throws
-    -> [(record: CollectionMaterializationRecord, markedAt: CollectionSourceVersion, claimCount: Int)]
+    -> [(
+      record: CollectionMaterializationRecord, markedAt: CollectionSourceVersion, claimCount: Int
+    )]
   {
     try await base.staleMaterializations()
   }
@@ -235,7 +237,9 @@ private actor EvictionGateStore: CollectionStore {
   }
 
   func staleMaterializations() async throws
-    -> [(record: CollectionMaterializationRecord, markedAt: CollectionSourceVersion, claimCount: Int)]
+    -> [(
+      record: CollectionMaterializationRecord, markedAt: CollectionSourceVersion, claimCount: Int
+    )]
   {
     try await base.staleMaterializations()
   }

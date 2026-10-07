@@ -13,7 +13,9 @@ public protocol CollectionStore<Model, Key>: Sendable {
   /// Every marked materialization, its drop position and its current number of row claims.
   /// Claims without a materialization are never marked. Results have no prescribed order.
   func staleMaterializations() async throws
-    -> [(record: CollectionMaterializationRecord, markedAt: CollectionSourceVersion, claimCount: Int)]
+    -> [(
+      record: CollectionMaterializationRecord, markedAt: CollectionSourceVersion, claimCount: Int
+    )]
 
   /// Clears only a mark still at the supplied position, preserving a later drop's mark.
   func clearStale(
@@ -99,7 +101,9 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
   }
 
   public func staleMaterializations() async throws
-    -> [(record: CollectionMaterializationRecord, markedAt: CollectionSourceVersion, claimCount: Int)]
+    -> [(
+      record: CollectionMaterializationRecord, markedAt: CollectionSourceVersion, claimCount: Int
+    )]
   {
     recordsByDemand.values.compactMap { record in
       guard let position = staleMarks[record.id] else { return nil }
