@@ -379,10 +379,10 @@ private struct StaleFixture: Sendable {
       staleSnapshot(rows, at: order), materializationID: id(owner), demand: identity(owner))
   }
 
-  func mark(_ owners: [String] = ["one"], rows: [Int] = [1]) async throws {
-    try await seed("dropper", rows: rows)
-    for owner in owners { try await seed(owner, rows: rows) }
-    try await seed("dropper", rows: [], at: 10)
+  func mark(_ owners: [String] = ["one"], rows: [Int] = [1], at order: UInt64 = 1) async throws {
+    try await seed("dropper", rows: rows, at: order)
+    for owner in owners { try await seed(owner, rows: rows, at: order) }
+    try await seed("dropper", rows: [], at: order + 9)
     let marked = try await store.base.staleMaterializations()
     #expect(Set(marked.map(\.record.id)) == Set(owners.map(id)))
   }
@@ -472,7 +472,7 @@ struct CollectionCoordinatorStalePassTests {
       await f.coordinator.setStaleRevalidationGate(isOpen: false)
       // Native-store takeover can remove these predecessor records before DELETE succeeds.
       for owner in ["one", "two"] { try await f.store.removeMaterialization(f.id(owner)) }
-      try await f.mark(["three"])
+      try await f.mark(["three"], rows: [2], at: 101)
       await f.source.failStops(0)
       await f.source.holdStops()
       let completion = StaleCompletion()
@@ -517,7 +517,7 @@ struct CollectionCoordinatorStalePassTests {
         try await f.eventually(advancingClock: false) { await f.source.stopAttempts.count == 2 })
       await f.coordinator.setStaleRevalidationGate(isOpen: false)
       for owner in ["one", "two"] { try await f.store.removeMaterialization(f.id(owner)) }
-      try await f.mark(["three"])
+      try await f.mark(["three"], rows: [2], at: 101)
       await f.coordinator.setStaleRevalidationGate(isOpen: true)
       try #require(
         try await f.eventually(advancingClock: false) {
@@ -532,12 +532,12 @@ struct CollectionCoordinatorStalePassTests {
       #expect(await f.source.maximumActive == 2)
       try #require(
         try await f.eventually(advancingClock: false) { Set(await f.source.stopped) == [0, 1] })
-      await f.source.succeed(2)
+      await f.source.succeed(2, at: 200)
       try #require(try await f.eventually(advancingClock: false) { try await f.marks().isEmpty })
     }
   }
 
-  enum CleanupInterruption: CaseIterable { case caller, lifecycle, retirement }
+  enum CleanupInterruption: CaseIterable { case caller, lifecycle, retirement, admission }
 
   @Test(arguments: CleanupInterruption.allCases)
   func interruptedCleanupOnlyHandoffNeverGrantsAdmission(_ interruption: CleanupInterruption)
@@ -566,13 +566,33 @@ struct CollectionCoordinatorStalePassTests {
       case .caller: handoff.cancel()
       case .lifecycle: await f.coordinator.setStaleRevalidationGate(isOpen: false)
       case .retirement: pass.cancel()
+      case .admission: await f.coordinator.setStaleRevalidationGate(isOpen: true)
       }
       // Permanent refusal remains in force. Cancellation must not need a fake-clock tick.
       #expect(await handoff.value == false)
       if interruption == .retirement { await pass.value }
-      #expect(await f.clock.pendingDelays.isEmpty)
+      if interruption == .admission {
+        // A superseded drain must return without cancelling the newer live gate's cleanup.
+        #expect(await f.clock.pendingDelays.contains(.milliseconds(250)))
+        try #require(
+          try await f.eventually(advancingClock: false) {
+            await f.clock.pendingDelays.contains(.seconds(5))
+          })
+        await f.source.failStops(0)
+        let resumed = Task { await f.coordinator.resumeAndDrainStaleRevalidation() }
+        try #require(
+          try await f.eventually(advancingClock: false) {
+            await f.clock.pendingDelays == [.milliseconds(250)]
+          })
+        await f.clock.advance(by: .milliseconds(250))
+        #expect(await resumed.value)
+        #expect(await f.source.stopped == [0])
+      } else {
+        try #require(
+          try await f.eventually(advancingClock: false) { await f.clock.pendingDelays.isEmpty })
+      }
       let attempts = await f.source.stopAttempts.count
-      #expect(attempts == (interruption == .retirement ? 3 : 2))
+      #expect(attempts == (interruption == .retirement || interruption == .admission ? 3 : 2))
       await f.clock.advance(by: .seconds(60))
       #expect(await f.source.stopAttempts.count == attempts)
       #expect(await f.source.requests.count == 1)

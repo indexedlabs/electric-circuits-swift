@@ -138,6 +138,7 @@ public actor CollectionCoordinator<
   private var stalePassClock: (any ShapeSubscriptionClock)?
   private var staleGateRevision = UUID()
   private var staleDrainToken: UUID?
+  private var staleDrainWaiters: [UUID: AsyncStream<Void>.Continuation] = [:]
   private var stalePassStopping = false
   private var stalePassWake: AsyncStream<Void>.Continuation?
   private var staleRuns: [CollectionMaterializationID: Task<Void, Never>] = [:]
@@ -245,6 +246,8 @@ public actor CollectionCoordinator<
       if !staleGateOpen || !staleAdmissionOpen {
         staleGateOpen = true
         staleAdmissionOpen = true
+        staleDrainToken = nil
+        wakeStaleDrains()
         stalePassWake?.yield(())
       }
       return
@@ -263,6 +266,7 @@ public actor CollectionCoordinator<
   /// `setStaleRevalidationGate(isOpen: true)` call.
   public func drainStaleRevalidation() async {
     staleAdmissionOpen = false
+    wakeStaleDrains()
     stalePassWake?.yield(())
     let admitted = Array(staleRuns.values)
     for task in admitted { await task.value }
@@ -280,7 +284,8 @@ public actor CollectionCoordinator<
   /// Returns true only after all admitted work and retained release authority are gone, with
   /// admission still closed. Returns false if lifecycle closure, pass retirement, a concurrent
   /// reopen, or caller cancellation interrupts the handoff; the caller must not admit repair work
-  /// then. Caller cancellation closes this operation's lifecycle gate and cancels retry backoff.
+  /// then. Caller cancellation closes the lifecycle gate and cancels retry backoff only while
+  /// this invocation still owns it; a superseded caller cannot close a newer operation's gate.
   /// With no pass and no retained work, returns true; retained work without a live pass returns
   /// false. This operation never starts a stale read or releases a foreground consumer's lease.
   public func resumeAndDrainStaleRevalidation() async -> Bool {
@@ -291,6 +296,7 @@ public actor CollectionCoordinator<
     staleGateRevision = revision
     staleGateOpen = true
     staleAdmissionOpen = false
+    wakeStaleDrains()
     stalePassWake?.yield(())
     defer {
       if staleDrainToken == drainToken { staleDrainToken = nil }
@@ -299,7 +305,10 @@ public actor CollectionCoordinator<
       guard let token = stalePassToken, let clock = stalePassClock else {
         return staleRuns.isEmpty && staleLeaseIDs.isEmpty && !Task.isCancelled
       }
-      return await drainRetainedStaleLeases(token: token, clock: clock, revision: revision)
+      let drained = await drainRetainedStaleLeases(token: token, clock: clock, revision: revision)
+      // AsyncStream cancellation can win before the cancellation handler reaches this actor.
+      if Task.isCancelled { cancelStaleDrain(drainToken) }
+      return drained
     } onCancel: {
       Task { await self.cancelStaleDrain(drainToken) }
     }
@@ -313,13 +322,26 @@ public actor CollectionCoordinator<
   private func drainRetainedStaleLeases(
     token: UUID, clock: any ShapeSubscriptionClock, revision: UUID
   ) async -> Bool {
-    while stalePassMayRun(token), !staleAdmissionOpen, staleGateRevision == revision {
+    let waiter = UUID()
+    let wake = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+    staleDrainWaiters[waiter] = wake.continuation
+    wake.continuation.yield(())
+    defer {
+      staleDrainWaiters.removeValue(forKey: waiter)
+      wake.continuation.finish()
+    }
+    for await _ in wake.stream {
+      guard stalePassMayRun(token), !staleAdmissionOpen, staleGateRevision == revision else {
+        return false
+      }
       resumeRetainedStaleLeases(token: token, clock: clock)
-      let admitted = Array(staleRuns.values)
-      if admitted.isEmpty { return staleLeaseIDs.isEmpty }
-      for task in admitted { await task.value }
+      if staleRuns.isEmpty { return staleLeaseIDs.isEmpty }
     }
     return false
+  }
+
+  private func wakeStaleDrains() {
+    for waiter in staleDrainWaiters.values { waiter.yield(()) }
   }
 
   // Keep cancellation in one actor turn, separate from awaiting release. In particular, do
@@ -327,8 +349,10 @@ public actor CollectionCoordinator<
   // attempt if a foreground lease joins during cleanup.
   func closeStaleRevalidationGate() -> [Task<Void, Never>] {
     staleGateRevision = UUID()
+    staleDrainToken = nil
     staleGateOpen = false
     staleAdmissionOpen = false
+    wakeStaleDrains()
     stalePassWake?.yield(())
     let running = Array(staleRuns.values)
     for task in running { task.cancel() }
@@ -342,6 +366,7 @@ public actor CollectionCoordinator<
   private func cancelStalePass(_ token: UUID) {
     guard stalePassToken == token else { return }
     stalePassStopping = true
+    wakeStaleDrains()
     for task in staleRuns.values { task.cancel() }
     for task in staleRetries.values { task.cancel() }
     stalePassWake?.finish()
@@ -391,6 +416,7 @@ public actor CollectionCoordinator<
       staleRuns[id] = Task {
         defer {
           self.staleRuns.removeValue(forKey: id)
+          self.wakeStaleDrains()
           if self.stalePassToken == token { self.stalePassWake?.yield(()) }
         }
         await self.finishStaleLeaseRelease(id, token: token, clock: clock)
@@ -462,6 +488,7 @@ public actor CollectionCoordinator<
     let id = mark.record.id
     defer {
       staleRuns.removeValue(forKey: id)
+      wakeStaleDrains()
       if stalePassToken == token { stalePassWake?.yield(()) }
     }
     guard stalePassMayRun(token) else { return }
