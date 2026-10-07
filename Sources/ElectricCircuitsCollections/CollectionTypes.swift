@@ -129,6 +129,9 @@ public struct CollectionDefinition<Model: Sendable, Key: Hashable & Sendable>: S
   /// A fixed, content-free subscription-kind label for revalidation telemetry.
   public let subscriptionKind: String?
   /// Rebuilds a stored demand, or returns nil when its identity is no longer understood.
+  /// The normalized demand must exactly match the stored identity (predicate, ordering,
+  /// source-field mappings and limit). Revalidation may use the current generation within
+  /// the same principal and authorization; a mismatched demand is treated as unrebuildable.
   public let rebuildDemand: (@Sendable (CollectionDemandIdentity) -> CollectionDemand<Model>?)?
 
   public init(

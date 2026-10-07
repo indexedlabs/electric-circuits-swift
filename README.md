@@ -34,7 +34,12 @@ The gate starts closed: call `setStaleRevalidationGate(isOpen:)` after first pai
 only while foreground and online. The pass shares ordinary leases, re-runs at most two unheld
 subscriptions at a time (smallest first), and retries failures with capped backoff. Held leases,
 including leases retained by the app's warm pool, clear without another request. A missing
-rebuilder or a nil result removes the stale materialization. Cancel and await the task when
+rebuilder, a nil result, or a rebuilt demand with a different normalized identity removes the
+stale materialization. Earlier-launch marks in the same principal and authorization are rebuilt
+in the current generation; after successful replacement, the old materialization is removed so
+its claims cannot retain stale rows. Other principals and authorization scopes are excluded.
+Idle listings run every five seconds; opening the gate, local snapshot/feed writes, completed
+runs and retry expiry wake the pass immediately. Cancel and await the task when
 retiring its scope or generation. The store protocol is unchanged in 0.5.0.
 
 Each `CollectionChange` carries its own `CollectionSourceVersion`; a `CollectionChangeBatch`

@@ -135,6 +135,7 @@ public actor CollectionCoordinator<
   private var staleGateOpen = false
   private var stalePassToken: UUID?
   private var stalePassStopping = false
+  private var stalePassWake: AsyncStream<Void>.Continuation?
   private var staleRuns: [CollectionMaterializationID: Task<Void, Never>] = [:]
   private var staleRetries: [CollectionMaterializationID: Task<Void, Never>] = [:]
   private var staleFailures: [CollectionMaterializationID: Int] = [:]
@@ -178,27 +179,42 @@ public actor CollectionCoordinator<
     let token = UUID()
     stalePassToken = token
     stalePassStopping = false
+    let wake = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+    stalePassWake = wake.continuation
+    wake.continuation.yield(())
     await withTaskCancellationHandler {
       var listingFailures = 0
-      while !Task.isCancelled && stalePassToken == token && !stalePassStopping {
-        var delay = Duration.milliseconds(250)
-        if staleGateOpen {
-          do {
-            try await scheduleStaleRuns(token: token, clock: clock, telemetry: telemetry)
-            listingFailures = 0
-          } catch is CancellationError {
-            break
-          } catch {
-            listingFailures = min(listingFailures + 1, 64)
-            delay = ShapeSubscriptionRetryPolicy(jitterRatio: 0).delay(forRetry: listingFailures)
-          }
-        }
+      var idle: Task<Void, Never>?
+      for await _ in wake.stream {
+        idle?.cancel()
+        guard stalePassToken == token, !stalePassStopping, !Task.isCancelled else { break }
+        guard staleGateOpen else { continue }
         do {
-          try await clock.sleep(for: delay)
-        } catch {
+          try await scheduleStaleRuns(token: token, clock: clock, telemetry: telemetry)
+          listingFailures = 0
+        } catch is CancellationError {
           break
+        } catch {
+          listingFailures = min(listingFailures + 1, 64)
+          // Local notifications cannot bypass a failed listing's bounded backoff.
+          let delay = ShapeSubscriptionRetryPolicy(jitterRatio: 0).delay(forRetry: listingFailures)
+          do { try await clock.sleep(for: delay) } catch { break }
+          wake.continuation.yield(())
+          continue
+        }
+        guard staleGateOpen else { continue }
+        // External writers have no notification seam. Poll slowly, while local writes,
+        // completed runs, retry expiry and opening the gate wake this same serialized loop.
+        idle = Task {
+          do {
+            try await clock.sleep(for: .seconds(5))
+            try Task.checkCancellation()
+            wake.continuation.yield(())
+          } catch {}
         }
       }
+      idle?.cancel()
+      if let idle { await idle.value }
       cancelStalePass(token)
       let pending = Array(staleRuns.values) + Array(staleRetries.values)
       for task in pending { await task.value }
@@ -210,6 +226,7 @@ public actor CollectionCoordinator<
       if stalePassToken == token {
         stalePassToken = nil
         stalePassStopping = false
+        stalePassWake = nil
       }
     } onCancel: {
       Task { await self.cancelStalePass(token) }
@@ -218,12 +235,26 @@ public actor CollectionCoordinator<
 
   /// Updates the app's foreground/online/first-paint gate. No runs proceed while it is closed.
   public func setStaleRevalidationGate(isOpen: Bool) async {
-    staleGateOpen = isOpen
-    guard !isOpen else { return }
+    if isOpen {
+      if !staleGateOpen {
+        staleGateOpen = true
+        stalePassWake?.yield(())
+      }
+      return
+    }
+    let running = closeStaleRevalidationGate()
+    for task in running { await task.value }
+  }
+
+  // Keep cancellation in one actor turn, separate from awaiting release. In particular, do
+  // not cancel the shared entry's attempt: final release owns cancellation and restarts an
+  // attempt if a foreground lease joins during cleanup.
+  func closeStaleRevalidationGate() -> [Task<Void, Never>] {
+    staleGateOpen = false
+    stalePassWake?.yield(())
     let running = Array(staleRuns.values)
     for task in running { task.cancel() }
-    cancelUnsharedStaleAttempts()
-    for task in running { await task.value }
+    return running
   }
 
   private func stalePassMayRun(_ token: UUID) -> Bool {
@@ -235,16 +266,7 @@ public actor CollectionCoordinator<
     stalePassStopping = true
     for task in staleRuns.values { task.cancel() }
     for task in staleRetries.values { task.cancel() }
-    cancelUnsharedStaleAttempts()
-  }
-
-  private func cancelUnsharedStaleAttempts() {
-    for leaseID in staleLeaseIDs.values {
-      guard let identity = demandByLease[leaseID], let entry = entries[identity],
-        entry.leases.count == 1, entry.leases[leaseID] != nil
-      else { continue }
-      entry.task?.cancel()
-    }
+    stalePassWake?.finish()
   }
 
   private func scheduleStaleRuns(
@@ -254,7 +276,9 @@ public actor CollectionCoordinator<
     // completion removes it from staleRuns; the next listing will see its conditional clear.
     let occupiedAtRead = Set(staleRuns.keys).union(staleRetries.keys)
     let marks = try await store.staleMaterializations().filter {
-      $0.record.demand.collection == definition.id && $0.record.demand.scope == scope
+      $0.record.demand.collection == definition.id
+        && $0.record.demand.scope.principal == scope.principal
+        && $0.record.demand.scope.authorization == scope.authorization
     }
     guard stalePassMayRun(token) else { return }
     let markedIDs = Set(marks.map { $0.record.id })
@@ -313,7 +337,10 @@ public actor CollectionCoordinator<
     token: UUID, clock: any ShapeSubscriptionClock, telemetry: TelemetryReporter
   ) async {
     let id = mark.record.id
-    defer { staleRuns.removeValue(forKey: id) }
+    defer {
+      staleRuns.removeValue(forKey: id)
+      if stalePassToken == token { stalePassWake?.yield(()) }
+    }
     guard stalePassMayRun(token) else { return }
     let started = ContinuousClock.now
     let span = telemetry.beginSpan(name: "sync.revalidate", kind: .internalSpan)
@@ -341,32 +368,41 @@ public actor CollectionCoordinator<
         attemptedRelease = false
       }
       guard stalePassMayRun(token) else { throw CancellationError() }
-      let identity = mark.record.demand
-      if let entry = entries[identity], !entry.leases.isEmpty {
-        try await store.clearStale(id, ifMarkedAt: mark.markedAt)
+      let storedIdentity = mark.record.demand
+      let activeIdentity = CollectionDemandIdentity(
+        collection: storedIdentity.collection, scope: scope,
+        canonicalDemand: storedIdentity.canonicalDemand)
+      if let entry = entries[activeIdentity], !entry.leases.isEmpty, entry.state == .live {
+        if storedIdentity != activeIdentity {
+          // The current live copy owns its own claims; an earlier launch's claims must
+          // actually leave the store, not merely lose their stale flag.
+          try await removeStaleMaterialization(storedIdentity)
+        } else {
+          try await store.clearStale(id, ifMarkedAt: mark.markedAt)
+        }
         outcome = "held"
-      } else if let demand = definition.rebuildDemand?(identity) {
+      } else if let demand = definition.rebuildDemand?(storedIdentity),
+        demand.identity(for: definition, scope: scope) == activeIdentity
+      {
         let lease = acquire(demand)
         staleLeaseIDs[id] = lease.id
-        rowsReturned = try await staleSnapshotRowCount(for: lease, identity: identity)
+        rowsReturned = try await staleSnapshotRowCount(for: lease, identity: activeIdentity)
         guard stalePassMayRun(token) else { throw CancellationError() }
         attemptedRelease = true
         try await lease.release()
         staleLeaseIDs.removeValue(forKey: id)
         guard stalePassMayRun(token) else { throw CancellationError() }
-        try await store.clearStale(id, ifMarkedAt: mark.markedAt)
+        if storedIdentity != activeIdentity {
+          // Retire the superseded generation only after the current snapshot and release
+          // succeed. Its replacement retains its own marks, including concurrent drops.
+          try await removeStaleMaterialization(storedIdentity)
+        } else {
+          try await store.clearStale(id, ifMarkedAt: mark.markedAt)
+        }
         outcome = "refreshed"
         claimsReleased = max(0, mark.claimCount - rowsReturned)
       } else {
-        // Use the existing eviction fence so an acquire arriving during removal waits for it.
-        let removal: Task<Void, Error>
-        if let existing = evictionTasks[identity] {
-          removal = existing
-        } else {
-          removal = Task { try await self.performEviction(identity) }
-          evictionTasks[identity] = removal
-        }
-        try await removal.value
+        try await removeStaleMaterialization(storedIdentity)
         outcome = "unrebuildable"
         claimsReleased = mark.claimCount
       }
@@ -382,12 +418,28 @@ public actor CollectionCoordinator<
       staleFailures[id] = failures
       let delay = ShapeSubscriptionRetryPolicy(jitterRatio: 0).delay(forRetry: failures)
       staleRetries[id] = Task {
-        defer { self.staleRetries.removeValue(forKey: id) }
+        defer {
+          self.staleRetries.removeValue(forKey: id)
+          if self.stalePassToken == token { self.stalePassWake?.yield(()) }
+        }
         // Backoff occupies no request slot. Failures have no attempt limit; marks survive
         // process restart, while the process-local backoff starts afresh after restart.
         try? await clock.sleep(for: delay)
       }
     }
+  }
+
+  private func removeStaleMaterialization(_ identity: CollectionDemandIdentity) async throws {
+    // Fence removal using the stored identity, including its original generation. Acquiring
+    // the replacement must never cause eviction to target that replacement's materialization.
+    let removal: Task<Void, Error>
+    if let existing = evictionTasks[identity] {
+      removal = existing
+    } else {
+      removal = Task { try await self.performEviction(identity) }
+      evictionTasks[identity] = removal
+    }
+    try await removal.value
   }
 
   private func staleSeconds(_ duration: Duration) -> Double {
@@ -550,6 +602,7 @@ public actor CollectionCoordinator<
       _ = await cleanup(stop, identity: identity, attempt: attempt)
       return
     }
+    stalePassWake?.yield(())
     snapshotted.snapshotRowCount = session.snapshot.rows.count
     entries[identity] = snapshotted
     guard updateEntry(identity: identity, attempt: attempt, state: .live) else {
@@ -590,6 +643,7 @@ public actor CollectionCoordinator<
     else { throw CancellationError() }
     do {
       try await store.apply(batch, to: current.materializationID)
+      stalePassWake?.yield(())
     } catch is CancellationError {
       throw CancellationError()
     } catch {
@@ -614,7 +668,9 @@ public actor CollectionCoordinator<
   private func clearInstalledStop(
     _ stop: AtMostOnceStop, identity: CollectionDemandIdentity, attempt: UUID
   ) {
-    guard var entry = entries[identity], entry.attempt == attempt, entry.stop === stop else { return }
+    guard var entry = entries[identity], entry.attempt == attempt, entry.stop === stop else {
+      return
+    }
     entry.stop = nil
     entries[identity] = entry
   }
