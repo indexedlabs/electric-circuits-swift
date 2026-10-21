@@ -40,7 +40,7 @@ in the current generation; after successful replacement, the old materialization
 its claims cannot retain stale rows. Other principals and authorization scopes are excluded.
 Idle listings run every five seconds; opening the gate, local snapshot/feed writes, completed
 runs and retry expiry wake the pass immediately. Cancel and await the task when
-retiring its scope or generation. The store protocol is unchanged in 0.7.0.
+retiring its scope or generation. The store protocol is unchanged in 0.8.0.
 
 For app-wide scheduling across collections, await `drainStaleRevalidation()` before opening the
 next collection's gate or starting an explicit repair read. Drain closes admission and lets
@@ -81,8 +81,23 @@ is skipped only for transactions visible to that snapshot below its WAL insert h
 32-bit xid wraparound ordering. The gate retires when the tail reaches the horizon. Engines without
 these fields retain LSN positioning; an unparseable or missing feed txid also uses the LSN fallback
 below the horizon. It renews the same subset-feed claim through
-`ShapeSubscriptionCoordinator`, and the producer cannot advance its local cursor until the consumer's
-atomic store callback returns.
+`ShapeSubscriptionCoordinator`, which adopts the handle the setup create returned rather than
+creating the claim a second time, and the producer cannot advance its local cursor until the
+consumer's atomic store callback returns.
+
+A demand the store already holds is resumed rather than re-materialized when the source allows it.
+On an exact cached record, `CollectionCoordinator` first calls the adapter's `resume`, which returns
+a `CollectionResumeSession` (a live tail from the stored cursor and source version) or nil. A
+resumed attempt skips `replaceSnapshot`: the demand stays `.cached` and reports `.live` once the
+tail commits a batch or answers an idle poll, and feed deletes release claims through the ordinary
+store `apply`. Nil takes the snapshot path; the default implementation always returns nil. Stale
+revalidation always snapshots. `CircuitsSubsetSource` fences each snapshot with the feed's shape ID
+(`subset-v2`) and resumes by re-joining the identical feed request: Circuits shares shapes by table,
+canonical predicate, sorted columns and `changes_only`, so the same shape ID means the stored offset
+is still a position in that append-only stream. A resume makes one `/v1/subset-feeds` POST and no
+frontier `HEAD` or snapshot query. Limited windows, `subset-v1` fences, a replaced shape ID, and a
+fence whose last session ended in a terminal stream outcome snapshot instead. On a feed that is
+already current, `.live` waits for the first long-poll answer.
 
 ```swift
 let definition = CollectionDefinition<Issue, Int64>(
@@ -257,7 +272,7 @@ wire contract, public API, and provider-schema release rules are explicit in
 [Policies/SUPPORT.md](Policies/SUPPORT.md) and [Policies/SEMVER.md](Policies/SEMVER.md). The DocC
 catalog begins at `ElectricCircuitsSwift` in Xcode's documentation viewer.
 
-## Install 0.7.0
+## Install 0.8.0
 
 Custom `CollectionStore` providers must implement `staleMaterializations()` and
 `clearStale(_:ifMarkedAt:)`. A snapshot omission or feed delete of a held row releases only that
@@ -275,7 +290,7 @@ dependencies.
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.7.0"),
+  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.8.0"),
 ]
 ```
 

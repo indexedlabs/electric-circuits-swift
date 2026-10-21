@@ -3,6 +3,31 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
+## 0.8.0
+
+- Add `ShapeSubscriptionCoordinator(..., adopting:)`. A caller that already created the claim with
+  the same request hands its `ShapeHandle` over; the first `start()` streams it without a second
+  create, still taking a capacity permit and running the materializer preflight, and renews it on
+  the handle's lease schedule. The coordinator owns the adopted claim's release from construction.
+  `CircuitsSubsetSource` uses it, so materializing a demand POSTs `/v1/subset-feeds` once, not twice.
+- Add `CollectionResumeSession` and a defaulted `CollectionSourceAdapter.resume` requirement. When
+  the store holds an exact record, `CollectionCoordinator` asks the source to continue it from the
+  stored cursor before materializing. A resumed attempt skips
+  `replaceSnapshot`, stays `.cached`, and reports `.live` once the tail commits a batch or answers
+  an idle poll. A nil result takes the snapshot path unchanged; adapters that do not implement
+  `resume` snapshot on every acquire as before. Stale revalidation always snapshots, and restarts a
+  resumed attempt it joins.
+- `CircuitsSubsetSource` writes `subset-v2|<shapeId>|<offset>|<lsn>` snapshot fences and implements
+  `resume`: it re-joins the identical feed request and, when the engine answers with the fenced
+  shape ID, tails the same append-only stream from the stored cursor and source version with no
+  frontier `HEAD` and no `/v1/subsets/query`. Limited windows, `subset-v1` fences, records without
+  a cursor, a replaced shape ID, and a fence whose last session ended in a terminal or
+  non-retryable stream outcome snapshot instead. A replaced feed's create is adopted by that
+  snapshot, so the fallback still POSTs once. Existing v1 fences decode and are rewritten by the
+  next snapshot.
+- This minor release preserves source compatibility with 0.7.0 and introduces no store protocol,
+  persisted schema, or HTTP changes; snapshot fences remain opaque strings to stores.
+
 ## 0.7.0
 
 - Add `CollectionCoordinator.resumeAndDrainStaleRevalidation() async -> Bool` to reopen lifecycle
