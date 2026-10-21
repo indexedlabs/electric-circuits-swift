@@ -16,7 +16,10 @@ idempotence and transactional guarantees.
 ## Lifecycle outcomes
 
 A successful `start` creates or renews a named claim, then starts a long-poll reader. `stop` cancels
-local work and releases the claim. A terminal stream outcome may require reseeding rather than an
+local work and releases the claim. A caller that already created the claim with the same request can
+pass that handle as `adopting:`; the first `start` then streams it without a second create, still
+taking a capacity permit and running the materializer preflight, and renews it on its lease schedule.
+The coordinator owns an adopted claim's release from construction. A terminal stream outcome may require reseeding rather than an
 automatic retry; it is reported as ``ShapeSubscriptionReseedRequired``. A caller must choose how to
 acquire a new snapshot and replace its local materialization.
 

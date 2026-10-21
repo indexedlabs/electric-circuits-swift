@@ -278,6 +278,9 @@ public actor ShapeSubscriptionCoordinator {
   private let recreatePolicy: ShapeSubscriptionRecreatePolicy
   private var continuation: AsyncStream<ShapeSubscriptionState>.Continuation?
   private var handle: ShapeHandle?
+  // A claim the caller created with this same request before the coordinator existed. The first
+  // successful start adopts it instead of POSTing again; until then stop() releases it.
+  private var adoptableHandle: ShapeHandle?
   private var pendingRelease: [ShapeHandle] = []
   private var generation: UInt64 = 0
   private var stopping = false
@@ -309,6 +312,13 @@ public actor ShapeSubscriptionCoordinator {
     private var startReturnGates: [UInt64: CheckedContinuation<Void, Never>] = [:]
   #endif
 
+  /// `adopting` hands the coordinator a claim the caller already created with this same
+  /// `request` and `kind` (for example a source's initial subset-feed create before its snapshot).
+  /// The first successful `start()` adopts that handle instead of creating again: it still takes a
+  /// capacity permit and runs the materializer preflight, then streams it and renews it on the
+  /// handle's normal lease schedule. The coordinator owns the adopted claim's release from
+  /// construction, so `stop()` releases it whether or not a start adopted it. Later starts after
+  /// a reseed create normally.
   public init(
     client: ElectricCircuitsClient, transport: any HTTPTransport, request: ShapeRequest,
     materializer: any ShapeMaterializer, retryPolicy: ShapeSubscriptionRetryPolicy = .init(),
@@ -317,7 +327,8 @@ public actor ShapeSubscriptionCoordinator {
     responseDecodingLimits: ResponseDecodingLimits = .default,
     telemetry: TelemetryReporter = .noop,
     kind: ShapeSubscriptionKind = .shape,
-    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init()
+    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init(),
+    adopting initialHandle: ShapeHandle? = nil
   ) {
     self.client = client
     self.transport = transport
@@ -330,6 +341,7 @@ public actor ShapeSubscriptionCoordinator {
     self.telemetry = telemetry
     self.kind = kind
     self.recreatePolicy = recreatePolicy
+    adoptableHandle = initialHandle
     let updates = AsyncStream<ShapeSubscriptionState>.makeStream()
     stateUpdates = updates.stream
     continuation = updates.continuation
@@ -604,6 +616,10 @@ public actor ShapeSubscriptionCoordinator {
       transition(.stopping)
       if let handle { appendRelease(handle) }
       handle = nil
+      // An adopted claim that no start consumed is still owned here. A start task suspended in
+      // preflight is cancelled below and can no longer take it.
+      if let adoptableHandle { appendRelease(adoptableHandle) }
+      adoptableHandle = nil
     }
     let create = startTask
     let renew = renewTask
@@ -699,6 +715,12 @@ public actor ShapeSubscriptionCoordinator {
       throw MaterializerFailure()
     }
     try Task.checkCancellation()
+    if let adopted = adoptableHandle {
+      // The caller's create already established this claim; creating again would only repeat the
+      // same POST. A start that fails before this point leaves it adoptable by a later start.
+      adoptableHandle = nil
+      return adopted
+    }
     return try await recreatingOnGone(operation: "create") {
       switch self.kind {
       case .shape:
