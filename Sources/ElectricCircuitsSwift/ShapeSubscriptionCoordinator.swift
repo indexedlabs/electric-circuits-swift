@@ -646,9 +646,11 @@ public actor ShapeSubscriptionCoordinator {
 
   private func consume(handle streamHandle: ShapeHandle, generation: UInt64) async {
     var retries = 0
+    var cursorAtAttempt = StreamCursor.beginning
     while isCurrent(generation) {
       do {
-        transition(.streaming(try await committedCursor()))
+        cursorAtAttempt = try await committedCursor()
+        transition(.streaming(cursorAtAttempt))
         let reader = ShapeStreamReader(
           streamURL: streamHandle.stream.url, transport: transport,
           materializer: CoordinatedMaterializer(base: materializer), telemetry: telemetry,
@@ -662,6 +664,14 @@ public actor ShapeSubscriptionCoordinator {
             reason: .terminal(reason), previous: streamHandle)
           do { try await requireReseed(outcome) } catch { transition(.failed(failure(for: error))) }
           return
+        }
+        // A reader can commit one or more batches before a later poll fails. Retry budget and
+        // backoff count consecutive failures, so progress since this attempt began starts a fresh
+        // budget rather than carrying failures from the prior cursor forward.
+        if let committedAfterFailure = try? await committedCursor(),
+          committedAfterFailure.offset != cursorAtAttempt.offset
+        {
+          retries = 0
         }
         guard isRetryable(error), retries < retryPolicy.maxRetries else {
           transition(.failed(exhaustedOrFailure(error, retries: retries, operation: "stream")))

@@ -783,6 +783,95 @@ struct ShapeSubscriptionCoordinatorTests {
     try await coordinator.stop()
   }
 
+  @Test func progressResetsStreamRetryBudgetBeforeTheNextFailure() async throws {
+    let transport = CoordinatorTransport(responses: [
+      shapeResponse(),
+      response("temporary-1", status: 503),
+      response(oneRow, headers: ["stream-next-offset": "1"]),
+      response("temporary-2", status: 503),
+      response(oneRow, headers: ["stream-next-offset": "2"]),
+      response("temporary-3", status: 503),
+      response(oneRow, headers: ["stream-next-offset": "3"]),
+      response("gone", status: 404),
+      response("", status: 404),
+    ])
+    let clock = RecordingClock()
+    let materializer = InMemoryShapeMaterializer()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "claim"),
+      materializer: materializer,
+      retryPolicy: .init(
+        maxRetries: 2, baseDelay: .seconds(1), maximumDelay: .seconds(2), jitterRatio: 0,
+        randomUnit: { 0.5 }),
+      clock: clock)
+
+    _ = try await coordinator.start()
+    for _ in 0..<1_000 {
+      if await transport.requests.count >= 9 { break }
+      await Task.yield()
+    }
+    for _ in 0..<1_000 {
+      if case .reseedRequired = await coordinator.state { break }
+      await Task.yield()
+    }
+
+    let requestCount = await transport.requests.count
+    let cursor = await materializer.cursor()
+    let delays = await clock.delays
+    let state = await coordinator.state
+    #expect(requestCount == 9)
+    #expect(cursor == StreamCursor(offset: "3"))
+    #expect(delays == [.seconds(1), .seconds(1), .seconds(1)])
+    #expect(
+      state
+        == .reseedRequired(
+          .init(
+            reason: .terminal(.notFound),
+            previous: ShapeHandle(
+              response: ShapeResponse(
+                shapeId: "s1", table: "public.items", streamPath: "/v1/streams/s1",
+                streamURL: URL(string: "https://streams.test/s1")!, subscription: "claim")))))
+    try await coordinator.stop()
+  }
+
+  @Test func consecutiveStreamFailuresStillExhaustRetryBudget() async throws {
+    let transport = CoordinatorTransport(responses: [
+      shapeResponse(),
+      response("temporary-1", status: 503),
+      response("temporary-2", status: 503),
+      response("temporary-3", status: 503),
+      response("", status: 404),
+    ])
+    let clock = RecordingClock()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "claim"),
+      materializer: InMemoryShapeMaterializer(),
+      retryPolicy: .init(
+        maxRetries: 2, baseDelay: .seconds(1), maximumDelay: .seconds(2), jitterRatio: 0,
+        randomUnit: { 0.5 }),
+      clock: clock)
+
+    _ = try await coordinator.start()
+    for _ in 0..<1_000 {
+      if case .failed = await coordinator.state { break }
+      await Task.yield()
+    }
+
+    let state = await coordinator.state
+    #expect(
+      state
+        == .failed(
+          .retryExhausted(operation: "stream", attempts: 3, cause: .http(status: 503))))
+    #expect(await clock.delays == [.seconds(1), .seconds(2)])
+    try await coordinator.stop()
+  }
+
   @Test func epochResetIsTerminalAndIsNotRetried() async throws {
     let transport = HeldEpochResetTransport()
     let clock = RecordingClock()
