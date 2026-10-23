@@ -543,6 +543,111 @@ struct ShapeSubscriptionCoordinatorTests {
     try await coordinator.stop()
   }
 
+  /// A source that created its claim before the coordinator existed hands it over: the first
+  /// start streams that handle without POSTing again and renews it on its own lease cadence.
+  @Test func adoptedClaimStreamsWithoutCreatingAndRenewsOnItsLeaseSchedule() async throws {
+    let transport = LeaseTransport()
+    let clock = HoldingClock()
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let request = ShapeRequest(table: "public.items", subscription: "stable-claim")
+    let adopted = try await client.createShape(request)
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: client, transport: transport, request: request,
+      materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0), clock: clock,
+      adopting: adopted)
+
+    #expect(try await coordinator.start() == adopted)
+    for _ in 0..<1_000 {
+      let streamed = await transport.requests.contains { $0.httpMethod == "GET" }
+      if streamed, await clock.delays.count == 1 { break }
+      await Task.yield()
+    }
+    #expect(await clock.delays == [.seconds(2)])
+    let requests = await transport.requests
+    #expect(requests.filter { $0.httpMethod == "POST" }.count == 1)
+    #expect(requests.contains { $0.httpMethod == "GET" && $0.url?.path == "/s1" })
+
+    try await coordinator.stop()
+    #expect(await transport.requests.filter { $0.httpMethod == "DELETE" }.count == 1)
+    #expect(await coordinator.state == .stopped)
+  }
+
+  /// An adopted claim's lease runs from the caller's create, not from the launch: a source that
+  /// read a frontier and a snapshot in between renews that much sooner, and at once when a third
+  /// of the lease has already passed.
+  @Test func adoptedClaimRenewsOnTheLeaseItsCreateStarted() async throws {
+    let transport = LeaseTransport()
+    let clock = HoldingClock()
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let request = ShapeRequest(table: "public.items", subscription: "stable-claim")
+    let adopted = try await client.createShape(request)
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: client, transport: transport, request: request,
+      materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0), clock: clock,
+      adopting: adopted, createdAt: .now - .seconds(5))
+
+    #expect(try await coordinator.start() == adopted)
+    for _ in 0..<1_000 {
+      if await clock.delays.count == 1 { break }
+      await Task.yield()
+    }
+    // A 6-second lease renews every 2 seconds; 5 have passed since the create.
+    #expect(await clock.delays == [.zero])
+
+    try await coordinator.stop()
+  }
+
+  /// The coordinator owns an adopted claim from construction, so stopping it before any start
+  /// still releases that claim, once.
+  @Test func stopReleasesAnAdoptedClaimThatNoStartConsumed() async throws {
+    let transport = LeaseTransport()
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let request = ShapeRequest(table: "public.items", subscription: "stable-claim")
+    let adopted = try await client.createShape(request)
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: client, transport: transport, request: request,
+      materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0),
+      clock: RecordingClock(), adopting: adopted)
+
+    try await coordinator.stop()
+
+    #expect(await transport.requests.map(\.httpMethod) == ["POST", "DELETE"])
+    #expect(await coordinator.state == .stopped)
+  }
+
+  /// Adoption still passes admission: a full capacity refuses the start without a create, and the
+  /// refused coordinator keeps the adopted claim for its stop to release.
+  @Test func adoptedClaimStillTakesACapacityPermit() async throws {
+    let transport = LeaseTransport()
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let capacity = ShapeSubscriptionCapacity(maximumActiveSubscriptions: 1)
+    let holder = ShapeSubscriptionCoordinator(
+      client: client, transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "holder"),
+      materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0),
+      clock: HoldingClock(), capacity: capacity)
+    _ = try await holder.start()
+    let request = ShapeRequest(table: "public.items", subscription: "stable-claim")
+    let adopted = try await client.createShape(request)
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: client, transport: transport, request: request,
+      materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0),
+      clock: RecordingClock(), capacity: capacity, adopting: adopted)
+
+    await #expect(throws: ShapeSubscriptionFailure.capacityExceeded(limit: 1)) {
+      _ = try await coordinator.start()
+    }
+    #expect(await transport.requests.filter { $0.httpMethod == "POST" }.count == 2)
+    try await coordinator.stop()
+    let deletes = await transport.requests.filter { $0.httpMethod == "DELETE" }
+    #expect(deletes.count == 1)
+    try await holder.stop()
+  }
+
   @Test func releaseRetriesResponseLossAndTreats404AsSuccess() async throws {
     let transport = ReleaseRetryTransport()
     let clock = RecordingClock()

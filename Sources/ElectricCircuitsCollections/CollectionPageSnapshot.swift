@@ -32,6 +32,18 @@ public struct CollectionPageSnapshot: Codable, Equatable, Hashable, Sendable {
     self.xip = xip
   }
 
+  /// The engine's `xmin:xmax:xip,…` text for this visibility, with `xip` sorted, so that
+  /// `init?(lsn:snapshot:horizon:)` reads back an equal value.
+  var snapshotText: String {
+    "\(xmin):\(xmax):" + xip.sorted().map(String.init).joined(separator: ",")
+  }
+
+  /// The horizon as PostgreSQL LSN text, which `init?(lsn:snapshot:horizon:)` reads back.
+  var horizonText: String {
+    String(horizon >> 32, radix: 16, uppercase: true) + "/"
+      + String(horizon & 0xFFFF_FFFF, radix: 16, uppercase: true)
+  }
+
   /// Decimal xid8 text modulo 2^32, without overflow or a floating-point conversion.
   public static func xid32(_ text: String) -> UInt32? {
     guard !text.isEmpty else { return nil }

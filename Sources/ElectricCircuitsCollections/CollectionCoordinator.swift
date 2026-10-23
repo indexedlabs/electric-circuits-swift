@@ -117,6 +117,11 @@ public actor CollectionCoordinator<
     var releaseTask: Task<Void, Error>?
     var awaitsEviction: Bool
     var snapshotRowCount: Int?
+    /// The next attempt must take the snapshot path even when the store holds an exact record.
+    /// Set by the stale pass, whose revalidation is a fresh snapshot; cleared once one commits.
+    var requiresSnapshot = false
+    /// The attempt currently continuing a stored cursor through `source.resume`, if any.
+    var resumingAttempt: UUID?
   }
 
   private let definition: CollectionDefinition<Model, Key>
@@ -531,7 +536,13 @@ public actor CollectionCoordinator<
       let activeIdentity = CollectionDemandIdentity(
         collection: storedIdentity.collection, scope: scope,
         canonicalDemand: storedIdentity.canonicalDemand)
-      if let entry = entries[activeIdentity], !entry.leases.isEmpty, entry.state == .live {
+      // A held live copy maintains its own claims from the feed, once its snapshot established
+      // them. A resumed tail does not count: it never re-read the source, which is what the mark
+      // asks for, so it revalidates through a snapshot like an unheld copy, below.
+      let held = entries[activeIdentity].flatMap { entry in
+        !entry.leases.isEmpty && entry.state == .live ? entry : nil
+      }
+      if let entry = held, entry.resumingAttempt != entry.attempt {
         if storedIdentity != activeIdentity {
           // The current live copy owns its own claims; an earlier launch's claims must
           // actually leave the store, not merely lose their stale flag.
@@ -540,11 +551,16 @@ public actor CollectionCoordinator<
           try await store.clearStale(id, ifMarkedAt: mark.markedAt)
         }
         outcome = "held"
-      } else if let demand = definition.rebuildDemand?(storedIdentity),
-        demand.identity(for: definition, scope: scope) == activeIdentity
-      {
-        let lease = acquire(demand)
+      } else if let demand = held?.demand ?? rebuiltDemand(storedIdentity, active: activeIdentity) {
+        // Revalidation is a fresh snapshot: a resumed tail neither reports a row count nor
+        // proves, once this lease releases it, that it reached the drop position.
+        let lease = acquire(demand, requiringSnapshot: true)
         staleLeaseIDs[id] = lease.id
+        if let joined = entries[activeIdentity], joined.resumingAttempt == joined.attempt {
+          // The shared entry's current attempt chose to resume before this lease joined it, so
+          // it will never report a snapshot. Restart it; the new attempt sees the requirement.
+          await lease.refresh()
+        }
         rowsReturned = try await staleSnapshotRowCount(for: lease, identity: activeIdentity)
         guard stalePassMayRun(token) else { throw CancellationError() }
         attemptedRelease = true
@@ -586,6 +602,16 @@ public actor CollectionCoordinator<
     }
   }
 
+  /// The demand a stale mark's stored identity rebuilds to, when it is the active identity.
+  private func rebuiltDemand(
+    _ stored: CollectionDemandIdentity, active: CollectionDemandIdentity
+  ) -> CollectionDemand<Model>? {
+    guard let demand = definition.rebuildDemand?(stored),
+      demand.identity(for: definition, scope: scope) == active
+    else { return nil }
+    return demand
+  }
+
   private func removeStaleMaterialization(_ identity: CollectionDemandIdentity) async throws {
     // Fence removal using the stored identity, including its original generation. Acquiring
     // the replacement must never cause eviction to target that replacement's materialization.
@@ -605,6 +631,12 @@ public actor CollectionCoordinator<
   }
 
   public func acquire(_ demand: CollectionDemand<Model>) -> CollectionLease {
+    acquire(demand, requiringSnapshot: false)
+  }
+
+  private func acquire(
+    _ demand: CollectionDemand<Model>, requiringSnapshot: Bool
+  ) -> CollectionLease {
     let identity = demand.identity(for: definition, scope: scope)
     let leaseID = UUID()
     let updates = AsyncStream<CollectionLoadState>.makeStream(
@@ -612,6 +644,7 @@ public actor CollectionCoordinator<
 
     if var entry = entries[identity] {
       entry.leases[leaseID] = updates.continuation
+      if requiringSnapshot { entry.requiresSnapshot = true }
       let shouldRetry = {
         guard case .failed = entry.state else { return false }
         return entry.task == nil && entry.stop == nil && entry.releaseToken == nil
@@ -642,7 +675,8 @@ public actor CollectionCoordinator<
         releaseToken: nil,
         releaseTask: nil,
         awaitsEviction: evictionTasks[identity] != nil,
-        snapshotRowCount: nil
+        snapshotRowCount: nil,
+        requiresSnapshot: requiringSnapshot
       )
       updates.continuation.yield(.unavailable)
       if evictionTasks[identity] == nil {
@@ -686,6 +720,7 @@ public actor CollectionCoordinator<
     }
     entry.task = task
     entry.snapshotRowCount = nil
+    entry.resumingAttempt = nil
     entries[identity] = entry
   }
 
@@ -704,7 +739,10 @@ public actor CollectionCoordinator<
       guard updateEntry(identity: identity, attempt: attempt, state: .cached) else { return }
       guard var entry = entries[identity], entry.attempt == attempt else { return }
       entry.materializationID = cached.id
+      let resumes = !entry.requiresSnapshot
+      if resumes { entry.resumingAttempt = attempt }
       entries[identity] = entry
+      if resumes, await runResumed(from: cached, identity: identity, attempt: attempt) { return }
     }
     guard updateEntry(identity: identity, attempt: attempt, state: .refreshing),
       let entry = entries[identity]
@@ -761,6 +799,7 @@ public actor CollectionCoordinator<
     }
     stalePassWake?.yield(())
     snapshotted.snapshotRowCount = session.snapshot.rows.count
+    snapshotted.requiresSnapshot = false
     entries[identity] = snapshotted
     guard updateEntry(identity: identity, attempt: attempt, state: .live) else {
       _ = await cleanup(stop, identity: identity, attempt: attempt)
@@ -788,6 +827,140 @@ public actor CollectionCoordinator<
     if await cleanup(stop, identity: identity, attempt: attempt) {
       finishStream(identity: identity, attempt: attempt)
     }
+  }
+
+  /// Continues an exact cached materialization from its committed cursor. Returns false when the
+  /// source declines, the stored record moved while it was asked, or the feed refuses the stored
+  /// cursor (`CollectionResumeInvalidated`) before the tail went live, and the attempt must take
+  /// the snapshot path; true when this attempt has finished, failed or been superseded. A
+  /// transient failure fails the attempt and leaves the cursor resumable by the next one.
+  ///
+  /// The snapshot path's per-acquire invariants, and how a resumed attempt keeps them:
+  /// - Rows and claims: there is no `replaceSnapshot`, so no omission pass marks other holders
+  ///   and no provider claim takeover runs. Neither is owed: the stored claims are exactly what
+  ///   this materialization's snapshot and feed established up to the stored cursor (any takeover
+  ///   happened at that snapshot), and the tail is gap-free from it, so each feed delete still
+  ///   releases its claim and marks other holders through the store's ordinary awaited `apply`.
+  ///   Stored marks are untouched. Retiring an earlier generation's stale copy stays with the
+  ///   stale pass, which always snapshots before it removes that copy.
+  /// - Cursor CAS: the session must start at the cursor the store still holds. The record is read
+  ///   again after the source call, and the first batch expects that cursor, so the store's
+  ///   compare-and-set rejects an interleaved writer instead of the tail skipping or replaying.
+  /// - `snapshotRowCount` stays nil because no snapshot was taken. The stale pass, which needs
+  ///   one, acquires with `requiresSnapshot` and refreshes a resumed attempt it joins.
+  /// - Readiness: the demand stays `.cached` (its rows are already local) and reports `.live` only
+  ///   after the tail commits a batch or answers an idle poll from the stored cursor.
+  private func runResumed(
+    from record: CollectionMaterializationRecord,
+    identity: CollectionDemandIdentity,
+    attempt: UUID
+  ) async -> Bool {
+    guard let entry = entries[identity], entry.attempt == attempt, !entry.leases.isEmpty else {
+      return true
+    }
+    let resumed: CollectionResumeSession<Model, Key>?
+    do {
+      resumed = try await source.resume(
+        entry.demand, identity: identity, materializationID: record.id, record: record)
+    } catch is CancellationError {
+      return true
+    } catch {
+      fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
+      return true
+    }
+    guard let session = resumed else {
+      clearResumingAttempt(identity: identity, attempt: attempt)
+      return false
+    }
+
+    let stop = AtMostOnceStop(session.stop)
+    guard install(stop: stop, identity: identity, attempt: attempt) else {
+      do {
+        try await stop.call()
+      } catch {
+        fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
+      }
+      return true
+    }
+    do {
+      try Task.checkCancellation()
+      let current = try await store.materialization(for: identity)
+      guard let current, current.id == record.id, current.cursor == session.cursor,
+        current.snapshotFence == record.snapshotFence
+      else {
+        // Another writer replaced or advanced the record while the source was asked. Release
+        // the resumed claim and snapshot rather than tail from a position the store left.
+        guard await cleanup(stop, identity: identity, attempt: attempt) else { return true }
+        clearResumingAttempt(identity: identity, attempt: attempt)
+        return false
+      }
+    } catch is CancellationError {
+      _ = await cleanup(stop, identity: identity, attempt: attempt)
+      return true
+    } catch {
+      _ = await cleanup(stop, identity: identity, attempt: attempt)
+      fail(identity: identity, attempt: attempt, with: .storeUnavailable)
+      return true
+    }
+    guard let current = entries[identity], current.attempt == attempt, !Task.isCancelled else {
+      _ = await cleanup(stop, identity: identity, attempt: attempt)
+      return true
+    }
+
+    do {
+      try await session.run(
+        { batch in
+          try Task.checkCancellation()
+          try await self.apply(batch, identity: identity, attempt: attempt)
+          await self.markResumedLive(identity: identity, attempt: attempt)
+        },
+        { await self.markResumedLive(identity: identity, attempt: attempt) }
+      )
+    } catch is CancellationError {
+      _ = await cleanup(stop, identity: identity, attempt: attempt)
+      return true
+    } catch is CollectionStoreApplyFailure {
+      _ = await cleanup(stop, identity: identity, attempt: attempt)
+      fail(identity: identity, attempt: attempt, with: .storeUnavailable)
+      return true
+    } catch is CollectionResumeInvalidated {
+      // The feed will not serve the stored cursor. Until the tail has committed or caught up,
+      // nothing has been reported live from it, so this attempt reseeds by snapshot.
+      guard await cleanup(stop, identity: identity, attempt: attempt) else { return true }
+      if let entry = entries[identity], entry.attempt == attempt, entry.state == .cached,
+        !Task.isCancelled
+      {
+        clearResumingAttempt(identity: identity, attempt: attempt)
+        return false
+      }
+      fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
+      return true
+    } catch {
+      _ = await cleanup(stop, identity: identity, attempt: attempt)
+      fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
+      return true
+    }
+
+    if await cleanup(stop, identity: identity, attempt: attempt) {
+      finishStream(identity: identity, attempt: attempt)
+    }
+    return true
+  }
+
+  /// The resumed tail has read past its stored cursor: report the cached demand live. A refresh,
+  /// failure or replacement attempt already owns the state, so only `.cached` advances.
+  private func markResumedLive(identity: CollectionDemandIdentity, attempt: UUID) {
+    guard let entry = entries[identity], entry.attempt == attempt, entry.state == .cached else {
+      return
+    }
+    updateEntry(identity: identity, attempt: attempt, state: .live)
+    stalePassWake?.yield(())
+  }
+
+  private func clearResumingAttempt(identity: CollectionDemandIdentity, attempt: UUID) {
+    guard var entry = entries[identity], entry.resumingAttempt == attempt else { return }
+    entry.resumingAttempt = nil
+    entries[identity] = entry
   }
 
   private func apply(
