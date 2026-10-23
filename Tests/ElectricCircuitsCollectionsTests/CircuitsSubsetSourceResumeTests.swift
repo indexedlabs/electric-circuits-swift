@@ -352,6 +352,31 @@ struct CircuitsSubsetSourceResumeTests {
     try await lease.release()
   }
 
+  /// A failure that says nothing about the stored cursor, an exhausted transient retry or an
+  /// authentication refusal the app clears by refreshing its token, fails the resumed attempt
+  /// without a snapshot and leaves the cursor resumable: the retry, on the same source instance,
+  /// re-joins the feed and reads on from the stored offset.
+  @Test(arguments: [503, 401])
+  func aFailureThatSaysNothingAboutTheCursorResumesAgainOnRetry(status: Int) async throws {
+    let transport = ResumeFeedTransport()
+    let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
+    let seeded = try await seedBySnapshot(transport, store: store)
+    await transport.script("shape-1", [.status(status)])
+
+    let lease = await relaunch(transport, store: store).acquire(openIssues)
+    #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
+    #expect(await transport.count("POST", "/v1/subsets/query") == 1)
+
+    await transport.script("shape-1", [.idle])
+    await lease.refresh()
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await transport.count("POST", "/v1/subsets/query") == 1)
+    #expect(await transport.count("POST", "/v1/subset-feeds") == 3)
+    #expect(await transport.streamOffsets("shape-1").suffix(2) == ["10", "10"])
+    #expect(try await store.materialization(for: openIdentity) == seeded)
+    try await lease.release()
+  }
+
   @Test func aVersionOneFenceSnapshotsAndIsRewrittenAsVersionTwo() async throws {
     let transport = ResumeFeedTransport()
     let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)

@@ -413,10 +413,13 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
 
   /// Outcomes a re-join of the same feed from the same cursor would deterministically repeat:
   /// terminal stream receipts (404/410/`stream-closed`), a replacement shape on renewal, and
-  /// non-retryable stream or HTTP failures. Transport loss, exhausted transient retries and
-  /// local store failures say nothing about the stored cursor.
+  /// non-retryable stream or HTTP failures. Transport loss, exhausted transient retries, an
+  /// authentication refusal the app clears by refreshing its credentials (401, 403, 407), and local
+  /// store failures say nothing about the stored cursor.
   private static func failureInvalidatesResume(_ failure: ShapeSubscriptionFailure) -> Bool {
     switch failure {
+    case .client(.http(let status, _)) where [401, 403, 407].contains(status):
+      false
     case .reseedRequired, .stream, .client:
       true
     case .transport, .materializerUnavailable, .materializer, .retryExhausted, .capacityExceeded:
