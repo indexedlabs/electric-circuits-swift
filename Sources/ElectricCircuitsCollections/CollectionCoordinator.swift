@@ -536,9 +536,13 @@ public actor CollectionCoordinator<
       let activeIdentity = CollectionDemandIdentity(
         collection: storedIdentity.collection, scope: scope,
         canonicalDemand: storedIdentity.canonicalDemand)
-      // A held live copy maintains its own claims from the feed. That holds for a resumed tail
-      // too: it reports live only after reading the same gap-free feed from its stored cursor.
-      if let entry = entries[activeIdentity], !entry.leases.isEmpty, entry.state == .live {
+      // A held live copy maintains its own claims from the feed, once its snapshot established
+      // them. A resumed tail does not count: it never re-read the source, which is what the mark
+      // asks for, so it revalidates through a snapshot like an unheld copy, below.
+      let held = entries[activeIdentity].flatMap { entry in
+        !entry.leases.isEmpty && entry.state == .live ? entry : nil
+      }
+      if let entry = held, entry.resumingAttempt != entry.attempt {
         if storedIdentity != activeIdentity {
           // The current live copy owns its own claims; an earlier launch's claims must
           // actually leave the store, not merely lose their stale flag.
@@ -547,9 +551,7 @@ public actor CollectionCoordinator<
           try await store.clearStale(id, ifMarkedAt: mark.markedAt)
         }
         outcome = "held"
-      } else if let demand = definition.rebuildDemand?(storedIdentity),
-        demand.identity(for: definition, scope: scope) == activeIdentity
-      {
+      } else if let demand = held?.demand ?? rebuiltDemand(storedIdentity, active: activeIdentity) {
         // Revalidation is a fresh snapshot: a resumed tail neither reports a row count nor
         // proves, once this lease releases it, that it reached the drop position.
         let lease = acquire(demand, requiringSnapshot: true)
@@ -598,6 +600,16 @@ public actor CollectionCoordinator<
         try? await clock.sleep(for: delay)
       }
     }
+  }
+
+  /// The demand a stale mark's stored identity rebuilds to, when it is the active identity.
+  private func rebuiltDemand(
+    _ stored: CollectionDemandIdentity, active: CollectionDemandIdentity
+  ) -> CollectionDemand<Model>? {
+    guard let demand = definition.rebuildDemand?(stored),
+      demand.identity(for: definition, scope: scope) == active
+    else { return nil }
+    return demand
   }
 
   private func removeStaleMaterialization(_ identity: CollectionDemandIdentity) async throws {
@@ -851,6 +863,7 @@ public actor CollectionCoordinator<
     } catch is CancellationError {
       return true
     } catch {
+      requireSnapshot(identity: identity, attempt: attempt)
       fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
       return true
     }
@@ -907,10 +920,12 @@ public actor CollectionCoordinator<
       return true
     } catch is CollectionStoreApplyFailure {
       _ = await cleanup(stop, identity: identity, attempt: attempt)
+      requireSnapshot(identity: identity, attempt: attempt)
       fail(identity: identity, attempt: attempt, with: .storeUnavailable)
       return true
     } catch {
       _ = await cleanup(stop, identity: identity, attempt: attempt)
+      requireSnapshot(identity: identity, attempt: attempt)
       fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
       return true
     }
@@ -929,6 +944,15 @@ public actor CollectionCoordinator<
     }
     updateEntry(identity: identity, attempt: attempt, state: .live)
     stalePassWake?.yield(())
+  }
+
+  /// A resume that failed is not retried as one: the entry's next attempt snapshots, whichever
+  /// source instance it asks, until a snapshot succeeds. A source's own memory of failed fences
+  /// lives only as long as that instance.
+  private func requireSnapshot(identity: CollectionDemandIdentity, attempt: UUID) {
+    guard var entry = entries[identity], entry.attempt == attempt else { return }
+    entry.requiresSnapshot = true
+    entries[identity] = entry
   }
 
   private func clearResumingAttempt(identity: CollectionDemandIdentity, attempt: UUID) {

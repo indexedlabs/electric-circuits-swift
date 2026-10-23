@@ -24,7 +24,8 @@ public enum CircuitsSubsetSourceError: Error, Equatable, Sendable {
 /// feed, fence its durable frontier, query the subset snapshot, then consume the feed with awaited
 /// store application. A stable materialization ID is also the server subscription claim.
 ///
-/// The snapshot fence names the feed it was taken from (`subset-v2`), so a later acquire of the
+/// The snapshot fence names the feed it was taken from and the snapshot's transaction visibility
+/// (`subset-v2`), so a later acquire of the
 /// same cached demand can `resume`: re-join the identical feed request and, when the engine
 /// answers with the same shape, continue the tail from the stored cursor with no frontier read or
 /// snapshot query. Circuits shares shapes by `(table, canonical predicate, sorted columns,
@@ -164,7 +165,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       let lifecycle = CircuitsSubsetSessionLifecycle(client: client, initialHandle: feed)
       let snapshotFence = SnapshotFence(
         rawValue: SubsetSnapshotFence.v2(
-          shapeID: feed.id, offset: frontier.offset, sourceVersion: snapshotVersion.rawValue
+          shapeID: feed.id, offset: frontier.offset, sourceVersion: snapshotVersion.rawValue,
+          visibility: snapshotVersion.snapshot
         ).rawValue)
 
       let resumeFailures = resumeFailures
@@ -208,7 +210,9 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   /// - the last resume from this same fence ended in a terminal or non-retryable stream outcome;
   /// - the re-joined feed answers with a different shape ID. A replacement changes-only feed has
   ///   no history for the gap since the stored cursor, so only a new snapshot can close it. That
-  ///   create is kept for the `materialize` call that follows, so the fallback POSTs only once.
+  ///   create is kept for the `materialize` call that follows on this source instance, so the
+  ///   fallback POSTs only once; a caller that materializes through another instance should first
+  ///   call `cleanupAbandonedMaterialization` here, which releases it.
   ///
   /// Otherwise the session tails the same feed from the stored cursor and source version. Its
   /// subscription coordinator adopts this create's handle, so a resume POSTs `/subset-feeds`
@@ -221,7 +225,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   ) async throws -> CollectionResumeSession<Model, Key>? {
     let fence = SubsetSnapshotFence(rawValue: record.snapshotFence.rawValue)
     guard demand.limit == nil, demand.order.count <= 1, record.id == materializationID,
-      let cursor = record.cursor, case .v2(let fencedShapeID, _, _)? = fence
+      let cursor = record.cursor, case .v2(let fencedShapeID, _, _, let visibility)? = fence
     else { return nil }
     guard await resumeFailures.allowsResume(materializationID, from: record.snapshotFence) else {
       return nil
@@ -237,17 +241,12 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       return nil
     }
 
-    // The tail gates snapshot overlap at the stored source version. While the store still holds
-    // the snapshot's page version (no change accepted past it), that restores the original
-    // visibility gate exactly. Once a change has been accepted, the stored version is that
-    // change's LSN; the stream after the stored offset commits at or above it, so the LSN gate
-    // can re-admit only snapshot-visible commits ordered after an invisible one below the
-    // horizon, and the store's `supersedes` keeps their bytes from regressing a newer row.
     let lifecycle = CircuitsSubsetSessionLifecycle(client: client, initialHandle: feed)
     let resumeFailures = resumeFailures
     let storedFence = record.snapshotFence
     let start = TailStart(
-      feed: feed, request: feedRequest, cursor: cursor, sourceVersion: record.sourceVersion,
+      feed: feed, request: feedRequest, cursor: cursor,
+      sourceVersion: Self.resumedGate(record.sourceVersion, fencedVisibility: visibility),
       window: nil)
     return CollectionResumeSession(
       cursor: cursor,
@@ -371,6 +370,29 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     }
   }
 
+  /// The version a resumed tail gates snapshot overlap at, so it admits exactly what the
+  /// snapshot's own tail would have admitted from the stored cursor.
+  ///
+  /// While no change has been accepted past the snapshot, the stored version is the snapshot's
+  /// page version, and only its transaction visibility tells a commit the snapshot already holds
+  /// from one that was still in progress when it was taken: such a commit can sit after the
+  /// stored offset with an LSN below the snapshot's, and an LSN comparison would drop it. A store
+  /// need not keep that visibility with the version (`sourceVersion.snapshot`), so the fence
+  /// carries it and it is restored here. Once a change has been accepted, the stored version is
+  /// that change's LSN; the stream after the stored offset commits at or above it, so the LSN gate
+  /// can re-admit only snapshot-visible commits ordered after an invisible one below the
+  /// horizon, and the store's `supersedes` keeps their bytes from regressing a newer row. A
+  /// snapshot with no visibility (an older engine) was tailed by LSN from the start.
+  static func resumedGate(
+    _ stored: CollectionSourceVersion, fencedVisibility: CollectionPageSnapshot?
+  ) -> CollectionSourceVersion {
+    guard stored.snapshot == nil, let fencedVisibility, stored.order <= fencedVisibility.lsn
+    else { return stored }
+    return CollectionSourceVersion(
+      rawValue: stored.rawValue, order: stored.order, snapshot: fencedVisibility,
+      transactionID: stored.transactionID)
+  }
+
   /// Outcomes a re-join of the same feed from the same cursor would deterministically repeat:
   /// terminal stream receipts (404/410/`stream-closed`), a replacement shape on renewal, and
   /// non-retryable stream or HTTP failures. Transport loss, exhausted transient retries and
@@ -408,19 +430,33 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
 /// and joined by `|`, so application-controlled values cannot alias one another.
 ///
 /// `subset-v1|<offset>|<lsn>` predates resume: it does not name the feed its cursor belongs to,
-/// so it still parses but is never resumable. `subset-v2|<shapeId>|<offset>|<lsn>` adds the
-/// shape ID of the changes-only feed whose stream the stored cursor positions. The fence stays
-/// opaque to the collection core and to stores; only this source interprets it.
+/// so it still parses but is never resumable. `subset-v2|<shapeId>|<offset>|<lsn>|<snapshot>|
+/// <horizon>` adds the shape ID of the changes-only feed whose stream the stored cursor
+/// positions, and the snapshot's transaction visibility (`xmin:xmax:xip,…` and the horizon LSN,
+/// both empty when the engine sent none), which a resumed tail gates at (`resumedGate`). The
+/// fence stays opaque to the collection core and to stores; only this source interprets it.
 enum SubsetSnapshotFence: Equatable, Sendable {
   case v1(offset: String, sourceVersion: String)
-  case v2(shapeID: String, offset: String, sourceVersion: String)
+  case v2(
+    shapeID: String, offset: String, sourceVersion: String, visibility: CollectionPageSnapshot?)
 
   init?(rawValue: String) {
     switch Self.components(of: rawValue) {
     case let parts? where parts.count == 3 && parts[0] == "subset-v1":
       self = .v1(offset: parts[1], sourceVersion: parts[2])
-    case let parts? where parts.count == 4 && parts[0] == "subset-v2":
-      self = .v2(shapeID: parts[1], offset: parts[2], sourceVersion: parts[3])
+    case let parts? where parts.count == 6 && parts[0] == "subset-v2":
+      let visibility: CollectionPageSnapshot?
+      if parts[4].isEmpty, parts[5].isEmpty {
+        visibility = nil
+      } else {
+        // Visibility the fence names but that does not parse cannot gate a resumed tail.
+        guard let order = CollectionPageSnapshot.postgresLSN(parts[3]),
+          let parsed = CollectionPageSnapshot(lsn: order, snapshot: parts[4], horizon: parts[5])
+        else { return nil }
+        visibility = parsed
+      }
+      self = .v2(
+        shapeID: parts[1], offset: parts[2], sourceVersion: parts[3], visibility: visibility)
     default:
       return nil
     }
@@ -430,8 +466,11 @@ enum SubsetSnapshotFence: Equatable, Sendable {
     let parts =
       switch self {
       case .v1(let offset, let sourceVersion): ["subset-v1", offset, sourceVersion]
-      case .v2(let shapeID, let offset, let sourceVersion):
-        ["subset-v2", shapeID, offset, sourceVersion]
+      case .v2(let shapeID, let offset, let sourceVersion, let visibility):
+        [
+          "subset-v2", shapeID, offset, sourceVersion, visibility?.snapshotText ?? "",
+          visibility?.horizonText ?? "",
+        ]
       }
     return parts.map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
   }

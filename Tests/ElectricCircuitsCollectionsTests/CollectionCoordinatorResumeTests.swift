@@ -19,6 +19,8 @@ private actor ResumingSource: CollectionSourceAdapter {
     /// Return a session that claims to start somewhere the store does not hold.
     case wrongCursor
     case throwing
+    /// Resume, then fail the tail as a terminal stream outcome would.
+    case failingTail
   }
 
   struct ResumeFailure: Error {}
@@ -60,7 +62,7 @@ private actor ResumingSource: CollectionSourceAdapter {
     resumes += 1
     let cursor: StreamCursor
     switch mode {
-    case .resume:
+    case .resume, .failingTail:
       guard let stored = record.cursor else { return nil }
       cursor = stored
     case .wrongCursor:
@@ -69,9 +71,11 @@ private actor ResumingSource: CollectionSourceAdapter {
       throw ResumeFailure()
     }
     let (index, events) = openSession()
+    let failsTail = mode == .failingTail
     return CollectionResumeSession(
       cursor: cursor, sourceVersion: record.sourceVersion,
       run: { _, caughtUp in
+        if failsTail { throw ResumeFailure() }
         for await _ in events { await caughtUp() }
       },
       stop: { await self.stop(index) })
@@ -201,6 +205,35 @@ struct CollectionCoordinatorResumeTests {
     #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
     #expect(await source.materializations == 0)
     #expect(await store.rowClaims(for: materializationA) == [1, 2])
+
+    // The retry snapshots rather than asking the source to resume again.
+    await lease.refresh()
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await source.resumes == 1)
+    #expect(await source.materializations == 1)
+    #expect(await store.rowClaims(for: materializationA) == [9])
+    try await lease.release()
+  }
+
+  /// A resumed tail that fails is not resumed again, even by a source that keeps no memory of
+  /// failed fences (an app may build a new source for each attempt): the coordinator's next
+  /// attempt for the entry snapshots.
+  @Test func aFailedResumedTailMakesTheNextAttemptSnapshot() async throws {
+    let store = try await seededStore()
+    let source = ResumingSource(mode: .failingTail, snapshotRows: [9])
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: resumeScope, source: source, store: store)
+
+    let lease = await coordinator.acquire(demandA)
+    #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
+    #expect(await source.resumes == 1)
+    #expect(await source.materializations == 0)
+
+    await lease.refresh()
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await source.resumes == 1)
+    #expect(await source.materializations == 1)
+    #expect(await store.rowClaims(for: materializationA) == [9])
     try await lease.release()
   }
 
@@ -241,6 +274,33 @@ struct CollectionCoordinatorResumeTests {
     #expect(await source.resumes == 1)
     #expect(await source.materializations == 1)
     #expect(await source.stops == 1)
+    #expect(await screen.state() == .live)
+    #expect(await store.rowClaims(for: materializationA) == [2])
+
+    try await screen.release()
+    pass.cancel()
+    await pass.value
+  }
+
+  /// A screen that resumed and already reports live never re-read the source, so the stale pass
+  /// still revalidates it through a snapshot before it clears the mark.
+  @Test func stalePassSnapshotsAResumedScreenThatIsAlreadyLive() async throws {
+    let store = try await seededStore(markingA: true)
+    let source = ResumingSource(snapshotRows: [2])
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: resumeScope, source: source, store: store)
+    let screen = await coordinator.acquire(demandA)
+    #expect(await eventually { await source.resumes == 1 })
+    await source.signalCaughtUp()
+    #expect(await eventually { await screen.state() == .live })
+    #expect(await source.materializations == 0)
+
+    let pass = Task { await coordinator.startStaleRevalidation() }
+    await coordinator.setStaleRevalidationGate(isOpen: true)
+
+    #expect(await eventually { try await store.staleMaterializations().isEmpty })
+    #expect(await source.resumes == 1)
+    #expect(await source.materializations == 1)
     #expect(await screen.state() == .live)
     #expect(await store.rowClaims(for: materializationA) == [2])
 

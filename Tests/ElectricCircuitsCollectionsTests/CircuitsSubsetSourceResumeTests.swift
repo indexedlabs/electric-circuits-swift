@@ -202,7 +202,7 @@ struct CircuitsSubsetSourceResumeTests {
     let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
     let seeded = try await seedBySnapshot(transport, store: store)
     #expect(seeded.cursor == StreamCursor(offset: "10", lsn: "0/10"))
-    #expect(seeded.snapshotFence.rawValue == "9:subset-v2|7:shape-1|2:10|4:0/10")
+    #expect(seeded.snapshotFence.rawValue == "9:subset-v2|7:shape-1|2:10|4:0/10|0:|0:")
     #expect(await store.rowClaims(for: seeded.id) == [1, 3])
 
     await transport.script(
@@ -285,7 +285,7 @@ struct CircuitsSubsetSourceResumeTests {
     #expect(await transport.streamOffsets("shape-1") == ["10"])
     let replaced = try #require(try await store.materialization(for: openIdentity))
     #expect(replaced.id == seeded.id)
-    #expect(replaced.snapshotFence.rawValue == "9:subset-v2|7:shape-2|2:10|4:0/40")
+    #expect(replaced.snapshotFence.rawValue == "9:subset-v2|7:shape-2|2:10|4:0/40|0:|0:")
     #expect(await store.rows() == [1: ResumeIssue(id: 1, title: "Fresh")])
     try await lease.release()
   }
@@ -304,15 +304,16 @@ struct CircuitsSubsetSourceResumeTests {
     #expect(await transport.count("POST", "/v1/subsets/query") == 1)
     #expect(try await store.materialization(for: openIdentity) == seeded)
 
-    // The same source remembers that this fence's resume was terminal, so the retry snapshots
-    // rather than re-joining a stream the engine will not serve from that cursor.
+    // The failed resume is not retried as one: the coordinator's next attempt, and this
+    // source's memory of the fence, both make the retry snapshot rather than re-join a stream
+    // the engine will not serve from that cursor.
     await lease.refresh()
     #expect(await eventually { await lease.state() == .live })
     #expect(await transport.count("POST", "/v1/subsets/query") == 2)
     #expect(await transport.count("POST", "/v1/subset-feeds") == 3)
     #expect(await transport.count("HEAD", "/streams/shape-1") == 2)
     let refreshed = try #require(try await store.materialization(for: openIdentity))
-    #expect(refreshed.snapshotFence.rawValue == "9:subset-v2|7:shape-1|2:10|4:0/40")
+    #expect(refreshed.snapshotFence.rawValue == "9:subset-v2|7:shape-1|2:10|4:0/40|0:|0:")
     #expect(await store.rows() == [1: ResumeIssue(id: 1, title: "Fresh")])
     try await lease.release()
   }
@@ -338,7 +339,7 @@ struct CircuitsSubsetSourceResumeTests {
     #expect(await transport.count("POST", "/v1/subsets/query") == 1)
     let rewritten = try #require(try await store.materialization(for: openIdentity))
     #expect(rewritten.id == id)
-    #expect(rewritten.snapshotFence.rawValue == "9:subset-v2|7:shape-1|2:10|4:0/10")
+    #expect(rewritten.snapshotFence.rawValue == "9:subset-v2|7:shape-1|2:10|4:0/10|0:|0:")
     try await lease.release()
   }
 
@@ -353,13 +354,25 @@ struct CircuitsSubsetSourceResumeTests {
         id: id, demand: identity, state: .live, snapshotFence: SnapshotFence(rawValue: fence),
         sourceVersion: CollectionSourceVersion(rawValue: "0/10", order: 0x10), cursor: cursor)
     }
-    let v2 = "9:subset-v2|7:shape-1|2:10|4:0/10"
+    let v2 = "9:subset-v2|7:shape-1|2:10|4:0/10|0:|0:"
     let cursor = StreamCursor(offset: "10", lsn: "0/10")
 
     let versionOne = try await source.resume(
       openIssues, identity: openIdentity, materializationID: id,
       record: record(for: openIdentity, fence: "9:subset-v1|2:10|4:0/10", cursor: cursor))
     #expect(versionOne == nil)
+
+    // A fence from before visibility was recorded, and one whose visibility does not parse,
+    // cannot gate a resumed tail.
+    let fourPart = try await source.resume(
+      openIssues, identity: openIdentity, materializationID: id,
+      record: record(for: openIdentity, fence: "9:subset-v2|7:shape-1|2:10|4:0/10", cursor: cursor))
+    #expect(fourPart == nil)
+    let badVisibility = try await source.resume(
+      openIssues, identity: openIdentity, materializationID: id,
+      record: record(
+        for: openIdentity, fence: "9:subset-v2|7:shape-1|2:10|4:0/10|3:bad|4:0/30", cursor: cursor))
+    #expect(badVisibility == nil)
 
     let cursorless = try await source.resume(
       openIssues, identity: openIdentity, materializationID: id,
@@ -381,6 +394,54 @@ struct CircuitsSubsetSourceResumeTests {
     #expect(limited == nil)
 
     #expect(await transport.requests.isEmpty)
+  }
+
+  /// A store need not keep the snapshot's transaction visibility with its source version (the
+  /// app's GRDB store keeps only the LSN), so the fence carries it. A commit that was still in
+  /// progress when the snapshot was taken can sit after the stored offset with an LSN below the
+  /// snapshot's; the resumed tail must admit it as the snapshot's own tail would have, and still
+  /// skip a commit the snapshot already holds.
+  @Test func aResumeRestoresTheSnapshotVisibilityTheStoreDidNotKeep() async throws {
+    let transport = ResumeFeedTransport(queryBodies: [
+      #"{"rows":[{"id":1,"title":"One"}],"lsn":"0/100","snapshot":"100:110:105","horizon":"0/180"}"#
+    ])
+    let seeded = try await seedBySnapshot(
+      transport, store: InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id))
+    #expect(
+      seeded.snapshotFence.rawValue
+        == "9:subset-v2|7:shape-1|2:10|5:0/100|11:100:110:105|5:0/180")
+
+    // The same record in a store that dropped `sourceVersion.snapshot`.
+    let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
+    try await store.replaceSnapshot(
+      CollectionSnapshot(
+        rows: [ResumeIssue(id: 1, title: "One")], fence: seeded.snapshotFence,
+        sourceVersion: CollectionSourceVersion(rawValue: "0/100", order: 0x100),
+        cursor: try #require(seeded.cursor)),
+      materializationID: seeded.id, demand: openIdentity)
+    #expect(try await store.materialization(for: openIdentity)?.sourceVersion.snapshot == nil)
+
+    await transport.script(
+      "shape-1",
+      [
+        .batch(
+          #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"Already in the snapshot"},"headers":{"operation":"update","lsn":"0/F0","txid":"104"}},{"type":"public.issues","key":"2","value":{"id":2,"title":"Committed during snapshot"},"headers":{"operation":"insert","lsn":"0/FF","txid":"105"}}]"#,
+          next: "11")
+      ])
+    let lease = await relaunch(transport, store: store).acquire(openIssues)
+
+    #expect(await eventually { await lease.state() == .live })
+    #expect(
+      await eventually {
+        try await store.materialization(for: openIdentity)?.cursor?.offset == "11"
+      })
+    #expect(
+      await store.rows() == [
+        1: ResumeIssue(id: 1, title: "One"),
+        2: ResumeIssue(id: 2, title: "Committed during snapshot"),
+      ])
+    #expect(await transport.count("POST", "/v1/subsets/query") == 1)
+    try await lease.release()
   }
 
   @Test func aLimitedCachedWindowSnapshotsItsPage() async throws {

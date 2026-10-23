@@ -91,8 +91,9 @@ a `CollectionResumeSession` (a live tail from the stored cursor and source versi
 resumed attempt skips `replaceSnapshot`: the demand stays `.cached` and reports `.live` once the
 tail commits a batch or answers an idle poll, and feed deletes release claims through the ordinary
 store `apply`. Nil takes the snapshot path; the default implementation always returns nil. Stale
-revalidation always snapshots. `CircuitsSubsetSource` fences each snapshot with the feed's shape ID
-(`subset-v2`) and resumes by re-joining the identical feed request: Circuits shares shapes by table,
+revalidation always snapshots, and a resume that fails is not retried as one.
+`CircuitsSubsetSource` fences each snapshot with the feed's shape ID and the snapshot's transaction
+visibility (`subset-v2`), and resumes by re-joining the identical feed request: Circuits shares shapes by table,
 canonical predicate, sorted columns and `changes_only`, so the same shape ID means the stored offset
 is still a position in that append-only stream. A resume makes one `/v1/subset-feeds` POST and no
 frontier `HEAD` or snapshot query. Limited windows, `subset-v1` fences, a replaced shape ID, and a
