@@ -40,7 +40,7 @@ in the current generation; after successful replacement, the old materialization
 its claims cannot retain stale rows. Other principals and authorization scopes are excluded.
 Idle listings run every five seconds; opening the gate, local snapshot/feed writes, completed
 runs and retry expiry wake the pass immediately. Cancel and await the task when
-retiring its scope or generation. The store protocol is unchanged in 0.7.0.
+retiring its scope or generation. The store protocol is unchanged in 0.7.1.
 
 For app-wide scheduling across collections, await `drainStaleRevalidation()` before opening the
 next collection's gate or starting an explicit repair read. Drain closes admission and lets
@@ -257,7 +257,7 @@ wire contract, public API, and provider-schema release rules are explicit in
 [Policies/SUPPORT.md](Policies/SUPPORT.md) and [Policies/SEMVER.md](Policies/SEMVER.md). The DocC
 catalog begins at `ElectricCircuitsSwift` in Xcode's documentation viewer.
 
-## Install 0.7.0
+## Install 0.7.1
 
 Custom `CollectionStore` providers must implement `staleMaterializations()` and
 `clearStale(_:ifMarkedAt:)`. A snapshot omission or feed delete of a held row releases only that
@@ -275,7 +275,7 @@ dependencies.
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.7.0"),
+  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.7.1"),
 ]
 ```
 
