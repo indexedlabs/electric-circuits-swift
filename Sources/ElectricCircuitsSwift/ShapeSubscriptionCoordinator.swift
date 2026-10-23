@@ -668,9 +668,11 @@ public actor ShapeSubscriptionCoordinator {
         // A reader can commit one or more batches before a later poll fails. Retry budget and
         // backoff count consecutive failures, so progress since this attempt began starts a fresh
         // budget rather than carrying failures from the prior cursor forward.
-        if let committedAfterFailure = try? await committedCursor(),
-          committedAfterFailure.offset != cursorAtAttempt.offset
-        {
+        let committedAfterFailure = try? await committedCursor()
+        // The read suspends this actor, so stop() or a replacement renew may have retired this
+        // stream meanwhile; a retired stream must not publish another retry or failure state.
+        guard isCurrent(generation), !Task.isCancelled else { return }
+        if let committedAfterFailure, committedAfterFailure.offset != cursorAtAttempt.offset {
           retries = 0
         }
         guard isRetryable(error), retries < retryPolicy.maxRetries else {

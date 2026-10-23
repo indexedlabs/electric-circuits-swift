@@ -358,6 +358,60 @@ private actor GatedMaterializer: ShapeMaterializer {
   func releaseApply() { released = true }
 }
 
+/// Holds the next committed-cursor read once armed, so a test can stop the coordinator while
+/// the stream's post-failure progress check is suspended.
+private actor HeldCursorReadMaterializer: ShapeMaterializer {
+  private var cursor: StreamCursor?
+  private var holdNextRead = false
+  private var readHeld = false
+  private var released = false
+  func apply(
+    _ batch: ChangeBatch,
+    expecting expectedCursor: StreamCursor?,
+    advancingTo cursor: StreamCursor
+  ) async throws {
+    if self.cursor == cursor { return }
+    guard self.cursor == expectedCursor else {
+      throw StreamError.cursorConflict(
+        expected: expectedCursor, actual: self.cursor, advancingTo: cursor)
+    }
+    self.cursor = cursor
+  }
+  func currentCursor() async throws -> StreamCursor? {
+    if holdNextRead {
+      holdNextRead = false
+      readHeld = true
+      while !released { await Task.yield() }
+    }
+    return cursor
+  }
+  func holdNextCursorRead() { holdNextRead = true }
+  func isReadHeld() -> Bool { readHeld }
+  func releaseRead() { released = true }
+}
+
+/// Serves a shape, then one retryable poll failure that arms the materializer's next cursor read,
+/// which is the stream's post-failure progress check. Later requests (the release) get a 404.
+private actor PollFailureArmingTransport: HTTPTransport {
+  private let materializer: HeldCursorReadMaterializer
+  private(set) var requests: [URLRequest] = []
+
+  init(materializer: HeldCursorReadMaterializer) { self.materializer = materializer }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    switch requests.count {
+    case 1:
+      return shapeResponse()
+    case 2:
+      await materializer.holdNextCursorRead()
+      return response("temporary", status: 503)
+    default:
+      return response("", status: 404)
+    }
+  }
+}
+
 private enum UnavailableStore: Error, Sendable {
   case locked
 }
@@ -870,6 +924,48 @@ struct ShapeSubscriptionCoordinatorTests {
           .retryExhausted(operation: "stream", attempts: 3, cause: .http(status: 503))))
     #expect(await clock.delays == [.seconds(1), .seconds(2)])
     try await coordinator.stop()
+  }
+
+  @Test func stopDuringPostFailureCursorReadPublishesNoRetryState() async throws {
+    let materializer = HeldCursorReadMaterializer()
+    let transport = PollFailureArmingTransport(materializer: materializer)
+    let clock = RecordingClock()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "stable-claim"),
+      materializer: materializer,
+      retryPolicy: .init(
+        maxRetries: 1, baseDelay: .seconds(1), maximumDelay: .seconds(1), jitterRatio: 0),
+      clock: clock)
+    let stateUpdates = await coordinator.stateUpdates
+    let published = Task { () -> [ShapeSubscriptionState] in
+      var states: [ShapeSubscriptionState] = []
+      for await state in stateUpdates { states.append(state) }
+      return states
+    }
+
+    _ = try await coordinator.start()
+    for _ in 0..<1_000 {
+      if await materializer.isReadHeld() { break }
+      await Task.yield()
+    }
+    #expect(await materializer.isReadHeld())
+    let stop = Task { try await coordinator.stop() }
+    for _ in 0..<1_000 {
+      if await coordinator.state == .stopping { break }
+      await Task.yield()
+    }
+    #expect(await coordinator.state == .stopping)
+    await materializer.releaseRead()
+    try await stop.value
+
+    let states = await published.value
+    let afterStopping = states.drop(while: { $0 != .stopping })
+    #expect(Array(afterStopping) == [.stopping, .stopped])
+    #expect(await clock.delays.isEmpty)
+    #expect(await coordinator.state == .stopped)
   }
 
   @Test func epochResetIsTerminalAndIsNotRetried() async throws {
