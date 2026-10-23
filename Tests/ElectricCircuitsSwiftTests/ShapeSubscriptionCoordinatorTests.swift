@@ -390,6 +390,29 @@ private actor HeldCursorReadMaterializer: ShapeMaterializer {
   func releaseRead() { released = true }
 }
 
+/// Resumes from a stored checkpoint, but every even-numbered cursor read fails until `failures`
+/// reads have failed. After the coordinator's opening availability read, that fails each stream
+/// attempt's first read while its post-failure read succeeds.
+private actor AlternatingCursorReadMaterializer: ShapeMaterializer {
+  private let cursor = StreamCursor(offset: "5")
+  private var reads = 0
+  private var failures: Int
+  init(failures: Int) { self.failures = failures }
+  func currentCursor() async throws -> StreamCursor? {
+    reads += 1
+    if failures > 0, reads.isMultiple(of: 2) {
+      failures -= 1
+      throw UnavailableStore.locked
+    }
+    return cursor
+  }
+  func apply(
+    _: ChangeBatch,
+    expecting _: StreamCursor?,
+    advancingTo _: StreamCursor
+  ) async throws {}
+}
+
 /// Serves a shape, then one retryable poll failure that arms the materializer's next cursor read,
 /// which is the stream's post-failure progress check. Later requests (the release) get a 404.
 private actor PollFailureArmingTransport: HTTPTransport {
@@ -923,6 +946,42 @@ struct ShapeSubscriptionCoordinatorTests {
         == .failed(
           .retryExhausted(operation: "stream", attempts: 3, cause: .http(status: 503))))
     #expect(await clock.delays == [.seconds(1), .seconds(2)])
+    try await coordinator.stop()
+  }
+
+  @Test func failedAttemptCursorReadDoesNotCountAsProgress() async throws {
+    let transport = CoordinatorTransport(responses: [
+      shapeResponse(),
+      response("", status: 404),
+      response("", status: 404),
+    ])
+    let clock = RecordingClock()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "claim"),
+      materializer: AlternatingCursorReadMaterializer(failures: 4),
+      retryPolicy: .init(
+        maxRetries: 2, baseDelay: .seconds(1), maximumDelay: .seconds(2), jitterRatio: 0,
+        randomUnit: { 0.5 }),
+      clock: clock)
+
+    _ = try await coordinator.start()
+    for _ in 0..<1_000 {
+      let state = await coordinator.state
+      if case .failed = state { break }
+      if case .reseedRequired = state { break }
+      await Task.yield()
+    }
+
+    let state = await coordinator.state
+    #expect(
+      state
+        == .failed(
+          .retryExhausted(operation: "stream", attempts: 3, cause: .transport(.unknown))))
+    #expect(await clock.delays == [.seconds(1), .seconds(2)])
+    #expect(await transport.requests.count == 1)
     try await coordinator.stop()
   }
 

@@ -646,11 +646,14 @@ public actor ShapeSubscriptionCoordinator {
 
   private func consume(handle streamHandle: ShapeHandle, generation: UInt64) async {
     var retries = 0
-    var cursorAtAttempt = StreamCursor.beginning
     while isCurrent(generation) {
+      // Unknown until this attempt's own read succeeds: a failed read must not leave the previous
+      // attempt's cursor as the baseline, or the post-failure read would look like progress.
+      var cursorAtAttempt: StreamCursor?
       do {
-        cursorAtAttempt = try await committedCursor()
-        transition(.streaming(cursorAtAttempt))
+        let attemptCursor = try await committedCursor()
+        cursorAtAttempt = attemptCursor
+        transition(.streaming(attemptCursor))
         let reader = ShapeStreamReader(
           streamURL: streamHandle.stream.url, transport: transport,
           materializer: CoordinatedMaterializer(base: materializer), telemetry: telemetry,
@@ -672,7 +675,9 @@ public actor ShapeSubscriptionCoordinator {
         // The read suspends this actor, so stop() or a replacement renew may have retired this
         // stream meanwhile; a retired stream must not publish another retry or failure state.
         guard isCurrent(generation), !Task.isCancelled else { return }
-        if let committedAfterFailure, committedAfterFailure.offset != cursorAtAttempt.offset {
+        if let cursorAtAttempt, let committedAfterFailure,
+          committedAfterFailure.offset != cursorAtAttempt.offset
+        {
           retries = 0
         }
         guard isRetryable(error), retries < retryPolicy.maxRetries else {
