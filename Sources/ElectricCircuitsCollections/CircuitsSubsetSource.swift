@@ -24,13 +24,15 @@ public enum CircuitsSubsetSourceError: Error, Equatable, Sendable {
 /// feed, fence its durable frontier, query the subset snapshot, then consume the feed with awaited
 /// store application. A stable materialization ID is also the server subscription claim.
 ///
-/// The snapshot fence names the feed it was taken from and the snapshot's transaction visibility
-/// (`subset-v2`), so a later acquire of the
-/// same cached demand can `resume`: re-join the identical feed request and, when the engine
-/// answers with the same shape, continue the tail from the stored cursor with no frontier read or
-/// snapshot query. Circuits shares shapes by `(table, canonical predicate, sorted columns,
-/// changes_only)`, and a changes-only feed's stream is append-only until the engine evicts it, so
-/// the same shape ID proves the stored offset is still a gap-free position in that stream.
+/// The snapshot fence names the stream it was taken from and the snapshot's transaction
+/// visibility (`subset-v2`), so a later acquire of the same cached demand can `resume`: re-join
+/// the identical feed request and, when the engine answers with the same stream URL, continue the
+/// tail from the stored cursor with no frontier read or snapshot query. Circuits shares shapes by
+/// `(table, canonical predicate, sorted columns, changes_only)`, a changes-only feed's stream is
+/// append-only until the engine retires it, and within one catalog a shape ID is never minted
+/// twice; the stream URL also names the catalog's namespace and generations, where shape IDs
+/// restart. So the same stream URL proves the stored offset is still a gap-free position in that
+/// stream (`Contracts/native-v1-contract-v1.md`, "Feed continuity").
 public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   CollectionSourceAdapter
 {
@@ -99,15 +101,17 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     try await pendingCleanup.retry(materializationID)
     let feedRequest = feedRequest(for: demand, materializationID: materializationID)
     let feed: ShapeHandle
+    let feedCreatedAt: ContinuousClock.Instant
     if let adopted = await pendingCleanup.takeAdoptable(materializationID) {
       // A resume that found its feed replaced already established this claim moments ago; the
       // frontier read and snapshot below fence against it exactly as against a fresh create.
-      feed = adopted
+      (feed, feedCreatedAt) = (adopted.handle, adopted.createdAt)
     } else {
       // The initial feed create is the same native route the coordinator later renews, so it
       // carries the same recreate vocabulary. A persisted materialization ID joining a dormant
       // shape whose fall-through the engine has exhausted must re-POST the identical claim, not
       // fail setup before the frontier HEAD and snapshot query.
+      feedCreatedAt = .now
       feed = try await createFeed(feedRequest)
     }
 
@@ -165,7 +169,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       let lifecycle = CircuitsSubsetSessionLifecycle(client: client, initialHandle: feed)
       let snapshotFence = SnapshotFence(
         rawValue: SubsetSnapshotFence.v2(
-          shapeID: feed.id, offset: frontier.offset, sourceVersion: snapshotVersion.rawValue,
+          stream: feed.response.streamURL.absoluteString, offset: frontier.offset,
+          sourceVersion: snapshotVersion.rawValue,
           visibility: snapshotVersion.snapshot
         ).rawValue)
 
@@ -176,8 +181,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
         run: { apply in
           try await runTail(
             TailStart(
-              feed: feed, request: feedRequest, cursor: cursor, sourceVersion: snapshotVersion,
-              window: window),
+              feed: feed, createdAt: feedCreatedAt, request: feedRequest, cursor: cursor,
+              sourceVersion: snapshotVersion, window: window),
             lifecycle: lifecycle, transport: transport, apply: apply,
             onFailure: { failure in
               // The record this snapshot writes names this feed; a later resume from it would
@@ -208,7 +213,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   /// - the demand is a limited window (its live state is the page, which needs a query anyway);
   /// - the fence predates `subset-v2` and so does not name its feed, or the record has no cursor;
   /// - the last resume from this same fence ended in a terminal or non-retryable stream outcome;
-  /// - the re-joined feed answers with a different shape ID. A replacement changes-only feed has
+  /// - the re-joined feed answers with a different stream URL. A replacement changes-only feed has
   ///   no history for the gap since the stored cursor, so only a new snapshot can close it. That
   ///   create is kept for the `materialize` call that follows on this source instance, so the
   ///   fallback POSTs only once; a caller that materializes through another instance should first
@@ -225,7 +230,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   ) async throws -> CollectionResumeSession<Model, Key>? {
     let fence = SubsetSnapshotFence(rawValue: record.snapshotFence.rawValue)
     guard demand.limit == nil, demand.order.count <= 1, record.id == materializationID,
-      let cursor = record.cursor, case .v2(let fencedShapeID, _, _, let visibility)? = fence
+      let cursor = record.cursor, case .v2(let fencedStream, _, _, let visibility)? = fence
     else { return nil }
     guard await resumeFailures.allowsResume(materializationID, from: record.snapshotFence) else {
       return nil
@@ -235,9 +240,10 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     try await pendingCleanup.retry(materializationID)
     try await pendingCleanup.releaseAdoptable(materializationID)
     let feedRequest = feedRequest(for: demand, materializationID: materializationID)
+    let createdAt = ContinuousClock.Instant.now
     let feed = try await createFeed(feedRequest)
-    guard feed.id == fencedShapeID else {
-      await pendingCleanup.keepAdoptable(feed, for: materializationID)
+    guard feed.response.streamURL.absoluteString == fencedStream else {
+      await pendingCleanup.keepAdoptable(feed, createdAt: createdAt, for: materializationID)
       return nil
     }
 
@@ -245,26 +251,35 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     let resumeFailures = resumeFailures
     let storedFence = record.snapshotFence
     let start = TailStart(
-      feed: feed, request: feedRequest, cursor: cursor,
+      feed: feed, createdAt: createdAt, request: feedRequest, cursor: cursor,
       sourceVersion: Self.resumedGate(record.sourceVersion, fencedVisibility: visibility),
       window: nil)
     return CollectionResumeSession(
       cursor: cursor,
       sourceVersion: record.sourceVersion,
       run: { apply, caughtUp in
-        try await runTail(
-          start, lifecycle: lifecycle,
-          // The subscription coordinator uses this transport only for stream reads from the
-          // stored cursor onward, so an idle answer there is the resumed tail's up-to-date proof.
-          transport: CaughtUpObservingTransport(base: transport, caughtUp: caughtUp),
-          apply: apply,
-          onFailure: { failure in
-            // Re-joining the same feed would repeat this outcome. Remember it so the next
-            // attempt snapshots instead of looping on a cursor the engine will not serve.
-            if Self.failureInvalidatesResume(failure) {
-              await resumeFailures.record(materializationID, fence: storedFence)
-            }
-          })
+        do {
+          try await runTail(
+            start, lifecycle: lifecycle,
+            // The subscription coordinator uses this transport only for stream reads from the
+            // stored cursor onward, so an idle answer there is the resumed tail's up-to-date proof.
+            transport: CaughtUpObservingTransport(base: transport, caughtUp: caughtUp),
+            apply: apply,
+            onFailure: { failure in
+              // Re-joining the same feed would repeat this outcome. Remember it so this source
+              // declines the fence rather than re-join a cursor the engine will not serve.
+              if Self.failureInvalidatesResume(failure) {
+                await resumeFailures.record(materializationID, fence: storedFence)
+              }
+            })
+        } catch {
+          // The coordinator reseeds by snapshot on a cursor the feed refused, and fails the
+          // attempt on anything else.
+          if await !resumeFailures.allowsResume(materializationID, from: storedFence) {
+            throw CollectionResumeInvalidated(cause: error)
+          }
+          throw error
+        }
       },
       stop: { try await lifecycle.stop() }
     )
@@ -295,10 +310,12 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     }
   }
 
-  /// Where a session's live tail starts: the feed handle its create returned, the identical
-  /// request the subscription coordinator renews with, and the stored or snapshot position.
+  /// Where a session's live tail starts: the feed handle its create returned and when that create
+  /// was sent, the identical request the subscription coordinator renews with, and the stored or
+  /// snapshot position.
   private struct TailStart: Sendable {
     let feed: ShapeHandle
+    let createdAt: ContinuousClock.Instant
     let request: ShapeRequest
     let cursor: StreamCursor
     let sourceVersion: CollectionSourceVersion
@@ -338,7 +355,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       telemetry: telemetry,
       kind: .subsetFeed,
       recreatePolicy: recreatePolicy,
-      adopting: start.feed
+      adopting: start.feed,
+      createdAt: start.createdAt
     )
     try await lifecycle.install(coordinator)
     let states = await coordinator.stateUpdates
@@ -430,15 +448,15 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
 /// and joined by `|`, so application-controlled values cannot alias one another.
 ///
 /// `subset-v1|<offset>|<lsn>` predates resume: it does not name the feed its cursor belongs to,
-/// so it still parses but is never resumable. `subset-v2|<shapeId>|<offset>|<lsn>|<snapshot>|
-/// <horizon>` adds the shape ID of the changes-only feed whose stream the stored cursor
-/// positions, and the snapshot's transaction visibility (`xmin:xmax:xip,…` and the horizon LSN,
+/// so it still parses but is never resumable. `subset-v2|<streamUrl>|<offset>|<lsn>|<snapshot>|
+/// <horizon>` adds the URL of the changes-only feed's stream that the stored cursor positions,
+/// and the snapshot's transaction visibility (`xmin:xmax:xip,…` and the horizon LSN,
 /// both empty when the engine sent none), which a resumed tail gates at (`resumedGate`). The
 /// fence stays opaque to the collection core and to stores; only this source interprets it.
 enum SubsetSnapshotFence: Equatable, Sendable {
   case v1(offset: String, sourceVersion: String)
   case v2(
-    shapeID: String, offset: String, sourceVersion: String, visibility: CollectionPageSnapshot?)
+    stream: String, offset: String, sourceVersion: String, visibility: CollectionPageSnapshot?)
 
   init?(rawValue: String) {
     switch Self.components(of: rawValue) {
@@ -456,7 +474,7 @@ enum SubsetSnapshotFence: Equatable, Sendable {
         visibility = parsed
       }
       self = .v2(
-        shapeID: parts[1], offset: parts[2], sourceVersion: parts[3], visibility: visibility)
+        stream: parts[1], offset: parts[2], sourceVersion: parts[3], visibility: visibility)
     default:
       return nil
     }
@@ -466,9 +484,9 @@ enum SubsetSnapshotFence: Equatable, Sendable {
     let parts =
       switch self {
       case .v1(let offset, let sourceVersion): ["subset-v1", offset, sourceVersion]
-      case .v2(let shapeID, let offset, let sourceVersion, let visibility):
+      case .v2(let stream, let offset, let sourceVersion, let visibility):
         [
-          "subset-v2", shapeID, offset, sourceVersion, visibility?.snapshotText ?? "",
+          "subset-v2", stream, offset, sourceVersion, visibility?.snapshotText ?? "",
           visibility?.horizonText ?? "",
         ]
       }
@@ -516,7 +534,8 @@ enum SubsetSnapshotFence: Equatable, Sendable {
 private actor PendingSubsetFeedCleanup {
   private let client: ElectricCircuitsClient
   private var handles: [CollectionMaterializationID: ShapeHandle] = [:]
-  private var adoptable: [CollectionMaterializationID: ShapeHandle] = [:]
+  private var adoptable:
+    [CollectionMaterializationID: (handle: ShapeHandle, createdAt: ContinuousClock.Instant)] = [:]
 
   init(client: ElectricCircuitsClient) {
     self.client = client
@@ -532,18 +551,25 @@ private actor PendingSubsetFeedCleanup {
     handles.removeValue(forKey: materializationID)
   }
 
-  func keepAdoptable(_ handle: ShapeHandle, for materializationID: CollectionMaterializationID) {
-    adoptable[materializationID] = handle
+  func keepAdoptable(
+    _ handle: ShapeHandle, createdAt: ContinuousClock.Instant,
+    for materializationID: CollectionMaterializationID
+  ) {
+    adoptable[materializationID] = (handle, createdAt)
   }
 
-  func takeAdoptable(_ materializationID: CollectionMaterializationID) -> ShapeHandle? {
+  func takeAdoptable(
+    _ materializationID: CollectionMaterializationID
+  ) -> (handle: ShapeHandle, createdAt: ContinuousClock.Instant)? {
     adoptable.removeValue(forKey: materializationID)
   }
 
   func releaseAdoptable(_ materializationID: CollectionMaterializationID) async throws {
-    guard let handle = adoptable[materializationID] else { return }
+    guard let handle = adoptable[materializationID]?.handle else { return }
     try await client.releaseShape(handle)
-    if adoptable[materializationID] == handle { adoptable.removeValue(forKey: materializationID) }
+    if adoptable[materializationID]?.handle == handle {
+      adoptable.removeValue(forKey: materializationID)
+    }
   }
 }
 

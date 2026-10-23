@@ -88,6 +88,29 @@ discarding the retired generation's materialization scope and cursor; never reus
 transport/nonterminal HTTP failures are retryable only under the caller/coordinator's bounded retry
 policy. Reset/recreate starts a new scope keyed by principal, template, subscription, and generation.
 
+## Feed continuity
+
+The engine shares a changes-only subset feed by `(table, canonical where, sorted columns,
+changesOnly)`. Releasing the last claim, by `DELETE` or a lapsed lease, does not retire the feed:
+the engine keeps appending to its stream until an idle grace period passes, then retires it
+(`stream-closed`, then `404` or `410`). While the feed is registered, a later `POST
+/v1/subset-feeds` with the identical request returns the same `shapeId` and `streamUrl`; once it is
+retired, the create mints a new `shapeId`. Within one engine catalog a shape ID is never minted
+twice. Shape IDs and `streamPath` restart in a new query or store generation, and only `streamUrl`
+names that generation.
+
+So a `stream-next-offset` read from a `streamUrl` stays a gap-free position in that stream for as
+long as a create for the identical request returns the same `streamUrl`. A client may store the
+offset with its materialization and, after re-joining, read on from it instead of taking a new
+frontier and snapshot. It compares `streamUrl`, never `shapeId` alone. A read from a stored offset
+may repeat a change the client already applied (a feed restored after an engine restart replays
+idempotently), but never skips one. `404`, `410` or `stream-closed` on that read is the terminal
+result above: discard the stored offset and snapshot.
+
+The engine's OpenAPI document does not state this; it is engine behavior (`electric-circuits`
+`82c77935`) pinned by its retention and retirement conformance tests. The JSON projection, a drift
+gate against that document, gains it when the engine documents it.
+
 ## Scalar and cursor rules
 
 Rows use JSON objects. `null` maps to `JSONValue.null`; missing object members remain missing and

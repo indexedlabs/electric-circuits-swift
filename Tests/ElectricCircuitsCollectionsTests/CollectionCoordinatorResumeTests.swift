@@ -19,8 +19,12 @@ private actor ResumingSource: CollectionSourceAdapter {
     /// Return a session that claims to start somewhere the store does not hold.
     case wrongCursor
     case throwing
-    /// Resume, then fail the tail as a terminal stream outcome would.
-    case failingTail
+    /// Resume, then fail the tail as lost transport would.
+    case transientTailFailure
+    /// Resume, then refuse the stored cursor before any read, as a `410` would.
+    case refusedCursor
+    /// Resume, report one idle poll, then refuse the cursor.
+    case refusedCursorAfterCatchUp
   }
 
   struct ResumeFailure: Error {}
@@ -62,7 +66,7 @@ private actor ResumingSource: CollectionSourceAdapter {
     resumes += 1
     let cursor: StreamCursor
     switch mode {
-    case .resume, .failingTail:
+    case .resume, .transientTailFailure, .refusedCursor, .refusedCursorAfterCatchUp:
       guard let stored = record.cursor else { return nil }
       cursor = stored
     case .wrongCursor:
@@ -71,12 +75,23 @@ private actor ResumingSource: CollectionSourceAdapter {
       throw ResumeFailure()
     }
     let (index, events) = openSession()
-    let failsTail = mode == .failingTail
+    let mode = mode
     return CollectionResumeSession(
       cursor: cursor, sourceVersion: record.sourceVersion,
       run: { _, caughtUp in
-        if failsTail { throw ResumeFailure() }
-        for await _ in events { await caughtUp() }
+        switch mode {
+        case .transientTailFailure:
+          throw ResumeFailure()
+        case .refusedCursor:
+          throw CollectionResumeInvalidated(cause: ResumeFailure())
+        case .refusedCursorAfterCatchUp:
+          for await _ in events {
+            await caughtUp()
+            throw CollectionResumeInvalidated(cause: ResumeFailure())
+          }
+        case .resume, .wrongCursor, .throwing:
+          for await _ in events { await caughtUp() }
+        }
       },
       stop: { await self.stop(index) })
   }
@@ -206,34 +221,68 @@ struct CollectionCoordinatorResumeTests {
     #expect(await source.materializations == 0)
     #expect(await store.rowClaims(for: materializationA) == [1, 2])
 
-    // The retry snapshots rather than asking the source to resume again.
+    // A resume the source could not set up says nothing about the stored cursor, so the retry
+    // asks again rather than re-querying the page.
     await lease.refresh()
+    #expect(await eventually { await source.resumes == 2 })
+    #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
+    #expect(await source.materializations == 0)
+    #expect(await store.rowClaims(for: materializationA) == [1, 2])
+    try await lease.release()
+  }
+
+  /// A cursor the feed refuses is an ordinary reseed: the same attempt stops the resumed session
+  /// and snapshots, so the lease sees no failure and needs no refresh, whichever source instance
+  /// a later attempt asks.
+  @Test func aRefusedCursorSnapshotsInTheSameAttempt() async throws {
+    let store = try await seededStore()
+    let source = ResumingSource(mode: .refusedCursor, snapshotRows: [9])
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: resumeScope, source: source, store: store)
+
+    let lease = await coordinator.acquire(demandA)
+
     #expect(await eventually { await lease.state() == .live })
     #expect(await source.resumes == 1)
+    #expect(await source.stops == 1)
     #expect(await source.materializations == 1)
     #expect(await store.rowClaims(for: materializationA) == [9])
     try await lease.release()
   }
 
-  /// A resumed tail that fails is not resumed again, even by a source that keeps no memory of
-  /// failed fences (an app may build a new source for each attempt): the coordinator's next
-  /// attempt for the entry snapshots.
-  @Test func aFailedResumedTailMakesTheNextAttemptSnapshot() async throws {
+  /// A transient failure says nothing about the stored cursor: the attempt fails without a
+  /// snapshot, and the retry resumes again rather than re-querying the page.
+  @Test func aTransientResumedTailFailureResumesAgainOnRetry() async throws {
     let store = try await seededStore()
-    let source = ResumingSource(mode: .failingTail, snapshotRows: [9])
+    let source = ResumingSource(mode: .transientTailFailure, snapshotRows: [9])
     let coordinator = CollectionCoordinator(
       definition: rowDefinition, scope: resumeScope, source: source, store: store)
 
     let lease = await coordinator.acquire(demandA)
     #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
-    #expect(await source.resumes == 1)
     #expect(await source.materializations == 0)
 
     await lease.refresh()
-    #expect(await eventually { await lease.state() == .live })
-    #expect(await source.resumes == 1)
-    #expect(await source.materializations == 1)
-    #expect(await store.rowClaims(for: materializationA) == [9])
+    #expect(await eventually { await source.resumes == 2 })
+    #expect(await source.materializations == 0)
+    #expect(await store.rowClaims(for: materializationA) == [1, 2])
+    try await lease.release()
+  }
+
+  /// Once the resumed tail has been reported live, a refused cursor fails the attempt as a
+  /// snapshot session's tail would.
+  @Test func aCursorRefusedAfterTheTailWentLiveFailsTheAttempt() async throws {
+    let store = try await seededStore()
+    let source = ResumingSource(mode: .refusedCursorAfterCatchUp, snapshotRows: [9])
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: resumeScope, source: source, store: store)
+
+    let lease = await coordinator.acquire(demandA)
+    #expect(await eventually { await source.resumes == 1 })
+    await source.signalCaughtUp()
+
+    #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
+    #expect(await source.materializations == 0)
     try await lease.release()
   }
 

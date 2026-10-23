@@ -830,8 +830,10 @@ public actor CollectionCoordinator<
   }
 
   /// Continues an exact cached materialization from its committed cursor. Returns false when the
-  /// source declines, or the stored record moved while it was asked, and the attempt must take the
-  /// snapshot path; true when this attempt has finished, failed or been superseded.
+  /// source declines, the stored record moved while it was asked, or the feed refuses the stored
+  /// cursor (`CollectionResumeInvalidated`) before the tail went live, and the attempt must take
+  /// the snapshot path; true when this attempt has finished, failed or been superseded. A
+  /// transient failure fails the attempt and leaves the cursor resumable by the next one.
   ///
   /// The snapshot path's per-acquire invariants, and how a resumed attempt keeps them:
   /// - Rows and claims: there is no `replaceSnapshot`, so no omission pass marks other holders
@@ -863,7 +865,6 @@ public actor CollectionCoordinator<
     } catch is CancellationError {
       return true
     } catch {
-      requireSnapshot(identity: identity, attempt: attempt)
       fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
       return true
     }
@@ -920,12 +921,22 @@ public actor CollectionCoordinator<
       return true
     } catch is CollectionStoreApplyFailure {
       _ = await cleanup(stop, identity: identity, attempt: attempt)
-      requireSnapshot(identity: identity, attempt: attempt)
       fail(identity: identity, attempt: attempt, with: .storeUnavailable)
+      return true
+    } catch is CollectionResumeInvalidated {
+      // The feed will not serve the stored cursor. Until the tail has committed or caught up,
+      // nothing has been reported live from it, so this attempt reseeds by snapshot.
+      guard await cleanup(stop, identity: identity, attempt: attempt) else { return true }
+      if let entry = entries[identity], entry.attempt == attempt, entry.state == .cached,
+        !Task.isCancelled
+      {
+        clearResumingAttempt(identity: identity, attempt: attempt)
+        return false
+      }
+      fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
       return true
     } catch {
       _ = await cleanup(stop, identity: identity, attempt: attempt)
-      requireSnapshot(identity: identity, attempt: attempt)
       fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
       return true
     }
@@ -944,15 +955,6 @@ public actor CollectionCoordinator<
     }
     updateEntry(identity: identity, attempt: attempt, state: .live)
     stalePassWake?.yield(())
-  }
-
-  /// A resume that failed is not retried as one: the entry's next attempt snapshots, whichever
-  /// source instance it asks, until a snapshot succeeds. A source's own memory of failed fences
-  /// lives only as long as that instance.
-  private func requireSnapshot(identity: CollectionDemandIdentity, attempt: UUID) {
-    guard var entry = entries[identity], entry.attempt == attempt else { return }
-    entry.requiresSnapshot = true
-    entries[identity] = entry
   }
 
   private func clearResumingAttempt(identity: CollectionDemandIdentity, attempt: UUID) {

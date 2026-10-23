@@ -310,7 +310,9 @@ struct CircuitsSubsetSourceTests {
     #expect(session.snapshot.rows == [NativeIssue(id: 1, title: "Snapshot")])
     #expect(session.snapshot.cursor == StreamCursor(offset: "10", lsn: "0/10"))
     // The fence names the feed its cursor belongs to, so a later acquire can resume that feed.
-    #expect(session.snapshot.fence.rawValue == "9:subset-v2|7:shape-1|2:10|4:0/10|0:|0:")
+    #expect(
+      session.snapshot.fence.rawValue
+        == "9:subset-v2|36:https://streams.test/streams/shape-1|2:10|4:0/10|0:|0:")
 
     let applied = AppliedNativeBatches()
     let run = Task {

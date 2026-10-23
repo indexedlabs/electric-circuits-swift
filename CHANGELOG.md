@@ -5,29 +5,37 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 
 ## 0.8.0
 
-- Add `ShapeSubscriptionCoordinator(..., adopting:)`. A caller that already created the claim with
-  the same request hands its `ShapeHandle` over; the first `start()` streams it without a second
-  create, still taking a capacity permit and running the materializer preflight, and renews it on
-  the handle's lease schedule. The coordinator owns the adopted claim's release from construction.
-  `CircuitsSubsetSource` uses it, so materializing a demand POSTs `/v1/subset-feeds` once, not twice.
-- Add `CollectionResumeSession` and a defaulted `CollectionSourceAdapter.resume` requirement. When
-  the store holds an exact record, `CollectionCoordinator` asks the source to continue it from the
-  stored cursor before materializing. A resumed attempt skips
-  `replaceSnapshot`, stays `.cached`, and reports `.live` once the tail commits a batch or answers
-  an idle poll. A nil result takes the snapshot path unchanged; adapters that do not implement
-  `resume` snapshot on every acquire as before. Stale revalidation always snapshots, and restarts a
-  resumed attempt it joins, including one that already reports `.live`. A resume that fails is
-  not retried as one: the entry's next attempt snapshots, whichever source instance it asks.
-- `CircuitsSubsetSource` writes `subset-v2|<shapeId>|<offset>|<lsn>|<snapshot>|<horizon>` snapshot
+- Add `ShapeSubscriptionCoordinator(..., adopting:, createdAt:)`. A caller that already created the
+  claim with the same request hands its `ShapeHandle` over; the first `start()` streams it without a
+  second create, still taking a capacity permit and running the materializer preflight. The
+  coordinator owns the adopted claim's release from construction, and renews it a third of the lease
+  after `createdAt`, when the caller sent its create, rather than after the launch, so a frontier
+  read and snapshot in between cannot let the claim lapse. `CircuitsSubsetSource` uses it, so
+  materializing a demand POSTs `/v1/subset-feeds` once, not twice.
+- Add `CollectionResumeSession`, `CollectionResumeInvalidated` and a defaulted
+  `CollectionSourceAdapter.resume` requirement. When the store holds an exact record,
+  `CollectionCoordinator` asks the source to continue it from the stored cursor before
+  materializing. A resumed attempt skips `replaceSnapshot`, stays `.cached`, and reports `.live`
+  once the tail commits a batch or answers an idle poll. A nil result takes the snapshot path
+  unchanged; adapters that do not implement `resume` snapshot on every acquire as before. Stale
+  revalidation always snapshots, and restarts a resumed attempt it joins, including one that already
+  reports `.live`. A session whose feed refuses the stored cursor throws
+  `CollectionResumeInvalidated`; until the tail goes live, the same attempt snapshots instead, so no
+  lease sees a failure. A transient failure fails the attempt, and the next attempt resumes again.
+- `CircuitsSubsetSource` writes `subset-v2|<streamUrl>|<offset>|<lsn>|<snapshot>|<horizon>` snapshot
   fences and implements `resume`: it re-joins the identical feed request and, when the engine
-  answers with the fenced shape ID, tails the same append-only stream from the stored cursor and
-  source version with no frontier `HEAD` and no `/v1/subsets/query`. The fence carries the
-  snapshot's transaction visibility, so a store that keeps only a version's LSN still resumes with
-  the snapshot's own overlap gate and admits a commit that was in progress when it was taken. Limited windows, `subset-v1` fences, records without
-  a cursor, a replaced shape ID, and a fence whose last session ended in a terminal or
-  non-retryable stream outcome snapshot instead. A replaced feed's create is adopted by the
-  snapshot that follows on the same source instance, so the fallback still POSTs once. Existing v1 fences decode and are rewritten by the
-  next snapshot.
+  answers with the fenced stream URL, tails the same append-only stream from the stored cursor and
+  source version with no frontier `HEAD` and no `/v1/subsets/query`. The stream URL, not the shape
+  ID, names the feed: shape IDs restart in a new engine query or store generation
+  (`Contracts/native-v1-contract-v1.md`, "Feed continuity"). The fence carries the snapshot's
+  transaction visibility, so a store that keeps only a version's LSN still resumes with the
+  snapshot's own overlap gate and admits a commit that was in progress when it was taken. Limited
+  windows, `subset-v1` fences, records without a cursor, a different stream URL, and a fence whose
+  last session ended in a terminal or non-retryable stream outcome snapshot instead. A replaced
+  feed's create is kept for the snapshot that follows on the same source instance, so the fallback
+  still POSTs once; an adapter that snapshots through another instance first calls
+  `cleanupAbandonedMaterialization`, which releases it. Existing v1 fences decode and are rewritten
+  by the next snapshot.
 - This minor release preserves source compatibility with 0.7.0 and introduces no store protocol,
   persisted schema, or HTTP changes; snapshot fences remain opaque strings to stores.
 

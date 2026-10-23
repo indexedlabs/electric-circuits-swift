@@ -91,14 +91,21 @@ a `CollectionResumeSession` (a live tail from the stored cursor and source versi
 resumed attempt skips `replaceSnapshot`: the demand stays `.cached` and reports `.live` once the
 tail commits a batch or answers an idle poll, and feed deletes release claims through the ordinary
 store `apply`. Nil takes the snapshot path; the default implementation always returns nil. Stale
-revalidation always snapshots, and a resume that fails is not retried as one.
-`CircuitsSubsetSource` fences each snapshot with the feed's shape ID and the snapshot's transaction
-visibility (`subset-v2`), and resumes by re-joining the identical feed request: Circuits shares shapes by table,
-canonical predicate, sorted columns and `changes_only`, so the same shape ID means the stored offset
-is still a position in that append-only stream. A resume makes one `/v1/subset-feeds` POST and no
-frontier `HEAD` or snapshot query. Limited windows, `subset-v1` fences, a replaced shape ID, and a
-fence whose last session ended in a terminal stream outcome snapshot instead. On a feed that is
-already current, `.live` waits for the first long-poll answer.
+revalidation always snapshots. A session whose feed refuses the stored cursor throws
+`CollectionResumeInvalidated`: until the tail goes live, the same attempt snapshots instead, so no
+lease sees a failure. A transient failure fails the attempt, and the next attempt resumes again.
+
+`CircuitsSubsetSource` fences each snapshot with the feed's stream URL and the snapshot's
+transaction visibility (`subset-v2`), and resumes by re-joining the identical feed request. The
+engine answers that request with the same stream URL until it retires the feed, and the stream is
+append-only, so the same URL means the stored offset is still a gap-free position in it
+(`Contracts/native-v1-contract-v1.md`, "Feed continuity"). A resume makes one `/v1/subset-feeds`
+POST and no frontier `HEAD` or snapshot query. Limited windows, `subset-v1` fences, a different
+stream URL, and a fence whose last session ended in a terminal stream outcome snapshot instead. A
+feed that answers with a different URL is kept for the snapshot that follows on the same source
+instance; an adapter that snapshots through another instance first calls
+`cleanupAbandonedMaterialization`, which releases it. On a feed that is already current, `.live`
+waits for the first long-poll answer.
 
 ```swift
 let definition = CollectionDefinition<Issue, Int64>(

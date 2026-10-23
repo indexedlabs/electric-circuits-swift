@@ -195,6 +195,10 @@ private func seedBySnapshot(
   return try #require(try await store.materialization(for: openIdentity))
 }
 
+/// `subset-v2` fence components naming the streams `ResumeFeedTransport` serves.
+private let shapeOne = "36:https://streams.test/streams/shape-1"
+private let shapeTwo = "36:https://streams.test/streams/shape-2"
+
 @Suite("Native Circuits subset source resume")
 struct CircuitsSubsetSourceResumeTests {
   @Test func resumingTheSameFeedTailsFromTheStoredCursorWithoutASnapshot() async throws {
@@ -202,7 +206,8 @@ struct CircuitsSubsetSourceResumeTests {
     let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
     let seeded = try await seedBySnapshot(transport, store: store)
     #expect(seeded.cursor == StreamCursor(offset: "10", lsn: "0/10"))
-    #expect(seeded.snapshotFence.rawValue == "9:subset-v2|7:shape-1|2:10|4:0/10|0:|0:")
+    #expect(
+      seeded.snapshotFence.rawValue == "9:subset-v2|\(shapeOne)|2:10|4:0/10|0:|0:")
     #expect(await store.rowClaims(for: seeded.id) == [1, 3])
 
     await transport.script(
@@ -285,35 +290,64 @@ struct CircuitsSubsetSourceResumeTests {
     #expect(await transport.streamOffsets("shape-1") == ["10"])
     let replaced = try #require(try await store.materialization(for: openIdentity))
     #expect(replaced.id == seeded.id)
-    #expect(replaced.snapshotFence.rawValue == "9:subset-v2|7:shape-2|2:10|4:0/40|0:|0:")
+    #expect(
+      replaced.snapshotFence.rawValue == "9:subset-v2|\(shapeTwo)|2:10|4:0/40|0:|0:")
     #expect(await store.rows() == [1: ResumeIssue(id: 1, title: "Fresh")])
     try await lease.release()
   }
 
-  @Test func aTerminalFirstResumedReadMakesTheNextAttemptSnapshot() async throws {
+  /// A stored cursor the engine no longer serves is an ordinary reseed: the first resumed read's
+  /// terminal answer stops the re-joined feed and the same attempt snapshots, so the lease never
+  /// fails and needs no refresh.
+  /// Shape IDs restart in a new query or store generation, and only the stream URL names it: a
+  /// fence from another generation's `shape-1` must not resume into this one's stream.
+  @Test func theSameShapeIDUnderAnotherStreamURLSnapshots() async throws {
+    let transport = ResumeFeedTransport(queryBodies: [
+      #"{"rows":[{"id":1,"title":"One"}],"lsn":"0/10"}"#,
+      #"{"rows":[{"id":1,"title":"Fresh"}],"lsn":"0/40"}"#,
+    ])
+    let seeded = try await seedBySnapshot(
+      transport, store: InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id))
+    let otherGeneration = "49:https://streams.test/generation-1/streams/shape-1"
+    let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
+    try await store.replaceSnapshot(
+      CollectionSnapshot(
+        rows: [ResumeIssue(id: 1, title: "One")],
+        fence: SnapshotFence(rawValue: "9:subset-v2|\(otherGeneration)|2:10|4:0/10|0:|0:"),
+        sourceVersion: seeded.sourceVersion, cursor: seeded.cursor),
+      materializationID: seeded.id, demand: openIdentity)
+
+    let lease = await relaunch(transport, store: store).acquire(openIssues)
+
+    #expect(await eventually { await lease.state() == .live })
+    // The snapshot adopts the resume's create, then reads its own frontier and page.
+    #expect(await transport.count("POST", "/v1/subset-feeds") == 2)
+    #expect(await transport.count("HEAD", "/streams/shape-1") == 2)
+    #expect(await transport.count("POST", "/v1/subsets/query") == 2)
+    let reseeded = try #require(try await store.materialization(for: openIdentity))
+    #expect(
+      reseeded.snapshotFence.rawValue == "9:subset-v2|\(shapeOne)|2:10|4:0/40|0:|0:")
+    #expect(await store.rows() == [1: ResumeIssue(id: 1, title: "Fresh")])
+    try await lease.release()
+  }
+
+  @Test func aTerminalFirstResumedReadSnapshotsInTheSameAttempt() async throws {
     let transport = ResumeFeedTransport(queryBodies: [
       #"{"rows":[{"id":1,"title":"One"},{"id":3,"title":"Three"}],"lsn":"0/10"}"#,
       #"{"rows":[{"id":1,"title":"Fresh"}],"lsn":"0/40"}"#,
     ])
     let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
-    let seeded = try await seedBySnapshot(transport, store: store)
+    _ = try await seedBySnapshot(transport, store: store)
     await transport.script("shape-1", [.status(410)])
 
     let lease = await relaunch(transport, store: store).acquire(openIssues)
-    #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
-    #expect(await transport.count("POST", "/v1/subsets/query") == 1)
-    #expect(try await store.materialization(for: openIdentity) == seeded)
-
-    // The failed resume is not retried as one: the coordinator's next attempt, and this
-    // source's memory of the fence, both make the retry snapshot rather than re-join a stream
-    // the engine will not serve from that cursor.
-    await lease.refresh()
     #expect(await eventually { await lease.state() == .live })
     #expect(await transport.count("POST", "/v1/subsets/query") == 2)
     #expect(await transport.count("POST", "/v1/subset-feeds") == 3)
     #expect(await transport.count("HEAD", "/streams/shape-1") == 2)
-    let refreshed = try #require(try await store.materialization(for: openIdentity))
-    #expect(refreshed.snapshotFence.rawValue == "9:subset-v2|7:shape-1|2:10|4:0/40|0:|0:")
+    let reseeded = try #require(try await store.materialization(for: openIdentity))
+    #expect(
+      reseeded.snapshotFence.rawValue == "9:subset-v2|\(shapeOne)|2:10|4:0/40|0:|0:")
     #expect(await store.rows() == [1: ResumeIssue(id: 1, title: "Fresh")])
     try await lease.release()
   }
@@ -339,7 +373,8 @@ struct CircuitsSubsetSourceResumeTests {
     #expect(await transport.count("POST", "/v1/subsets/query") == 1)
     let rewritten = try #require(try await store.materialization(for: openIdentity))
     #expect(rewritten.id == id)
-    #expect(rewritten.snapshotFence.rawValue == "9:subset-v2|7:shape-1|2:10|4:0/10|0:|0:")
+    #expect(
+      rewritten.snapshotFence.rawValue == "9:subset-v2|\(shapeOne)|2:10|4:0/10|0:|0:")
     try await lease.release()
   }
 
@@ -354,7 +389,7 @@ struct CircuitsSubsetSourceResumeTests {
         id: id, demand: identity, state: .live, snapshotFence: SnapshotFence(rawValue: fence),
         sourceVersion: CollectionSourceVersion(rawValue: "0/10", order: 0x10), cursor: cursor)
     }
-    let v2 = "9:subset-v2|7:shape-1|2:10|4:0/10|0:|0:"
+    let v2 = "9:subset-v2|\(shapeOne)|2:10|4:0/10|0:|0:"
     let cursor = StreamCursor(offset: "10", lsn: "0/10")
 
     let versionOne = try await source.resume(
@@ -366,12 +401,14 @@ struct CircuitsSubsetSourceResumeTests {
     // cannot gate a resumed tail.
     let fourPart = try await source.resume(
       openIssues, identity: openIdentity, materializationID: id,
-      record: record(for: openIdentity, fence: "9:subset-v2|7:shape-1|2:10|4:0/10", cursor: cursor))
+      record: record(
+        for: openIdentity, fence: "9:subset-v2|\(shapeOne)|2:10|4:0/10", cursor: cursor))
     #expect(fourPart == nil)
     let badVisibility = try await source.resume(
       openIssues, identity: openIdentity, materializationID: id,
       record: record(
-        for: openIdentity, fence: "9:subset-v2|7:shape-1|2:10|4:0/10|3:bad|4:0/30", cursor: cursor))
+        for: openIdentity, fence: "9:subset-v2|\(shapeOne)|2:10|4:0/10|3:bad|4:0/30",
+        cursor: cursor))
     #expect(badVisibility == nil)
 
     let cursorless = try await source.resume(
@@ -409,7 +446,7 @@ struct CircuitsSubsetSourceResumeTests {
       transport, store: InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id))
     #expect(
       seeded.snapshotFence.rawValue
-        == "9:subset-v2|7:shape-1|2:10|5:0/100|11:100:110:105|5:0/180")
+        == "9:subset-v2|\(shapeOne)|2:10|5:0/100|11:100:110:105|5:0/180")
 
     // The same record in a store that dropped `sourceVersion.snapshot`.
     let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
@@ -417,7 +454,7 @@ struct CircuitsSubsetSourceResumeTests {
       CollectionSnapshot(
         rows: [ResumeIssue(id: 1, title: "One")], fence: seeded.snapshotFence,
         sourceVersion: CollectionSourceVersion(rawValue: "0/100", order: 0x100),
-        cursor: try #require(seeded.cursor)),
+        cursor: seeded.cursor),
       materializationID: seeded.id, demand: openIdentity)
     #expect(try await store.materialization(for: openIdentity)?.sourceVersion.snapshot == nil)
 

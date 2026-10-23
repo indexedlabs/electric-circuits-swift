@@ -573,6 +573,32 @@ struct ShapeSubscriptionCoordinatorTests {
     #expect(await coordinator.state == .stopped)
   }
 
+  /// An adopted claim's lease runs from the caller's create, not from the launch: a source that
+  /// read a frontier and a snapshot in between renews that much sooner, and at once when a third
+  /// of the lease has already passed.
+  @Test func adoptedClaimRenewsOnTheLeaseItsCreateStarted() async throws {
+    let transport = LeaseTransport()
+    let clock = HoldingClock()
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let request = ShapeRequest(table: "public.items", subscription: "stable-claim")
+    let adopted = try await client.createShape(request)
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: client, transport: transport, request: request,
+      materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0), clock: clock,
+      adopting: adopted, createdAt: .now - .seconds(5))
+
+    #expect(try await coordinator.start() == adopted)
+    for _ in 0..<1_000 {
+      if await clock.delays.count == 1 { break }
+      await Task.yield()
+    }
+    // A 6-second lease renews every 2 seconds; 5 have passed since the create.
+    #expect(await clock.delays == [.zero])
+
+    try await coordinator.stop()
+  }
+
   /// The coordinator owns an adopted claim from construction, so stopping it before any start
   /// still releases that claim, once.
   @Test func stopReleasesAnAdoptedClaimThatNoStartConsumed() async throws {
