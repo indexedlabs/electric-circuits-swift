@@ -647,8 +647,13 @@ public actor ShapeSubscriptionCoordinator {
   private func consume(handle streamHandle: ShapeHandle, generation: UInt64) async {
     var retries = 0
     while isCurrent(generation) {
+      // Unknown until this attempt's own read succeeds: a failed read must not leave the previous
+      // attempt's cursor as the baseline, or the post-failure read would look like progress.
+      var cursorAtAttempt: StreamCursor?
       do {
-        transition(.streaming(try await committedCursor()))
+        let attemptCursor = try await committedCursor()
+        cursorAtAttempt = attemptCursor
+        transition(.streaming(attemptCursor))
         let reader = ShapeStreamReader(
           streamURL: streamHandle.stream.url, transport: transport,
           materializer: CoordinatedMaterializer(base: materializer), telemetry: telemetry,
@@ -662,6 +667,18 @@ public actor ShapeSubscriptionCoordinator {
             reason: .terminal(reason), previous: streamHandle)
           do { try await requireReseed(outcome) } catch { transition(.failed(failure(for: error))) }
           return
+        }
+        // A reader can commit one or more batches before a later poll fails. Retry budget and
+        // backoff count consecutive failures, so progress since this attempt began starts a fresh
+        // budget rather than carrying failures from the prior cursor forward.
+        let committedAfterFailure = try? await committedCursor()
+        // The read suspends this actor, so stop() or a replacement renew may have retired this
+        // stream meanwhile; a retired stream must not publish another retry or failure state.
+        guard isCurrent(generation), !Task.isCancelled else { return }
+        if let cursorAtAttempt, let committedAfterFailure,
+          committedAfterFailure.offset != cursorAtAttempt.offset
+        {
+          retries = 0
         }
         guard isRetryable(error), retries < retryPolicy.maxRetries else {
           transition(.failed(exhaustedOrFailure(error, retries: retries, operation: "stream")))
