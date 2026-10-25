@@ -302,6 +302,71 @@ public struct SubsetResponse: Codable, Equatable, Sendable {
   }
 }
 
+/// The snapshot page a one-round-trip subset load returns beside its feed. It may differ from the
+/// feed's own predicate: a limited window pages by an order column the feed does not require.
+public struct SubsetLoadPage: Codable, Equatable, Sendable {
+  public var `where`: Predicate?
+  public var orderBy: SubsetOrderBy?
+  public var limit: Int?
+  public init(where predicate: Predicate? = nil, orderBy: SubsetOrderBy? = nil, limit: Int? = nil) {
+    self.where = predicate
+    self.orderBy = orderBy
+    self.limit = limit
+  }
+}
+
+/// `POST v1/subset-loads`: create or renew a changes-only feed, read its stream frontier, and
+/// query its snapshot page, in that order, in one round trip. The feed half carries the same
+/// stable subscription claim as `createSubsetFeed`, so a retry renews rather than duplicates.
+public struct SubsetLoadRequest: Codable, Equatable, Sendable {
+  public var table: String
+  public var `where`: Predicate?
+  public var columns: [String]?
+  public var subscription: String?
+  /// The page to read; nil reads the feed's predicate unpaged.
+  public var query: SubsetLoadPage?
+  public init(
+    table: String, where predicate: Predicate? = nil, columns: [String]? = nil,
+    subscription: String? = UUID().uuidString, query: SubsetLoadPage? = nil
+  ) {
+    self.table = table
+    self.where = predicate
+    self.columns = columns
+    self.subscription = subscription
+    self.query = query
+  }
+}
+
+/// A one-round-trip subset load: the feed's handle, the frontier its snapshot is fenced at, and
+/// the snapshot page. These are exactly the values `createSubsetFeed`, `streamCursor(for:)` and
+/// `querySubset` return for the same feed, so callers fence and apply them identically.
+public struct SubsetLoad: Equatable, Sendable {
+  public let handle: ShapeHandle
+  public let frontier: StreamCursor
+  public let page: SubsetResponse
+  public init(handle: ShapeHandle, frontier: StreamCursor, page: SubsetResponse) {
+    self.handle = handle
+    self.frontier = frontier
+    self.page = page
+  }
+}
+
+/// The wire body of `POST v1/subset-loads`: the shape fields, `offset`, and the page fields side by
+/// side in one object.
+private struct SubsetLoadResponse: Decodable {
+  let shape: ShapeResponse
+  let offset: String
+  let page: SubsetResponse
+
+  private enum CodingKeys: String, CodingKey { case offset }
+
+  init(from decoder: any Decoder) throws {
+    shape = try ShapeResponse(from: decoder)
+    page = try SubsetResponse(from: decoder)
+    offset = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .offset)
+  }
+}
+
 public enum AggregateFunction: String, Codable, Sendable {
   case count, sum, avg, min, max
 }
@@ -618,6 +683,27 @@ public actor ElectricCircuitsClient {
   }
   public func querySubset(_ request: SubsetQuery) async throws -> SubsetResponse {
     try await send(path: "v1/subsets/query", method: "POST", body: request)
+  }
+
+  /// One round trip for what `createSubsetFeed`, `streamCursor(for:)` and `querySubset` do in
+  /// three. A server without the route answers 404 (or 405), which callers may treat as "use the
+  /// three calls".
+  public func loadSubset(_ request: SubsetLoadRequest) async throws -> SubsetLoad {
+    let wire: SubsetLoadResponse = try await send(
+      path: "v1/subset-loads", method: "POST", body: request)
+    var shape = wire.shape
+    if let subscription = request.subscription {
+      if let echoed = shape.subscription, echoed != subscription {
+        throw ClientError.decoding("subset load response subscription does not match request")
+      }
+      shape.subscription = subscription
+    }
+    guard !wire.offset.isEmpty else {
+      throw ClientError.decoding("subset load response missing offset")
+    }
+    return SubsetLoad(
+      handle: ShapeHandle(response: shape), frontier: StreamCursor(offset: wire.offset),
+      page: wire.page)
   }
 
   /// Reads the durable stream's current frontier without consuming a batch. Subset-feed clients

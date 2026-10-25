@@ -16,9 +16,20 @@ public enum CircuitsSubsetSourceError: Error, Equatable, Sendable {
   case subscription(ShapeSubscriptionFailure)
 }
 
+/// How a subset session is set up.
+public enum SubsetSetupRoute: Sendable, Equatable {
+  /// One `POST v1/subset-loads` (feed, frontier and snapshot in one round trip). A server without
+  /// the route (404 or 405) is remembered and set up with the three requests instead.
+  case automatic
+  /// Feed create, stream `HEAD`, then snapshot query, as three requests.
+  case threeRequests
+}
+
 /// Native Electric Circuits source strategy for an on-demand demand: establish the changes-only
 /// feed, fence its durable frontier, query the subset snapshot, then consume the feed with awaited
-/// store application. A stable materialization ID is also the server subscription claim.
+/// store application. A stable materialization ID is also the server subscription claim. The
+/// three steps are one round trip where the server offers `v1/subset-loads`, and the session's
+/// tail starts on the loaded feed rather than POSTing its claim again.
 public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   CollectionSourceAdapter
 {
@@ -36,6 +47,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   private let telemetry: TelemetryReporter
   private let recreatePolicy: ShapeSubscriptionRecreatePolicy
   private let pendingCleanup: PendingSubsetFeedCleanup
+  private let setupRoute: SubsetSetupRoute
+  private let loadSupport = SubsetLoadSupport()
 
   public init(
     client: ElectricCircuitsClient,
@@ -48,6 +61,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     responseDecodingLimits: ResponseDecodingLimits = .default,
     telemetry: TelemetryReporter = .noop,
     recreatePolicy: ShapeSubscriptionRecreatePolicy = .init(),
+    setupRoute: SubsetSetupRoute = .automatic,
     decodeRow: @escaping @Sendable (ChangeRow) throws -> Model,
     decodeKey: @escaping @Sendable (String) throws -> Key,
     keyForRow: (@Sendable (Model) throws -> Key)? = nil
@@ -63,6 +77,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     self.responseDecodingLimits = responseDecodingLimits
     self.telemetry = telemetry
     self.recreatePolicy = recreatePolicy
+    self.setupRoute = setupRoute
     self.decodeRow = decodeRow
     self.decodeKey = decodeKey
     self.keyForRow = keyForRow
@@ -92,38 +107,49 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       changesOnly: true,
       subscription: subscription
     )
-    // The initial feed create is the same native route the coordinator later joins, so it carries
-    // the same recreate vocabulary. A persisted materialization ID joining a dormant shape whose
-    // fall-through the engine has exhausted must re-POST the identical claim, not fail setup
-    // before the frontier HEAD and snapshot query.
-    let feed = try await recreatePolicy.recreatingOnGone(clock: clock) {
-      try await client.createSubsetFeed(feedRequest)
+    let orderBy = demand.order.first.map {
+      SubsetOrderBy(column: $0.sourceName, descending: $0.direction == .descending)
+    }
+    // A window is positioned by its order column, so a row without one cannot be placed in
+    // the page: SQL sorts NULL sort keys first under DESC and would fill the page with them.
+    // The page therefore requires the sort key while the feed keeps the demand's predicate, so
+    // a row that gains its sort key later still arrives on the tail and re-queries the page.
+    let pagePredicate: ElectricCircuitsSwift.Predicate? =
+      if demand.limit != nil, let orderBy {
+        .and(
+          [demand.sourcePredicate, .isNull(column: orderBy.column, isNull: false)]
+            .compactMap { $0 })
+      } else {
+        demand.sourcePredicate
+      }
+    let pageQuery = SubsetQuery(
+      table: table,
+      where: pagePredicate,
+      columns: columns,
+      orderBy: orderBy,
+      limit: demand.limit
+    )
+    // One round trip where the server offers it: the load creates or renews the feed, reads its
+    // frontier, then queries the page, in the same order as the three requests below. Like the
+    // feed create, it carries the recreate vocabulary: a persisted materialization ID joining a
+    // dormant shape whose fall-through the engine has exhausted re-POSTs the identical claim.
+    let loaded = try await loadIfSupported(feedRequest: feedRequest, pageQuery: pageQuery)
+    let feed: ShapeHandle
+    if let loaded {
+      feed = loaded.handle
+    } else {
+      feed = try await recreatePolicy.recreatingOnGone(clock: clock) {
+        try await client.createSubsetFeed(feedRequest)
+      }
     }
 
     do {
-      let frontier = try await client.streamCursor(for: feed)
-      let orderBy = demand.order.first.map {
-        SubsetOrderBy(column: $0.sourceName, descending: $0.direction == .descending)
+      let frontier: StreamCursor
+      if let loaded {
+        frontier = loaded.frontier
+      } else {
+        frontier = try await client.streamCursor(for: feed)
       }
-      // A window is positioned by its order column, so a row without one cannot be placed in
-      // the page: SQL sorts NULL sort keys first under DESC and would fill the page with them.
-      // The page therefore requires the sort key while the feed keeps the demand's predicate, so
-      // a row that gains its sort key later still arrives on the tail and re-queries the page.
-      let pagePredicate: ElectricCircuitsSwift.Predicate? =
-        if demand.limit != nil, let orderBy {
-          .and(
-            [demand.sourcePredicate, .isNull(column: orderBy.column, isNull: false)]
-              .compactMap { $0 })
-        } else {
-          demand.sourcePredicate
-        }
-      let pageQuery = SubsetQuery(
-        table: table,
-        where: pagePredicate,
-        columns: columns,
-        orderBy: orderBy,
-        limit: demand.limit
-      )
       let decodeRow = decodeRow
       let decodePage: @Sendable (SubsetResponse) throws -> ([Model], CollectionSourceVersion) = {
         response in
@@ -138,7 +164,13 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
         }
         return (rows, version)
       }
-      let (rows, snapshotVersion) = try decodePage(try await client.querySubset(pageQuery))
+      let firstPage: SubsetResponse
+      if let loaded {
+        firstPage = loaded.page
+      } else {
+        firstPage = try await client.querySubset(pageQuery)
+      }
+      let (rows, snapshotVersion) = try decodePage(firstPage)
       let window: LimitedWindow<Model, Key>? =
         if demand.limit != nil, let keyForRow {
           LimitedWindow(
@@ -181,7 +213,9 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
             responseDecodingLimits: responseDecodingLimits,
             telemetry: telemetry,
             kind: .subsetFeed,
-            recreatePolicy: recreatePolicy
+            recreatePolicy: recreatePolicy,
+            // The tail starts on the feed setup created rather than POSTing its claim again.
+            initialHandle: feed
           )
           try await lifecycle.install(coordinator)
           let states = await coordinator.stateUpdates
@@ -227,6 +261,29 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     }
   }
 
+  /// The one-round-trip setup, or nil when the server has no `v1/subset-loads` route (remembered
+  /// for this source) or the caller asked for three requests.
+  private func loadIfSupported(feedRequest: ShapeRequest, pageQuery: SubsetQuery) async throws
+    -> SubsetLoad?
+  {
+    guard setupRoute == .automatic, await loadSupport.isAvailable else { return nil }
+    let request = SubsetLoadRequest(
+      table: table,
+      where: feedRequest.where,
+      columns: columns,
+      subscription: feedRequest.subscription,
+      query: SubsetLoadPage(
+        where: pageQuery.where, orderBy: pageQuery.orderBy, limit: pageQuery.limit))
+    do {
+      return try await recreatePolicy.recreatingOnGone(clock: clock) {
+        try await client.loadSubset(request)
+      }
+    } catch ClientError.http(status: let status, message: _) where status == 404 || status == 405 {
+      await loadSupport.markUnavailable()
+      return nil
+    }
+  }
+
   public func cleanupAbandonedMaterialization(
     _ materializationID: CollectionMaterializationID
   ) async throws {
@@ -263,6 +320,12 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
 /// the one release handle per materialization until the idempotent DELETE succeeds (or receives
 /// 404, which the client normalizes to success). The registry is bounded by active failed setup
 /// attempts and is drained before another feed with that stable subscription can be created.
+/// Whether the server offers `v1/subset-loads`; learnt once per source from a 404 or 405.
+private actor SubsetLoadSupport {
+  private(set) var isAvailable = true
+  func markUnavailable() { isAvailable = false }
+}
+
 private actor PendingSubsetFeedCleanup {
   private let client: ElectricCircuitsClient
   private var handles: [CollectionMaterializationID: ShapeHandle] = [:]

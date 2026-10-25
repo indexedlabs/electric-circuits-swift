@@ -278,6 +278,9 @@ public actor ShapeSubscriptionCoordinator {
   private let recreatePolicy: ShapeSubscriptionRecreatePolicy
   private var continuation: AsyncStream<ShapeSubscriptionState>.Continuation?
   private var handle: ShapeHandle?
+  // A claim the caller already created (a subset load), adopted by the first create instead of
+  // POSTing the identical claim again. Consumed once; a later recreate POSTs as usual.
+  private var adoptedHandle: ShapeHandle?
   private var pendingRelease: [ShapeHandle] = []
   private var generation: UInt64 = 0
   private var stopping = false
@@ -317,8 +320,10 @@ public actor ShapeSubscriptionCoordinator {
     responseDecodingLimits: ResponseDecodingLimits = .default,
     telemetry: TelemetryReporter = .noop,
     kind: ShapeSubscriptionKind = .shape,
-    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init()
+    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init(),
+    initialHandle: ShapeHandle? = nil
   ) {
+    self.adoptedHandle = initialHandle
     self.client = client
     self.transport = transport
     self.request = request
@@ -716,6 +721,10 @@ public actor ShapeSubscriptionCoordinator {
       throw MaterializerFailure()
     }
     try Task.checkCancellation()
+    if let adopted = adoptedHandle {
+      adoptedHandle = nil
+      return adopted
+    }
     return try await recreatingOnGone(operation: "create") {
       switch self.kind {
       case .shape:
