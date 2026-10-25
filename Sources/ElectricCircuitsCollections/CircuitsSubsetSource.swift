@@ -427,7 +427,7 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
     }
   }
 
-  private struct PageResult: Sendable {
+  private struct PageResult {
     let rows: [(model: Model, primary: PrimaryKey, secondary: JSONValue, token: String)]
     let version: CollectionSourceVersion
   }
