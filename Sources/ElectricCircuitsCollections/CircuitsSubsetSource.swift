@@ -241,7 +241,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     keyColumn: String,
     basePredicate: ElectricCircuitsSwift.Predicate? = nil,
     secondaryKeyForRow: @escaping @Sendable (Model) throws -> JSONValue,
-    onChanges: (@Sendable ([CollectionChange<Model, Key>]) async throws -> Void)? = nil
+    onChanges: (@Sendable ([CollectionChange<Model, Key>]) async throws -> Void)? = nil,
+    onMembershipRelease: (@Sendable ([Key]) async throws -> Void)? = nil
   ) -> KeyedWindow<Model, Key> {
     let primaryKeyForRow: @Sendable (Model) throws -> Key = keyForRow ?? { _ in
       // A keyed window must be able to associate a page row with the opaque primary key in the
@@ -262,7 +263,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       retryPolicy: retryPolicy,
       clock: clock,
       recreatePolicy: recreatePolicy,
-      onChanges: onChanges
+      onChanges: onChanges,
+      onMembershipRelease: onMembershipRelease
     )
   }
 
@@ -393,36 +395,58 @@ private struct LimitedWindow<Model: Sendable, Key: Hashable & Sendable>: Sendabl
 /// Shares one coordinator and one changes-only feed for every keyed window with the same table,
 /// predicate and projection. The hub is deliberately type-erased: subscribers decode their own
 /// rows, while the stream cursor and coordinator lifecycle remain shared.
-private actor KeyedWindowFeedHub: ShapeMaterializer {
+private final class KeyedWindowFeedHub: ShapeMaterializer, @unchecked Sendable {
   typealias Callback = @Sendable (ChangeBatch) async throws -> Void
 
+  private let lock = NSLock()
   private var subscribers: [UUID: Callback] = [:]
+  private var subscriberOrder: [UUID] = []
   private var cursor: StreamCursor?
 
-  func add(_ callback: @escaping Callback) -> UUID {
-    let id = UUID()
+  func add(_ id: UUID, callback: @escaping Callback) {
+    lock.lock()
+    defer { lock.unlock() }
     subscribers[id] = callback
-    return id
+    subscriberOrder.append(id)
   }
 
   func remove(_ id: UUID) {
+    lock.lock()
+    defer { lock.unlock() }
     subscribers.removeValue(forKey: id)
+    subscriberOrder.removeAll { $0 == id }
   }
 
-  func currentCursor() async throws -> StreamCursor? { cursor }
+  func prime(_ value: StreamCursor) {
+    lock.lock()
+    defer { lock.unlock() }
+    if cursor == nil { cursor = value }
+  }
+
+  func currentCursor() async throws -> StreamCursor? {
+    lock.lock()
+    defer { lock.unlock() }
+    return cursor
+  }
 
   func apply(
     _ batch: ChangeBatch, expecting expectedCursor: StreamCursor?, advancingTo next: StreamCursor
   ) async throws {
-    if cursor == next { return }
-    guard cursor == expectedCursor else {
-      throw StreamError.cursorConflict(expected: expectedCursor, actual: cursor, advancingTo: next)
+    lock.lock()
+    let current = cursor
+    let callbacks = subscriberOrder.compactMap { subscribers[$0] }
+    lock.unlock()
+    if current == next { return }
+    guard current == expectedCursor else {
+      throw StreamError.cursorConflict(expected: expectedCursor, actual: current, advancingTo: next)
     }
-    // Keep callback order stable. If one callback fails, do not advance the shared cursor; the
-    // coordinator retries the same batch and every subscriber sees the replay.
-    for callback in subscribers.values {
+    // Keep callback order stable for this batch. If one callback fails, do not advance the shared
+    // cursor; the coordinator retries the same batch and every subscriber sees the replay.
+    for callback in callbacks {
       try await callback(batch)
     }
+    lock.lock()
+    defer { lock.unlock() }
     cursor = next
   }
 }
@@ -436,6 +460,7 @@ private actor KeyedWindowFeedRegistry {
     let key: String
     let subscriberID: UUID
     let handle: ShapeHandle
+    let head: StreamCursor
     let coordinator: ShapeSubscriptionCoordinator
   }
 
@@ -443,10 +468,18 @@ private actor KeyedWindowFeedRegistry {
     let hub: KeyedWindowFeedHub
     let coordinator: ShapeSubscriptionCoordinator
     let handle: ShapeHandle
+    let head: StreamCursor
     var references: Int
   }
 
   private var entries: [String: Entry] = [:]
+  private struct Started: Sendable {
+    let hub: KeyedWindowFeedHub
+    let coordinator: ShapeSubscriptionCoordinator
+    let handle: ShapeHandle
+    let head: StreamCursor
+  }
+  private var pending: [String: Task<Started, Error>] = [:]
 
   func acquire(
     key: String,
@@ -459,32 +492,78 @@ private actor KeyedWindowFeedRegistry {
     callback: @escaping KeyedWindowFeedHub.Callback
   ) async throws -> Lease {
     if var entry = entries[key] {
-      let subscriberID = await entry.hub.add(callback)
+      let subscriberID = UUID()
       entry.references += 1
       entries[key] = entry
+      entry.hub.add(subscriberID, callback: callback)
       return Lease(
-        key: key, subscriberID: subscriberID, handle: entry.handle, coordinator: entry.coordinator)
+        key: key, subscriberID: subscriberID, handle: entry.handle, head: entry.head,
+        coordinator: entry.coordinator)
     }
 
-    let hub = KeyedWindowFeedHub()
-    let coordinator = ShapeSubscriptionCoordinator(
-      client: client,
-      transport: transport,
-      request: request,
-      materializer: hub,
-      retryPolicy: retryPolicy,
-      clock: clock,
-      kind: .subsetFeed,
-      recreatePolicy: recreatePolicy)
-    let handle = try await coordinator.start()
-    let subscriberID = await hub.add(callback)
-    entries[key] = Entry(hub: hub, coordinator: coordinator, handle: handle, references: 1)
-    return Lease(key: key, subscriberID: subscriberID, handle: handle, coordinator: coordinator)
+    let task: Task<Started, Error>
+    if let existing = pending[key] {
+      task = existing
+    } else {
+      let taskValue = Task<Started, Error> {
+        let hub = KeyedWindowFeedHub()
+        let handle = try await recreatePolicy.recreatingOnGone(clock: clock) {
+          try await client.createSubsetFeed(request)
+        }
+        do {
+          let head = try await client.streamCursor(for: handle)
+          hub.prime(head)
+          let coordinator = ShapeSubscriptionCoordinator(
+            client: client,
+            transport: transport,
+            request: request,
+            materializer: hub,
+            retryPolicy: retryPolicy,
+            clock: clock,
+            kind: .subsetFeed,
+            recreatePolicy: recreatePolicy)
+          _ = try await coordinator.start(existing: handle)
+          return Started(hub: hub, coordinator: coordinator, handle: handle, head: head)
+        } catch {
+          try? await client.releaseShape(handle)
+          throw error
+        }
+      }
+      pending[key] = taskValue
+      task = taskValue
+    }
+
+    let started: Started
+    do {
+      started = try await task.value
+    } catch {
+      pending.removeValue(forKey: key)
+      throw error
+    }
+    if var entry = entries[key] {
+      let subscriberID = UUID()
+      entry.references += 1
+      entries[key] = entry
+      entry.hub.add(subscriberID, callback: callback)
+      return Lease(
+        key: key, subscriberID: subscriberID, handle: entry.handle, head: entry.head,
+        coordinator: entry.coordinator)
+    }
+    pending.removeValue(forKey: key)
+    let subscriberID = UUID()
+    started.hub.add(subscriberID, callback: callback)
+    entries[key] = Entry(
+      hub: started.hub, coordinator: started.coordinator, handle: started.handle,
+      head: started.head, references: 1)
+    return Lease(
+      key: key, subscriberID: subscriberID, handle: started.handle, head: started.head,
+      coordinator: started.coordinator)
   }
 
   func release(_ lease: Lease) async throws {
     guard var entry = entries[lease.key] else { return }
-    await entry.hub.remove(lease.subscriberID)
+    guard entry.handle.id == lease.handle.id else { return }
+    entry.hub.remove(lease.subscriberID)
     entry.references -= 1
     guard entry.references == 0 else {
       entries[lease.key] = entry
@@ -682,23 +761,29 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
 
   public func start(subscription: String = UUID().uuidString) async throws {
     guard state != .live else { return }
+    state = .live
     let request = ShapeRequest(
       table: table, where: basePredicate, columns: columns, changesOnly: true,
       subscription: subscription)
     let baseURL = await client.baseURL
     let registryKey = feedRegistryKey(request, baseURL: baseURL)
-    let lease = try await KeyedWindowFeedRegistry.shared.acquire(
-      key: registryKey, client: client, transport: transport, request: request,
-      retryPolicy: retryPolicy, clock: clock, recreatePolicy: recreatePolicy,
-      callback: { [weak self] batch in
-        guard let self else { return }
-        _ = try await self.applyTail(batch)
-      })
-    registryLease = lease
-    coordinator = lease.coordinator
-    feed = lease.handle
-    frontier = .beginning
-    state = .live
+    do {
+      let lease = try await KeyedWindowFeedRegistry.shared.acquire(
+        key: registryKey, client: client, transport: transport, request: request,
+        retryPolicy: retryPolicy, clock: clock, recreatePolicy: recreatePolicy,
+        callback: { [weak self] batch in
+          guard let self else { return }
+          guard await self.isLiveForSharedFeed() else { return }
+          _ = try await self.applyTail(batch)
+        })
+      registryLease = lease
+      coordinator = lease.coordinator
+      feed = lease.handle
+      frontier = lease.head
+    } catch {
+      state = .idle
+      throw error
+    }
   }
 
   public func restart(subscription: String = UUID().uuidString)
@@ -745,6 +830,7 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
     let unique = uniqueValues(keys)
     var ownedTokens = Set<String>()
     var joinedTokens = Set<String>()
+    var satisfiedTokens = Set<String>()
     var joiners: [KeyedPageCompletion<[CollectionChange<Model, PrimaryKey>]>] = []
     var pages: [PageDraft] = []
     var tickets: [PageTicket] = []
@@ -761,6 +847,8 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
           if let pageID = pageForToken[token], let page = inFlight[pageID] {
             joinedTokens.insert(token)
             joiners.append(page.completion)
+          } else {
+            satisfiedTokens.insert(token)
           }
         } else {
           claims[token] = Claim(value: key, holders: [holder])
@@ -807,6 +895,14 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
         releaseApplicationPermit()
       }
       for joiner in joiners { changes.append(contentsOf: try await joiner.value()) }
+      for token in satisfiedTokens {
+        for primary in secondaryToPrimaries[token] ?? [] {
+          guard let raw = rawRows[primary], let version = versions[primary],
+            let model = try? decodeRow(raw)
+          else { continue }
+          changes.append(.upsert(model, sourceVersion: version))
+        }
+      }
       return changes
     } catch {
       if permitHeld { releaseApplicationPermit(); permitHeld = false }
@@ -962,8 +1058,10 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
       String(decoding: $0, as: UTF8.self)
     } ?? "nil"
     let columns = request.columns?.joined(separator: ",") ?? "*"
-    return "\(baseURL.absoluteString)|\(table)|\(columns)|\(predicate)"
+    return "\(ObjectIdentifier(client))|\(baseURL.absoluteString)|\(table)|\(columns)|\(predicate)"
   }
+
+  private func isLiveForSharedFeed() -> Bool { state == .live }
 
   private func beginPage(_ keys: [JSONValue]) throws -> PageTicket {
     let tokens = Set(try keys.map(canonicalToken))
