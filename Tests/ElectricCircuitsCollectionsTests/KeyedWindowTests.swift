@@ -226,7 +226,7 @@ struct KeyedWindowTests {
       transport: transport,
       table: "public.records",
       keyColumn: "client_id",
-      decodeRow: { _ in throw KeyedRow.DecodeError() },
+      decodeRow: { (_: ChangeRow) throws -> KeyedRow in throw KeyedRow.DecodeError() },
       decodePrimaryKey: { $0 },
       primaryKeyForRow: \.id,
       secondaryKeyForRow: { .string($0.clientID) }
@@ -309,6 +309,13 @@ struct KeyedWindowTests {
     _ = try await window.addKeys(keys)
     #expect(await transport.feedCount() == 1)
     #expect(await transport.queryCount() == 2)
+    let feedRequest = try #require(
+      await transport.requests.first(where: {
+        $0.httpMethod == "POST" && $0.url?.path == "/v1/subset-feeds"
+      }))
+    let feed = try JSONDecoder().decode(ShapeRequest.self, from: try #require(feedRequest.httpBody))
+    #expect(feed.changesOnly == true)
+    #expect(feed.where == nil)
     let requests = await transport.queryRequests()
     let queries = try requests.map { try JSONDecoder().decode(SubsetQuery.self, from: #require($0.httpBody)) }
     #expect(queries.count == 2)

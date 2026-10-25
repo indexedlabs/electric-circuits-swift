@@ -589,7 +589,7 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
         changes.append(.upsert(row.model, sourceVersion: result.version))
       }
     }
-    for token in claims.keys where !returned.contains(token) {
+    for token in claims.keys.filter({ !returned.contains($0) }) {
       claims.removeValue(forKey: token)
     }
     for (primary, oldRow) in oldRows {
@@ -752,9 +752,10 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
   /// Marks a 410/closed stream as ended while retaining claims for `restart`.
   public func end() async throws {
     guard state != .idle else { return }
-    if let feed { try await client.releaseShape(feed) }
+    let handle = feed
     feed = nil
     state = .ended
+    if let handle { try await client.releaseShape(handle) }
   }
 
   public func stop() async throws {
@@ -844,7 +845,9 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
   }
 
   private func pageQuery(for keys: [JSONValue]) -> SubsetQuery {
-    let leaves = keys.map { .leaf(column: keyColumn, op: .eq, value: $0) }
+    let leaves: [ElectricCircuitsSwift.Predicate] = keys.map {
+      .leaf(column: keyColumn, op: .eq, value: $0)
+    }
     let keyPredicate: ElectricCircuitsSwift.Predicate = .or(leaves)
     let predicate: ElectricCircuitsSwift.Predicate? =
       if let basePredicate { .and([basePredicate, keyPredicate]) } else { keyPredicate }
