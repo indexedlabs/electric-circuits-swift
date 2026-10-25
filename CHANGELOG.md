@@ -3,6 +3,13 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
+## Unreleased
+
+- Prototype one-request subset setup through the gateway's `/sync/v1/subset-loads` route, selected
+  explicitly with `ElectricCircuitsClient.Configuration.subsetSetup`; three-request setup remains
+  the default. The one-request body requires a stable subscription and leaves failed-load claims
+  lease-bounded. Lease renewal retains its configured retry budget plus one final recovery attempt.
+
 ## 0.7.1
 
 - Fix stream retry state to count consecutive poll failures. A committed cursor advance resets
