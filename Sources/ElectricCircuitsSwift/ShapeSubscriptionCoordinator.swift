@@ -869,8 +869,8 @@ public actor ShapeSubscriptionCoordinator {
       } catch {
         // Preserve the normal renewal budget and add one final retry. Keeping both attempts inside
         // the renewal operation means `.failed` is published only after the lease retry budget is
-        // exhausted. The prototype gateway contract says renewal keeps the configured budget plus
-        // one final recovery attempt, so maxRetries=0 still gets that one extra attempt.
+        // exhausted. The prototype gateway contract clause is: "renewal keeps the configured
+        // budget plus one final recovery attempt"; maxRetries=0 still gets that extra attempt.
         guard isRetryable(error), retries < retryPolicy.maxRetries + 1 else {
           if isRetryable(error) {
             throw ShapeSubscriptionFailure.retryExhausted(
