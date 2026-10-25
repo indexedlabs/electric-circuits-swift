@@ -248,7 +248,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       // stream. Callers using this convenience method therefore need to provide `keyForRow`.
       throw CircuitsSubsetSourceError.invalidLiveKey("keyForRow is required for KeyedWindow")
     }
-    KeyedWindow(
+    return KeyedWindow(
       client: client,
       transport: transport,
       table: table,
@@ -400,7 +400,7 @@ private struct LimitedWindow<Model: Sendable, Key: Hashable & Sendable>: Sendabl
 public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
   Sendable, ShapeMaterializer
 {
-  public static let pageSize = 100
+  public static var pageSize: Int { 100 }
 
   public enum State: Equatable, Sendable {
     case idle
