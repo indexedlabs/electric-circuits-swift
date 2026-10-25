@@ -13,6 +13,13 @@ private struct KeyedRow: Equatable, Sendable {
   let recordID: String
   let title: String
 
+  init(id: String, clientID: String, recordID: String, title: String) {
+    self.id = id
+    self.clientID = clientID
+    self.recordID = recordID
+    self.title = title
+  }
+
   init(row: ChangeRow) throws {
     guard case .string(let id) = row["id"],
       case .string(let clientID) = row["client_id"],
@@ -145,7 +152,11 @@ private actor RecordedKeyedChanges {
 }
 
 private func row(_ id: String, _ clientID: String, _ recordID: String, _ title: String) -> String {
-  #"{"id":"\#(id)","client_id":"\#(clientID)","record_id":"\#(recordID)","title":"\#(title)"}"#
+  let value: ChangeRow = [
+    "id": .string(id), "client_id": .string(clientID), "record_id": .string(recordID),
+    "title": .string(title),
+  ]
+  return String(decoding: try! JSONEncoder().encode(value), as: UTF8.self)
 }
 
 private func page(_ rows: [String], lsn: String = "0/10") -> String {
@@ -249,18 +260,21 @@ struct KeyedWindowTests {
   }
 
   @Test func S3UpdatesMoveRowsIntoAndOutOfClaimedSecondaryKeys() async throws {
+    let recorded = RecordedKeyedChanges()
     let transport = KeyedScriptedTransport(
       queryBodies: [page([
         row("1", "old", "record-1", "old row"), row("2", "outside", "record-2", "outside row")
       ])])
-    let window = makeWindow(transport)
+    let window = makeWindow(
+      transport, onMembershipRelease: { keys in await recorded.release(keys) })
     try await window.start(subscription: "s3")
     _ = try await window.addKeys([.string("old"), .string("new")])
     let out = try await window.applyTail(
       tail(operation: .update, key: "1", value: row("1", "outside", "record-1", "moved out")))
     let into = try await window.applyTail(
       tail(operation: .update, key: "2", value: row("2", "new", "record-2", "moved in"), lsn: "0/30"))
-    #expect(out.contains { if case .delete(let key, _) = $0 { return key == "1" }; return false })
+    #expect(out.isEmpty)
+    #expect(await recorded.membershipReleases == [["1"]])
     #expect(into.contains { if case .upsert(let row, _) = $0 { return row.id == "2" }; return false })
     try await window.stop()
   }

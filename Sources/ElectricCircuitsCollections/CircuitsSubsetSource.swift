@@ -390,6 +390,111 @@ private struct LimitedWindow<Model: Sendable, Key: Hashable & Sendable>: Sendabl
   let decodePage: @Sendable (SubsetResponse) throws -> ([Model], CollectionSourceVersion)
 }
 
+/// Shares one coordinator and one changes-only feed for every keyed window with the same table,
+/// predicate and projection. The hub is deliberately type-erased: subscribers decode their own
+/// rows, while the stream cursor and coordinator lifecycle remain shared.
+private actor KeyedWindowFeedHub: ShapeMaterializer {
+  typealias Callback = @Sendable (ChangeBatch) async throws -> Void
+
+  private var subscribers: [UUID: Callback] = [:]
+  private var cursor: StreamCursor?
+
+  func add(_ callback: @escaping Callback) -> UUID {
+    let id = UUID()
+    subscribers[id] = callback
+    return id
+  }
+
+  func remove(_ id: UUID) {
+    subscribers.removeValue(forKey: id)
+  }
+
+  func currentCursor() async throws -> StreamCursor? { cursor }
+
+  func apply(
+    _ batch: ChangeBatch, expecting expectedCursor: StreamCursor?, advancingTo next: StreamCursor
+  ) async throws {
+    if cursor == next { return }
+    guard cursor == expectedCursor else {
+      throw StreamError.cursorConflict(expected: expectedCursor, actual: cursor, advancingTo: next)
+    }
+    // Keep callback order stable. If one callback fails, do not advance the shared cursor; the
+    // coordinator retries the same batch and every subscriber sees the replay.
+    for callback in subscribers.values {
+      try await callback(batch)
+    }
+    cursor = next
+  }
+}
+
+/// Reference-counted owner of keyed-window feeds. A feed is created before any page query and is
+/// released only after the last window gives up its subscription.
+private actor KeyedWindowFeedRegistry {
+  static let shared = KeyedWindowFeedRegistry()
+
+  struct Lease: Sendable {
+    let key: String
+    let subscriberID: UUID
+    let handle: ShapeHandle
+    let coordinator: ShapeSubscriptionCoordinator
+  }
+
+  private struct Entry {
+    let hub: KeyedWindowFeedHub
+    let coordinator: ShapeSubscriptionCoordinator
+    let handle: ShapeHandle
+    var references: Int
+  }
+
+  private var entries: [String: Entry] = [:]
+
+  func acquire(
+    key: String,
+    client: ElectricCircuitsClient,
+    transport: any HTTPTransport,
+    request: ShapeRequest,
+    retryPolicy: ShapeSubscriptionRetryPolicy,
+    clock: any ShapeSubscriptionClock,
+    recreatePolicy: ShapeSubscriptionRecreatePolicy,
+    callback: @escaping KeyedWindowFeedHub.Callback
+  ) async throws -> Lease {
+    if var entry = entries[key] {
+      let subscriberID = await entry.hub.add(callback)
+      entry.references += 1
+      entries[key] = entry
+      return Lease(
+        key: key, subscriberID: subscriberID, handle: entry.handle, coordinator: entry.coordinator)
+    }
+
+    let hub = KeyedWindowFeedHub()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: client,
+      transport: transport,
+      request: request,
+      materializer: hub,
+      retryPolicy: retryPolicy,
+      clock: clock,
+      kind: .subsetFeed,
+      recreatePolicy: recreatePolicy)
+    let handle = try await coordinator.start()
+    let subscriberID = await hub.add(callback)
+    entries[key] = Entry(hub: hub, coordinator: coordinator, handle: handle, references: 1)
+    return Lease(key: key, subscriberID: subscriberID, handle: handle, coordinator: coordinator)
+  }
+
+  func release(_ lease: Lease) async throws {
+    guard var entry = entries[lease.key] else { return }
+    await entry.hub.remove(lease.subscriberID)
+    entry.references -= 1
+    guard entry.references == 0 else {
+      entries[lease.key] = entry
+      return
+    }
+    entries.removeValue(forKey: lease.key)
+    try await entry.coordinator.stop()
+  }
+}
+
 /// Additive, explicitly claimed keyed pages over one changes-only feed.
 ///
 /// `LimitedWindow` follows a moving ordered page. A `KeyedWindow` instead keeps the keys a host has
@@ -444,6 +549,13 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
     let task: Task<SubsetResponse, Error>
   }
 
+  private struct PageTicket {
+    let id: UUID
+    let tokens: Set<String>
+    let completion: KeyedPageCompletion<[CollectionChange<Model, PrimaryKey>]>
+    let task: Task<SubsetResponse, Error>
+  }
+
   private struct Snapshot {
     var claims: [String: Claim]
     var primaryToSecondary: [PrimaryKey: String]
@@ -471,6 +583,8 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
 
   private var state: State = .idle
   private var feed: ShapeHandle?
+  private var coordinator: ShapeSubscriptionCoordinator?
+  private var registryLease: KeyedWindowFeedRegistry.Lease?
   private var frontier: StreamCursor?
   private var claims: [String: Claim] = [:]
   private var primaryToSecondary: [PrimaryKey: String] = [:]
@@ -539,16 +653,19 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
     }.joined()
   }
 
-  /// The registry/coordinator integration is kept at the feed boundary: the controller is a
-  /// `ShapeMaterializer`, so a host can hand it to `ShapeSubscriptionCoordinator` and get renewal,
-  /// retry, recreate-on-410 and telemetry from the SDK. `run()` remains a small compatibility
-  /// helper for the prototype's scripted transport tests.
+  /// The production path is backed by the shared registry and SDK coordinator. The direct
+  /// materializer methods remain available for scripted transport tests.
   public func run() async throws {
-    guard let feed, let frontier else { throw KeyedWindowError.notLive }
-    let reader = ShapeStreamReader(
-      streamURL: feed.stream.url, transport: transport, materializer: self,
-      startingAt: frontier)
-    try await reader.run()
+    guard let coordinator else { throw KeyedWindowError.notLive }
+    for await update in coordinator.stateUpdates {
+      switch update {
+      case .failed(let failure): throw CircuitsSubsetSourceError.subscription(failure)
+      case .reseedRequired(let outcome):
+        throw CircuitsSubsetSourceError.subscription(.reseedRequired(outcome))
+      case .stopped: return
+      default: continue
+      }
+    }
   }
 
   public func apply(
@@ -567,17 +684,19 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
     let request = ShapeRequest(
       table: table, where: basePredicate, columns: columns, changesOnly: true,
       subscription: subscription)
-    let handle = try await recreatePolicy.recreatingOnGone(clock: clock) {
-      try await client.createSubsetFeed(request)
-    }
-    do {
-      frontier = try await client.streamCursor(for: handle)
-      feed = handle
-      state = .live
-    } catch {
-      try? await client.releaseShape(handle)
-      throw error
-    }
+    let registryKey = feedRegistryKey(request)
+    let lease = try await KeyedWindowFeedRegistry.shared.acquire(
+      key: registryKey, client: client, transport: transport, request: request,
+      retryPolicy: retryPolicy, clock: clock, recreatePolicy: recreatePolicy,
+      callback: { [weak self] batch in
+        guard let self else { return }
+        _ = try await self.applyTail(batch)
+      })
+    registryLease = lease
+    coordinator = lease.coordinator
+    feed = lease.handle
+    frontier = .beginning
+    state = .live
   }
 
   public func restart(subscription: String = UUID().uuidString)
@@ -623,9 +742,12 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
     guard state == .live else { throw KeyedWindowError.notLive }
     let unique = uniqueValues(keys)
     var ownedTokens = Set<String>()
+    var joinedTokens = Set<String>()
     var joiners: [KeyedPageCompletion<[CollectionChange<Model, PrimaryKey>]>] = []
     var pages: [PageDraft] = []
+    var tickets: [PageTicket] = []
     var permitHeld = false
+    var committed = false
     await acquireApplicationPermit()
     permitHeld = true
     do {
@@ -635,6 +757,7 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
           claim.holders.insert(holder)
           claims[token] = claim
           if let pageID = pageForToken[token], let page = inFlight[pageID] {
+            joinedTokens.insert(token)
             joiners.append(page.completion)
           }
         } else {
@@ -645,12 +768,18 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
       releaseApplicationPermit()
       permitHeld = false
       let pending = ownedTokens.map { claims[$0]!.value }
-      for chunk in chunks(pending) {
-        pages.append(try await fetchPageDraft(chunk))
+      tickets = try chunks(pending).map(beginPage)
+      for ticket in tickets {
+        pages.append(try await awaitPage(ticket))
       }
       await acquireApplicationPermit()
       permitHeld = true
-      defer { if permitHeld { releaseApplicationPermit() } }
+      defer {
+        if permitHeld {
+          permitHeld = false
+          releaseApplicationPermit()
+        }
+      }
       var next = snapshot()
       var changes: [CollectionChange<Model, PrimaryKey>] = []
       var releases: [PrimaryKey] = []
@@ -666,27 +795,33 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
       }
       try await emit(changes, membershipReleases: releases)
       commit(next)
+      committed = true
       for page in pages {
         retirePage(page)
         page.completion.finish(.success(changes))
       }
-      releaseApplicationPermit()
-      permitHeld = false
+      if permitHeld {
+        permitHeld = false
+        releaseApplicationPermit()
+      }
       for joiner in joiners { changes.append(contentsOf: try await joiner.value()) }
       return changes
     } catch {
       if permitHeld { releaseApplicationPermit(); permitHeld = false }
       await acquireApplicationPermit()
-      for token in ownedTokens {
+      for token in ownedTokens.union(joinedTokens) where !committed {
         if var claim = claims[token] {
           claim.holders.remove(holder)
           if claim.holders.isEmpty { claims.removeValue(forKey: token) } else { claims[token] = claim }
         }
       }
       releaseApplicationPermit()
-      for page in pages {
-        retirePage(page)
-        page.completion.finish(.failure(error))
+      if !committed {
+        for ticket in tickets {
+          ticket.task.cancel()
+          retirePage(id: ticket.id, tokens: ticket.tokens)
+          ticket.completion.finish(.failure(error))
+        }
       }
       throw error
     }
@@ -706,6 +841,7 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
     -> [CollectionChange<Model, PrimaryKey>]
   {
     await acquireApplicationPermit()
+    defer { releaseApplicationPermit() }
     var next = snapshot()
     var releases: [PrimaryKey] = []
     for key in uniqueValues(keys) {
@@ -724,7 +860,6 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
     }
     try await emit([], membershipReleases: releases)
     commit(next)
-    releaseApplicationPermit()
     return []
   }
 
@@ -797,23 +932,37 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
 
   public func end() async throws {
     guard state != .idle else { return }
-    let handle = feed
+    let lease = registryLease
+    registryLease = nil
+    coordinator = nil
     feed = nil
     state = .ended
-    if let handle { try await client.releaseShape(handle) }
+    if let lease { try await KeyedWindowFeedRegistry.shared.release(lease) }
   }
 
   public func stop() async throws {
     for page in inFlight.values { page.task.cancel(); page.completion.finish(.failure(CancellationError())) }
     inFlight.removeAll()
     pageForToken.removeAll()
-    if let feed { try await client.releaseShape(feed) }
+    let lease = registryLease
+    registryLease = nil
+    coordinator = nil
+    if let lease { try await KeyedWindowFeedRegistry.shared.release(lease) }
     feed = nil
     frontier = nil
     state = .idle
   }
 
-  private func fetchPageDraft(_ keys: [JSONValue]) async throws -> PageDraft {
+  private func feedRegistryKey(_ request: ShapeRequest) -> String {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    let predicate = (try? encoder.encode(request.where)).map {
+      String(decoding: $0, as: UTF8.self)
+    } ?? "nil"
+    return "\(client.baseURL.absoluteString)|\(table)|\(predicate)"
+  }
+
+  private func beginPage(_ keys: [JSONValue]) throws -> PageTicket {
     let tokens = Set(try keys.map(canonicalToken))
     let id = UUID()
     let completion = KeyedPageCompletion<[CollectionChange<Model, PrimaryKey>]>()
@@ -822,17 +971,22 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
     let task = Task { try await client.querySubset(query) }
     inFlight[id] = InFlightPage(id: id, tokens: tokens, completion: completion, task: task)
     for token in tokens { pageForToken[token] = id }
+    return PageTicket(id: id, tokens: tokens, completion: completion, task: task)
+  }
+
+  private func awaitPage(_ ticket: PageTicket) async throws -> PageDraft {
     do {
       let response = try await withTaskCancellationHandler(
-        operation: { try await task.value },
-        onCancel: { task.cancel() })
+        operation: { try await ticket.task.value },
+        onCancel: { ticket.task.cancel() })
       try Task.checkCancellation()
       let result = try decodePage(response)
-      return PageDraft(id: id, tokens: tokens, result: result, completion: completion)
+      return PageDraft(
+        id: ticket.id, tokens: ticket.tokens, result: result, completion: ticket.completion)
     } catch {
-      task.cancel()
-      retirePage(id: id, tokens: tokens)
-      completion.finish(.failure(error))
+      ticket.task.cancel()
+      retirePage(id: ticket.id, tokens: ticket.tokens)
+      ticket.completion.finish(.failure(error))
       throw error
     }
   }
