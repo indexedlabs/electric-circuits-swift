@@ -801,6 +801,7 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
       let result = try decodePage(response)
       var changes: [CollectionChange<Model, PrimaryKey>] = []
       for row in result.rows where tokens.contains(row.token) {
+        guard claims[row.token] != nil else { continue }
         // A tail may have passed this primary key while the page was in flight. Its version map
         // also stores delete tombstones, so a stale page row is ignored instead of resurrecting it.
         if let tailVersion = primaryVersions[row.primary], !result.version.supersedes(tailVersion) {
