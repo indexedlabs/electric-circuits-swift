@@ -233,6 +233,41 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     try await pendingCleanup.retry(materializationID)
   }
 
+  /// Builds the additive keyed-window mode for this source. The returned controller is intended
+  /// for a host that mounts and releases a set of secondary keys independently of the collection
+  /// coordinator's exact-demand leases. It shares this source's decoder, transport and retry
+  /// policy, and therefore uses the same native subset-feed contract as `materialize`.
+  public func makeKeyedWindow(
+    keyColumn: String,
+    basePredicate: ElectricCircuitsSwift.Predicate? = nil,
+    secondaryKeyForRow: @escaping @Sendable (Model) throws -> JSONValue,
+    onChanges: (@Sendable ([CollectionChange<Model, Key>]) async throws -> Void)? = nil,
+    onMembershipRelease: (@Sendable ([Key]) async throws -> Void)? = nil
+  ) -> KeyedWindow<Model, Key> {
+    let primaryKeyForRow: @Sendable (Model) throws -> Key = keyForRow ?? { _ in
+      // A keyed window must be able to associate a page row with the opaque primary key in the
+      // stream. Callers using this convenience method therefore need to provide `keyForRow`.
+      throw CircuitsSubsetSourceError.invalidLiveKey("keyForRow is required for KeyedWindow")
+    }
+    return KeyedWindow(
+      client: client,
+      transport: transport,
+      table: table,
+      columns: columns,
+      basePredicate: basePredicate,
+      keyColumn: keyColumn,
+      decodeRow: decodeRow,
+      decodePrimaryKey: decodeKey,
+      primaryKeyForRow: primaryKeyForRow,
+      secondaryKeyForRow: secondaryKeyForRow,
+      retryPolicy: retryPolicy,
+      clock: clock,
+      recreatePolicy: recreatePolicy,
+      onChanges: onChanges,
+      onMembershipRelease: onMembershipRelease
+    )
+  }
+
   private static func snapshotFence(offset: String, sourceVersion: String) -> String {
     ["subset-v1", offset, sourceVersion]
       .map { "\($0.utf8.count):\($0)" }
@@ -357,6 +392,869 @@ private struct LimitedWindow<Model: Sendable, Key: Hashable & Sendable>: Sendabl
   let decodePage: @Sendable (SubsetResponse) throws -> ([Model], CollectionSourceVersion)
 }
 
+/// Shares one coordinator and one changes-only feed for every keyed window with the same table,
+/// predicate and projection. The hub is deliberately type-erased: subscribers decode their own
+/// rows, while the stream cursor and coordinator lifecycle remain shared.
+private final class KeyedWindowFeedHub: ShapeMaterializer, @unchecked Sendable {
+  typealias Callback = @Sendable (ChangeBatch) async throws -> Void
+
+  private let lock = NSLock()
+  private var subscribers: [UUID: Callback] = [:]
+  private var subscriberOrder: [UUID] = []
+  private var cursor: StreamCursor?
+
+  func add(_ id: UUID, callback: @escaping Callback) {
+    lock.withLock {
+      subscribers[id] = callback
+      subscriberOrder.append(id)
+    }
+  }
+
+  func remove(_ id: UUID) {
+    lock.withLock {
+      subscribers.removeValue(forKey: id)
+      subscriberOrder.removeAll { $0 == id }
+    }
+  }
+
+  func prime(_ value: StreamCursor) {
+    lock.withLock {
+      if cursor == nil { cursor = value }
+    }
+  }
+
+  func currentCursor() async throws -> StreamCursor? {
+    lock.withLock { cursor }
+  }
+
+  func apply(
+    _ batch: ChangeBatch, expecting expectedCursor: StreamCursor?, advancingTo next: StreamCursor
+  ) async throws {
+    let (current, callbacks) = lock.withLock {
+      (cursor, subscriberOrder.compactMap { subscribers[$0] })
+    }
+    if current == next { return }
+    guard current == expectedCursor else {
+      throw StreamError.cursorConflict(expected: expectedCursor, actual: current, advancingTo: next)
+    }
+    // Keep callback order stable for this batch. If one callback fails, do not advance the shared
+    // cursor; the coordinator retries the same batch and every subscriber sees the replay.
+    for callback in callbacks {
+      try await callback(batch)
+    }
+    lock.withLock { cursor = next }
+  }
+}
+
+/// Reference-counted owner of keyed-window feeds. A feed is created before any page query and is
+/// released only after the last window gives up its subscription.
+private actor KeyedWindowFeedRegistry {
+  static let shared = KeyedWindowFeedRegistry()
+
+  struct Lease: Sendable {
+    let key: String
+    let subscriberID: UUID
+    let handle: ShapeHandle
+    let head: StreamCursor
+    let coordinator: ShapeSubscriptionCoordinator
+  }
+
+  private struct Entry {
+    let hub: KeyedWindowFeedHub
+    let coordinator: ShapeSubscriptionCoordinator
+    let handle: ShapeHandle
+    let head: StreamCursor
+    var references: Int
+  }
+
+  private var entries: [String: Entry] = [:]
+  private struct Started: Sendable {
+    let hub: KeyedWindowFeedHub
+    let coordinator: ShapeSubscriptionCoordinator
+    let handle: ShapeHandle
+    let head: StreamCursor
+  }
+  private var pending: [String: Task<Started, Error>] = [:]
+
+  func acquire(
+    key: String,
+    client: ElectricCircuitsClient,
+    transport: any HTTPTransport,
+    request: ShapeRequest,
+    retryPolicy: ShapeSubscriptionRetryPolicy,
+    clock: any ShapeSubscriptionClock,
+    recreatePolicy: ShapeSubscriptionRecreatePolicy,
+    callback: @escaping KeyedWindowFeedHub.Callback
+  ) async throws -> Lease {
+    if var entry = entries[key] {
+      let subscriberID = UUID()
+      entry.references += 1
+      entries[key] = entry
+      entry.hub.add(subscriberID, callback: callback)
+      return Lease(
+        key: key, subscriberID: subscriberID, handle: entry.handle, head: entry.head,
+        coordinator: entry.coordinator)
+    }
+
+    let task: Task<Started, Error>
+    if let existing = pending[key] {
+      task = existing
+    } else {
+      let taskValue = Task<Started, Error> {
+        let hub = KeyedWindowFeedHub()
+        let handle = try await recreatePolicy.recreatingOnGone(clock: clock) {
+          try await client.createSubsetFeed(request)
+        }
+        do {
+          let head = try await client.streamCursor(for: handle)
+          hub.prime(head)
+          let coordinator = ShapeSubscriptionCoordinator(
+            client: client,
+            transport: transport,
+            request: request,
+            materializer: hub,
+            retryPolicy: retryPolicy,
+            clock: clock,
+            kind: .subsetFeed,
+            recreatePolicy: recreatePolicy)
+          _ = try await coordinator.start(existing: handle)
+          return Started(hub: hub, coordinator: coordinator, handle: handle, head: head)
+        } catch {
+          try? await client.releaseShape(handle)
+          throw error
+        }
+      }
+      pending[key] = taskValue
+      task = taskValue
+    }
+
+    let started: Started
+    do {
+      started = try await task.value
+    } catch {
+      pending.removeValue(forKey: key)
+      throw error
+    }
+    if var entry = entries[key] {
+      let subscriberID = UUID()
+      entry.references += 1
+      entries[key] = entry
+      entry.hub.add(subscriberID, callback: callback)
+      return Lease(
+        key: key, subscriberID: subscriberID, handle: entry.handle, head: entry.head,
+        coordinator: entry.coordinator)
+    }
+    pending.removeValue(forKey: key)
+    let subscriberID = UUID()
+    started.hub.add(subscriberID, callback: callback)
+    entries[key] = Entry(
+      hub: started.hub, coordinator: started.coordinator, handle: started.handle,
+      head: started.head, references: 1)
+    return Lease(
+      key: key, subscriberID: subscriberID, handle: started.handle, head: started.head,
+      coordinator: started.coordinator)
+  }
+
+  func release(_ lease: Lease) async throws {
+    guard var entry = entries[lease.key] else { return }
+    guard entry.handle.id == lease.handle.id else { return }
+    entry.hub.remove(lease.subscriberID)
+    entry.references -= 1
+    guard entry.references == 0 else {
+      entries[lease.key] = entry
+      return
+    }
+    entries.removeValue(forKey: lease.key)
+    try await entry.coordinator.stop()
+  }
+}
+
+/// Additive, explicitly claimed keyed pages over one changes-only feed.
+///
+/// `LimitedWindow` follows a moving ordered page. A `KeyedWindow` instead keeps the keys a host has
+/// claimed and fetches those keys in one-shot pages. Pages never replace store membership: callers
+/// release claims explicitly, and a membership release is reported separately from a source delete.
+public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
+  Sendable, ShapeMaterializer
+{
+  public static var pageSize: Int { 100 }
+
+  public enum State: Equatable, Sendable { case idle, live, ended }
+
+  public struct DebugState: Equatable, Sendable {
+    public let state: State
+    public let claimedKeyCount: Int
+    public let heldPrimaryKeyCount: Int
+    public let inFlightPageCount: Int
+    public let feedCreated: Bool
+    public init(
+      state: State, claimedKeyCount: Int, heldPrimaryKeyCount: Int,
+      inFlightPageCount: Int, feedCreated: Bool
+    ) {
+      self.state = state
+      self.claimedKeyCount = claimedKeyCount
+      self.heldPrimaryKeyCount = heldPrimaryKeyCount
+      self.inFlightPageCount = inFlightPageCount
+      self.feedCreated = feedCreated
+    }
+  }
+
+  private struct Claim {
+    let value: JSONValue
+    var holders: Set<String>
+  }
+
+  private struct PageResult: Sendable {
+    let rows: [(raw: ChangeRow, model: Model, primary: PrimaryKey, secondary: JSONValue, token: String)]
+    let version: CollectionSourceVersion
+  }
+
+  private struct PageDraft: Sendable {
+    let id: UUID
+    let tokens: Set<String>
+    let result: PageResult
+    let completion: KeyedPageCompletion<[CollectionChange<Model, PrimaryKey>]>
+  }
+
+  private struct InFlightPage {
+    let id: UUID
+    let tokens: Set<String>
+    let completion: KeyedPageCompletion<[CollectionChange<Model, PrimaryKey>]>
+    let task: Task<SubsetResponse, Error>
+  }
+
+  private struct PageTicket {
+    let id: UUID
+    let tokens: Set<String>
+    let completion: KeyedPageCompletion<[CollectionChange<Model, PrimaryKey>]>
+    let task: Task<SubsetResponse, Error>
+  }
+
+  private struct Snapshot {
+    var claims: [String: Claim]
+    var primaryToSecondary: [PrimaryKey: String]
+    var secondaryToPrimaries: [String: Set<PrimaryKey>]
+    var versions: [PrimaryKey: CollectionSourceVersion]
+    var rawRows: [PrimaryKey: ChangeRow]
+  }
+
+  private let client: ElectricCircuitsClient
+  private let transport: any HTTPTransport
+  private let table: String
+  private let columns: [String]?
+  private let basePredicate: ElectricCircuitsSwift.Predicate?
+  private let keyColumn: String
+  private let decodeRow: @Sendable (ChangeRow) throws -> Model
+  private let decodePrimaryKey: @Sendable (String) throws -> PrimaryKey
+  private let primaryKeyForRow: @Sendable (Model) throws -> PrimaryKey
+  private let secondaryKeyForRow: @Sendable (Model) throws -> JSONValue
+  private let retryPolicy: ShapeSubscriptionRetryPolicy
+  private let clock: any ShapeSubscriptionClock
+  private let recreatePolicy: ShapeSubscriptionRecreatePolicy
+  private let onChanges: (@Sendable ([CollectionChange<Model, PrimaryKey>]) async throws -> Void)?
+  private let onMembershipRelease: (@Sendable ([PrimaryKey]) async throws -> Void)?
+  private let defaultHolder = "default"
+
+  private var state: State = .idle
+  private var feed: ShapeHandle?
+  private var coordinator: ShapeSubscriptionCoordinator?
+  private var registryLease: KeyedWindowFeedRegistry.Lease?
+  private var frontier: StreamCursor?
+  private var claims: [String: Claim] = [:]
+  private var primaryToSecondary: [PrimaryKey: String] = [:]
+  private var secondaryToPrimaries: [String: Set<PrimaryKey>] = [:]
+  private var versions: [PrimaryKey: CollectionSourceVersion] = [:]
+  private var rawRows: [PrimaryKey: ChangeRow] = [:]
+  private var inFlight: [UUID: InFlightPage] = [:]
+  private var pageForToken: [String: UUID] = [:]
+  private var applying = false
+  private var applicationWaiters: [CheckedContinuation<Void, Never>] = []
+
+  public init(
+    client: ElectricCircuitsClient,
+    transport: any HTTPTransport,
+    table: String,
+    columns: [String]? = nil,
+    basePredicate: ElectricCircuitsSwift.Predicate? = nil,
+    keyColumn: String,
+    decodeRow: @escaping @Sendable (ChangeRow) throws -> Model,
+    decodePrimaryKey: @escaping @Sendable (String) throws -> PrimaryKey,
+    primaryKeyForRow: @escaping @Sendable (Model) throws -> PrimaryKey,
+    secondaryKeyForRow: @escaping @Sendable (Model) throws -> JSONValue,
+    retryPolicy: ShapeSubscriptionRetryPolicy = .init(),
+    clock: any ShapeSubscriptionClock = ContinuousShapeSubscriptionClock(),
+    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init(),
+    onChanges: (@Sendable ([CollectionChange<Model, PrimaryKey>]) async throws -> Void)? = nil,
+    onMembershipRelease: (@Sendable ([PrimaryKey]) async throws -> Void)? = nil
+  ) {
+    precondition(!table.isEmpty && !keyColumn.isEmpty)
+    self.client = client
+    self.transport = transport
+    self.table = table
+    self.columns = columns
+    self.basePredicate = basePredicate
+    self.keyColumn = keyColumn
+    self.decodeRow = decodeRow
+    self.decodePrimaryKey = decodePrimaryKey
+    self.primaryKeyForRow = primaryKeyForRow
+    self.secondaryKeyForRow = secondaryKeyForRow
+    self.retryPolicy = retryPolicy
+    self.clock = clock
+    self.recreatePolicy = recreatePolicy
+    self.onChanges = onChanges
+    self.onMembershipRelease = onMembershipRelease
+  }
+
+  public func debugState() -> DebugState {
+    DebugState(
+      state: state, claimedKeyCount: claims.values.reduce(0) { $0 + $1.holders.count },
+      heldPrimaryKeyCount: primaryToSecondary.count, inFlightPageCount: inFlight.count,
+      feedCreated: feed != nil)
+  }
+
+  public func currentCursor() async throws -> StreamCursor? { frontier }
+
+  public static func compositePrimaryKey(_ components: [String]) -> String {
+    components.enumerated().map { index, component in
+      let escaped = component.reduce(into: "") { output, character in
+        switch character {
+        case "\\": output.append("\\\\")
+        case "\u{1f}": output.append("\\x1f")
+        default: output.append(character)
+        }
+      }
+      return index == 0 ? escaped : "\u{1f}\(escaped)"
+    }.joined()
+  }
+
+  /// The production path is backed by the shared registry and SDK coordinator. The direct
+  /// materializer methods remain available for scripted transport tests.
+  public func run() async throws {
+    guard let coordinator else { throw KeyedWindowError.notLive }
+    let updates = await coordinator.stateUpdates
+    for await update in updates {
+      switch update {
+      case .failed(let failure): throw CircuitsSubsetSourceError.subscription(failure)
+      case .reseedRequired(let outcome):
+        throw CircuitsSubsetSourceError.subscription(.reseedRequired(outcome))
+      case .stopped: return
+      default: continue
+      }
+    }
+  }
+
+  public func apply(
+    _ batch: ChangeBatch, expecting expectedCursor: StreamCursor?, advancingTo cursor: StreamCursor
+  ) async throws {
+    guard frontier == expectedCursor else {
+      throw StreamError.cursorConflict(
+        expected: expectedCursor, actual: frontier, advancingTo: cursor)
+    }
+    _ = try await applyTail(batch)
+    frontier = cursor
+  }
+
+  public func start(subscription: String = UUID().uuidString) async throws {
+    guard state != .live else { return }
+    state = .live
+    let request = ShapeRequest(
+      table: table, where: basePredicate, columns: columns, changesOnly: true,
+      subscription: subscription)
+    let baseURL = await client.baseURL
+    let registryKey = feedRegistryKey(request, baseURL: baseURL)
+    do {
+      let lease = try await KeyedWindowFeedRegistry.shared.acquire(
+        key: registryKey, client: client, transport: transport, request: request,
+        retryPolicy: retryPolicy, clock: clock, recreatePolicy: recreatePolicy,
+        callback: { [weak self] batch in
+          guard let self else { return }
+          guard await self.isLiveForSharedFeed() else { return }
+          _ = try await self.applyTail(batch)
+        })
+      registryLease = lease
+      coordinator = lease.coordinator
+      feed = lease.handle
+      frontier = lease.head
+    } catch {
+      state = .idle
+      throw error
+    }
+  }
+
+  public func restart(subscription: String = UUID().uuidString)
+    async throws -> [CollectionChange<Model, PrimaryKey>]
+  {
+    await acquireApplicationPermit()
+    let retained = claims
+    let oldPrimaryKeys = Set(primaryToSecondary.keys)
+    releaseApplicationPermit()
+    try await stop()
+    try await start(subscription: subscription)
+    guard !retained.isEmpty else { return [] }
+    var drafts: [PageResult] = []
+    for chunk in chunks(retained.values.map(\.value)) {
+      drafts.append(try await fetchPage(chunk))
+    }
+    await acquireApplicationPermit()
+    defer { releaseApplicationPermit() }
+    var next = Snapshot(
+      claims: retained, primaryToSecondary: [:], secondaryToPrimaries: [:], versions: [:], rawRows: [:])
+    var changes: [CollectionChange<Model, PrimaryKey>] = []
+    for result in drafts {
+      for row in result.rows where claimIsActive(row.token, in: retained) {
+        nextInstall(row, version: result.version, into: &next)
+        changes.append(.upsert(row.model, sourceVersion: result.version))
+      }
+    }
+    let released = oldPrimaryKeys.subtracting(next.primaryToSecondary.keys)
+    try await emit(changes, membershipReleases: Array(released))
+    commit(next)
+    return changes
+  }
+
+  @discardableResult
+  public func addKeys(_ keys: [JSONValue]) async throws -> [CollectionChange<Model, PrimaryKey>] {
+    try await addKeys(keys, holder: defaultHolder)
+  }
+
+  @discardableResult
+  public func addKeys(_ keys: [JSONValue], holder: String) async throws
+    -> [CollectionChange<Model, PrimaryKey>]
+  {
+    guard state == .live else { throw KeyedWindowError.notLive }
+    let unique = uniqueValues(keys)
+    var ownedTokens = Set<String>()
+    var joinedTokens = Set<String>()
+    var satisfiedTokens = Set<String>()
+    var joiners: [KeyedPageCompletion<[CollectionChange<Model, PrimaryKey>]>] = []
+    var pages: [PageDraft] = []
+    var tickets: [PageTicket] = []
+    var permitHeld = false
+    var committed = false
+    await acquireApplicationPermit()
+    permitHeld = true
+    do {
+      for key in unique {
+        let token = try canonicalToken(key)
+        if var claim = claims[token] {
+          claim.holders.insert(holder)
+          claims[token] = claim
+          if let pageID = pageForToken[token], let page = inFlight[pageID] {
+            joinedTokens.insert(token)
+            joiners.append(page.completion)
+          } else {
+            satisfiedTokens.insert(token)
+          }
+        } else {
+          claims[token] = Claim(value: key, holders: [holder])
+          ownedTokens.insert(token)
+        }
+      }
+      releaseApplicationPermit()
+      permitHeld = false
+      let pending = ownedTokens.map { claims[$0]!.value }
+      tickets = try chunks(pending).map(beginPage)
+      for ticket in tickets {
+        pages.append(try await awaitPage(ticket))
+      }
+      await acquireApplicationPermit()
+      permitHeld = true
+      defer {
+        if permitHeld {
+          permitHeld = false
+          releaseApplicationPermit()
+        }
+      }
+      var next = snapshot()
+      var changes: [CollectionChange<Model, PrimaryKey>] = []
+      let releases: [PrimaryKey] = []
+      for page in pages {
+        for row in page.result.rows where claimIsActive(row.token, in: next.claims) {
+          guard next.versions[row.primary].map({ page.result.version.supersedes($0) }) ?? true else { continue }
+          if let old = next.primaryToSecondary[row.primary], old != row.token {
+            removePrimary(row.primary, from: &next)
+          }
+          nextInstall(row, version: page.result.version, into: &next)
+          changes.append(.upsert(row.model, sourceVersion: page.result.version))
+        }
+      }
+      try await emit(changes, membershipReleases: releases)
+      commit(next)
+      committed = true
+      for page in pages {
+        retirePage(page)
+        page.completion.finish(.success(changes))
+      }
+      if permitHeld {
+        permitHeld = false
+        releaseApplicationPermit()
+      }
+      for joiner in joiners { changes.append(contentsOf: try await joiner.value()) }
+      for token in satisfiedTokens {
+        for primary in secondaryToPrimaries[token] ?? [] {
+          guard let raw = rawRows[primary], let version = versions[primary],
+            let model = try? decodeRow(raw)
+          else { continue }
+          changes.append(.upsert(model, sourceVersion: version))
+        }
+      }
+      return changes
+    } catch {
+      if permitHeld { releaseApplicationPermit(); permitHeld = false }
+      await acquireApplicationPermit()
+      for token in ownedTokens.union(joinedTokens) where !committed {
+        if var claim = claims[token] {
+          claim.holders.remove(holder)
+          if claim.holders.isEmpty { claims.removeValue(forKey: token) } else { claims[token] = claim }
+        }
+      }
+      releaseApplicationPermit()
+      if !committed {
+        for ticket in tickets {
+          ticket.task.cancel()
+          retirePage(id: ticket.id, tokens: ticket.tokens)
+          ticket.completion.finish(.failure(error))
+        }
+      }
+      throw error
+    }
+  }
+
+  public func addKeys(_ keys: [String]) async throws -> [CollectionChange<Model, PrimaryKey>] {
+    try await addKeys(keys.map { .string($0) })
+  }
+
+  @discardableResult
+  public func releaseKeys(_ keys: [JSONValue]) async throws -> [CollectionChange<Model, PrimaryKey>] {
+    try await releaseKeys(keys, holder: defaultHolder)
+  }
+
+  @discardableResult
+  public func releaseKeys(_ keys: [JSONValue], holder: String) async throws
+    -> [CollectionChange<Model, PrimaryKey>]
+  {
+    await acquireApplicationPermit()
+    defer { releaseApplicationPermit() }
+    var next = snapshot()
+    var releases: [PrimaryKey] = []
+    for key in uniqueValues(keys) {
+      let token = try canonicalToken(key)
+      guard var claim = next.claims[token] else { continue }
+      claim.holders.remove(holder)
+      if claim.holders.isEmpty {
+        next.claims.removeValue(forKey: token)
+        for primary in next.secondaryToPrimaries[token] ?? [] {
+          removePrimary(primary, from: &next)
+          releases.append(primary)
+        }
+      } else {
+        next.claims[token] = claim
+      }
+    }
+    try await emit([], membershipReleases: releases)
+    commit(next)
+    return []
+  }
+
+  @discardableResult
+  public func releaseKeys(_ keys: [String]) async throws -> [CollectionChange<Model, PrimaryKey>] {
+    try await releaseKeys(keys.map { .string($0) })
+  }
+
+  @discardableResult
+  public func applyTail(_ batch: ChangeBatch) async throws -> [CollectionChange<Model, PrimaryKey>] {
+    guard state == .live else { throw KeyedWindowError.notLive }
+    await acquireApplicationPermit()
+    defer { releaseApplicationPermit() }
+    var next = snapshot()
+    var changes: [CollectionChange<Model, PrimaryKey>] = []
+    var releases: [PrimaryKey] = []
+    for envelope in batch.envelopes {
+      guard let rawLSN = envelope.headers.lsn,
+        let parsed = CircuitsSubsetSource<Model, PrimaryKey>.postgresLSN(rawLSN)
+      else { throw CircuitsSubsetSourceError.invalidLiveSourceVersion(envelope.headers.lsn) }
+      let version = CollectionSourceVersion(
+        rawValue: parsed.rawValue, order: parsed.order,
+        transactionID: envelope.headers.txid.flatMap(CollectionPageSnapshot.xid32))
+      let primary = try decodePrimaryKey(envelope.key)
+      if let previous = next.versions[primary], !version.supersedes(previous) { continue }
+      let pageInFlight = !inFlight.isEmpty
+      if pageInFlight { next.versions[primary] = version }
+      if envelope.headers.operation == .delete {
+        if next.primaryToSecondary[primary] != nil {
+          removePrimary(primary, from: &next)
+          changes.append(.delete(primary, sourceVersion: version))
+        }
+        continue
+      }
+      let heldSecondary = next.primaryToSecondary[primary]
+      let oldRaw = next.rawRows[primary]
+      let merged = mergeRow(old: oldRaw, oldImage: envelope.old, value: envelope.value)
+      let rawSecondary: String?
+      if let merged, let value = merged[keyColumn] {
+        rawSecondary = try canonicalToken(value)
+      } else {
+        rawSecondary = nil
+      }
+      let claimed = rawSecondary.map { claimIsActive($0, in: next.claims) } ?? false
+      guard heldSecondary != nil || claimed else { continue }
+      guard let merged else { throw StreamError.missingValue(key: envelope.key) }
+      let model = try decodeRow(merged)
+      let secondary = try secondaryKeyForRow(model)
+      let token = try canonicalToken(secondary)
+      guard claimIsActive(token, in: next.claims) else {
+        if next.primaryToSecondary[primary] != nil {
+          removePrimary(primary, from: &next)
+          releases.append(primary)
+        }
+        continue
+      }
+      if heldSecondary != nil, heldSecondary != token {
+        removePrimary(primary, from: &next)
+      }
+      nextInstall(
+        (raw: merged, model: model, primary: primary, secondary: secondary, token: token),
+        version: version, into: &next)
+      changes.append(.upsert(model, sourceVersion: version))
+    }
+    gcUnheldVersions(&next)
+    try await emit(changes, membershipReleases: releases)
+    commit(next)
+    return changes
+  }
+
+  public func end() async throws {
+    guard state != .idle else { return }
+    let lease = registryLease
+    registryLease = nil
+    coordinator = nil
+    feed = nil
+    state = .ended
+    if let lease { try await KeyedWindowFeedRegistry.shared.release(lease) }
+  }
+
+  public func stop() async throws {
+    for page in inFlight.values { page.task.cancel(); page.completion.finish(.failure(CancellationError())) }
+    inFlight.removeAll()
+    pageForToken.removeAll()
+    let lease = registryLease
+    registryLease = nil
+    coordinator = nil
+    if let lease { try await KeyedWindowFeedRegistry.shared.release(lease) }
+    feed = nil
+    frontier = nil
+    state = .idle
+  }
+
+  private func feedRegistryKey(_ request: ShapeRequest, baseURL: URL) -> String {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    let predicate = (try? encoder.encode(request.where)).map {
+      String(decoding: $0, as: UTF8.self)
+    } ?? "nil"
+    let columns = request.columns?.joined(separator: ",") ?? "*"
+    return "\(ObjectIdentifier(client))|\(baseURL.absoluteString)|\(table)|\(columns)|\(predicate)"
+  }
+
+  private func isLiveForSharedFeed() -> Bool { state == .live }
+
+  private func beginPage(_ keys: [JSONValue]) throws -> PageTicket {
+    let tokens = Set(try keys.map(canonicalToken))
+    let id = UUID()
+    let completion = KeyedPageCompletion<[CollectionChange<Model, PrimaryKey>]>()
+    let query = pageQuery(for: keys)
+    let client = client
+    let task = Task { try await client.querySubset(query) }
+    inFlight[id] = InFlightPage(id: id, tokens: tokens, completion: completion, task: task)
+    for token in tokens { pageForToken[token] = id }
+    return PageTicket(id: id, tokens: tokens, completion: completion, task: task)
+  }
+
+  private func awaitPage(_ ticket: PageTicket) async throws -> PageDraft {
+    do {
+      let response = try await withTaskCancellationHandler(
+        operation: { try await ticket.task.value },
+        onCancel: { ticket.task.cancel() })
+      try Task.checkCancellation()
+      let result = try decodePage(response)
+      return PageDraft(
+        id: ticket.id, tokens: ticket.tokens, result: result, completion: ticket.completion)
+    } catch {
+      ticket.task.cancel()
+      retirePage(id: ticket.id, tokens: ticket.tokens)
+      ticket.completion.finish(.failure(error))
+      throw error
+    }
+  }
+
+  private func fetchPage(_ keys: [JSONValue]) async throws -> PageResult {
+    try Task.checkCancellation()
+    let response = try await client.querySubset(pageQuery(for: keys))
+    try Task.checkCancellation()
+    return try decodePage(response)
+  }
+
+  private func decodePage(_ response: SubsetResponse) throws -> PageResult {
+    guard let version = CircuitsSubsetSource<Model, PrimaryKey>.pageVersion(response) else {
+      throw CircuitsSubsetSourceError.invalidSnapshotSourceVersion(response.lsn)
+    }
+    var decoded: [(raw: ChangeRow, model: Model, primary: PrimaryKey, secondary: JSONValue, token: String)] = []
+    for (index, value) in response.rows.enumerated() {
+      guard case .object(let row) = value else {
+        throw CircuitsSubsetSourceError.invalidSnapshotRow(index: index)
+      }
+      let model = try decodeRow(row)
+      let primary = try primaryKeyForRow(model)
+      let secondary = try secondaryKeyForRow(model)
+      decoded.append((row, model, primary, secondary, try canonicalToken(secondary)))
+    }
+    return PageResult(rows: decoded, version: version)
+  }
+
+  private func pageQuery(for keys: [JSONValue]) -> SubsetQuery {
+    let leaves: [ElectricCircuitsSwift.Predicate] = keys.map {
+      .leaf(column: keyColumn, op: .eq, value: $0)
+    }
+    let keyPredicate: ElectricCircuitsSwift.Predicate = .or(leaves)
+    let predicate: ElectricCircuitsSwift.Predicate? =
+      if let basePredicate { .and([basePredicate, keyPredicate]) } else { keyPredicate }
+    return SubsetQuery(table: table, where: predicate, columns: columns)
+  }
+
+  private func chunks(_ values: [JSONValue]) -> [[JSONValue]] {
+    stride(from: 0, to: values.count, by: Self.pageSize).map {
+      Array(values[$0..<min($0 + Self.pageSize, values.count)])
+    }
+  }
+
+  private func uniqueValues(_ values: [JSONValue]) -> [JSONValue] {
+    var seen = Set<String>()
+    return values.compactMap { value in
+      guard let key = try? canonicalToken(value), seen.insert(key).inserted else { return nil }
+      return value
+    }
+  }
+
+  private func canonicalToken(_ value: JSONValue) throws -> String {
+    switch value {
+    case .null: return "null"
+    case .bool(let value): return value ? "bool:1" : "bool:0"
+    case .int(let value): return "int:\(value)"
+    case .decimal(let value): return "decimal:\(value)"
+    case .number(let value): return "number:\(value)"
+    case .string(let value): return "string:\(value.utf8.count):\(value)"
+    case .array(let values): return "array:[\(try values.map(canonicalToken).joined(separator: ","))]"
+    case .object(let values):
+      return "object:{\(try values.keys.sorted().map { "\($0)=\(try canonicalToken(values[$0]!))" }.joined(separator: ","))}"
+    }
+  }
+
+  private func mergeRow(old: ChangeRow?, oldImage: ChangeRow?, value: ChangeRow?) -> ChangeRow? {
+    var merged = old ?? oldImage ?? [:]
+    if let oldImage { for (key, value) in oldImage { merged[key] = value } }
+    if let value { for (key, value) in value { merged[key] = value } }
+    return merged.isEmpty ? nil : merged
+  }
+
+  private func snapshot() -> Snapshot {
+    Snapshot(
+      claims: claims, primaryToSecondary: primaryToSecondary,
+      secondaryToPrimaries: secondaryToPrimaries, versions: versions, rawRows: rawRows)
+  }
+
+  private func commit(_ next: Snapshot) {
+    claims = next.claims
+    primaryToSecondary = next.primaryToSecondary
+    secondaryToPrimaries = next.secondaryToPrimaries
+    versions = next.versions
+    rawRows = next.rawRows
+  }
+
+  private func claimIsActive(_ token: String, in claims: [String: Claim]) -> Bool {
+    !(claims[token]?.holders.isEmpty ?? true)
+  }
+
+  private func nextInstall(
+    _ row: (raw: ChangeRow, model: Model, primary: PrimaryKey, secondary: JSONValue, token: String),
+    version: CollectionSourceVersion,
+    into next: inout Snapshot
+  ) {
+    if let old = next.primaryToSecondary[row.primary], old != row.token {
+      next.secondaryToPrimaries[old]?.remove(row.primary)
+    }
+    next.primaryToSecondary[row.primary] = row.token
+    next.secondaryToPrimaries[row.token, default: []].insert(row.primary)
+    next.versions[row.primary] = version
+    next.rawRows[row.primary] = row.raw
+  }
+
+  private func removePrimary(_ primary: PrimaryKey, from next: inout Snapshot) {
+    if let token = next.primaryToSecondary.removeValue(forKey: primary) {
+      next.secondaryToPrimaries[token]?.remove(primary)
+      if next.secondaryToPrimaries[token]?.isEmpty == true {
+        next.secondaryToPrimaries.removeValue(forKey: token)
+      }
+    }
+    next.rawRows.removeValue(forKey: primary)
+  }
+
+  private func gcUnheldVersions(_ next: inout Snapshot) {
+    guard inFlight.isEmpty else { return }
+    next.versions = next.versions.filter { next.primaryToSecondary[$0.key] != nil }
+  }
+
+  private func retirePage(_ page: PageDraft) {
+    retirePage(id: page.id, tokens: page.tokens)
+  }
+
+  private func retirePage(id: UUID, tokens: Set<String>) {
+    inFlight.removeValue(forKey: id)
+    for token in tokens where pageForToken[token] == id {
+      pageForToken.removeValue(forKey: token)
+    }
+  }
+
+  private func emit(
+    _ changes: [CollectionChange<Model, PrimaryKey>], membershipReleases: [PrimaryKey]
+  ) async throws {
+    if !changes.isEmpty, let onChanges { try await onChanges(changes) }
+    if !membershipReleases.isEmpty, let onMembershipRelease {
+      try await onMembershipRelease(membershipReleases)
+    }
+  }
+
+  private func acquireApplicationPermit() async {
+    if applying {
+      await withCheckedContinuation { applicationWaiters.append($0) }
+    } else {
+      applying = true
+    }
+  }
+
+  private func releaseApplicationPermit() {
+    if applicationWaiters.isEmpty { applying = false }
+    else { applicationWaiters.removeFirst().resume() }
+  }
+}
+
+private final class KeyedPageCompletion<Value: Sendable>: @unchecked Sendable {
+  private let continuation: AsyncThrowingStream<Value, Error>.Continuation
+  private let task: Task<Value, Error>
+  init() {
+    let pair = AsyncThrowingStream<Value, Error>.makeStream()
+    continuation = pair.continuation
+    task = Task { try await pair.stream.first(where: { _ in true })! }
+  }
+  func finish(_ result: Result<Value, Error>) {
+    switch result {
+    case .success(let value): continuation.yield(value); continuation.finish()
+    case .failure(let error): continuation.finish(throwing: error)
+    }
+  }
+  func value() async throws -> Value { try await task.value }
+}
+
+public enum KeyedWindowError: Error, Equatable, Sendable { case notLive }
 private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable & Sendable>:
   ShapeMaterializer
 {

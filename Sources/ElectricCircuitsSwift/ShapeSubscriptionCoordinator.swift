@@ -352,6 +352,24 @@ public actor ShapeSubscriptionCoordinator {
       onCancel: { Task { await self.cancelStartWaiter(waiterID) } })
   }
 
+  /// Starts consuming an already-created claim. Providers that must fence a snapshot with the
+  /// claim's HEAD frontier can create the feed, read HEAD, then hand that exact handle here; the
+  /// coordinator still owns stream retry, renewal, recreate and release for the claim.
+  @discardableResult
+  public func start(existing existingHandle: ShapeHandle) async throws -> ShapeHandle {
+    guard isAcceptingOperations, handle == nil, startTask == nil else {
+      if let handle, isAcceptingOperations { return handle }
+      throw CancellationError()
+    }
+    _ = try await materializer.currentCursor()
+    transition(.starting)
+    handle = existingHandle
+    currentClaimAcknowledged = true
+    generation &+= 1
+    launchStream(for: existingHandle, generation: generation)
+    return existingHandle
+  }
+
   private func startForWaiter(_ waiterID: UInt64) async throws -> ShapeHandle {
     registerInitialStartParticipationIfNeeded(waiterID)
     defer { finishStartWaiter(waiterID) }
