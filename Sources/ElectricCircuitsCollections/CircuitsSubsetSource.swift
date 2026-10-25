@@ -81,7 +81,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     self.decodeRow = decodeRow
     self.decodeKey = decodeKey
     self.keyForRow = keyForRow
-    pendingCleanup = PendingSubsetFeedCleanup(client: client)
+    pendingCleanup = PendingSubsetFeedCleanup(
+      client: client, recreatePolicy: recreatePolicy, clock: clock)
   }
 
   public func materialize(
@@ -136,19 +137,24 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     let loaded = try await loadIfSupported(
       feedRequest: feedRequest, pageQuery: pageQuery, materializationID: materializationID)
     let feed: ShapeHandle
+    let mintedAt: ContinuousClock.Instant
     if let loaded {
-      feed = loaded.handle
+      feed = loaded.load.handle
+      mintedAt = loaded.mintedAt
     } else {
+      // Stamp before the fallback request starts so a slow create can only make the adopted
+      // handle look older.
+      mintedAt = .now
       feed = try await recreatePolicy.recreatingOnGone(clock: clock) {
         try await client.createSubsetFeed(feedRequest)
       }
     }
-    let adopted = AdoptedShapeHandle(handle: feed)
+    let adopted = AdoptedShapeHandle(handle: feed, mintedAt: mintedAt)
 
     do {
       let frontier: StreamCursor
       if let loaded {
-        frontier = loaded.frontier
+        frontier = loaded.load.frontier
       } else {
         frontier = try await client.streamCursor(for: feed)
       }
@@ -168,7 +174,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       }
       let firstPage: SubsetResponse
       if let loaded {
-        firstPage = loaded.page
+        firstPage = loaded.load.page
       } else {
         firstPage = try await client.querySubset(pageQuery)
       }
@@ -268,8 +274,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   private func loadIfSupported(
     feedRequest: ShapeRequest, pageQuery: SubsetQuery,
     materializationID: CollectionMaterializationID
-  ) async throws -> SubsetLoad? {
-    guard setupRoute == .automatic, await loadSupport.shouldLoad() else { return nil }
+  ) async throws -> LoadedSubset? {
+    guard setupRoute == .automatic, await loadSupport.shouldTryLoad() else { return nil }
     let request = SubsetLoadRequest(
       table: table,
       where: feedRequest.where,
@@ -278,23 +284,23 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       query: SubsetLoadPage(
         where: pageQuery.where, orderBy: pageQuery.orderBy, limit: pageQuery.limit))
     do {
+      // The response includes the page, so transfer and decoding can consume a substantial part
+      // of the feed lease. A request-start timestamp is conservative for adoption.
+      let mintedAt = ContinuousClock.now
       let loaded = try await recreatePolicy.recreatingOnGone(clock: clock) {
         try await client.loadSubset(request)
       }
-      await loadSupport.settle(available: true)
-      return loaded
+      return LoadedSubset(load: loaded, mintedAt: mintedAt)
     } catch {
       let status = Self.httpStatus(error)
       if let status, status == 404 || status == 405 {
-        await loadSupport.settle(available: false)
+        await loadSupport.markUnavailable()
         return nil
       }
       if let status, (400..<500).contains(status) {
         // A refused request (400, 409, an exhausted 410) leaves no claim to release.
-        await loadSupport.settle(available: true)
         throw error
       }
-      await loadSupport.settle(available: nil)
       // The server may have created or renewed the claim before the client rejected the response
       // or lost the connection. Keep the claim so this attempt, or the next setup or abandonment
       // cleanup of this materialization, recovers its handle and releases it.
@@ -341,50 +347,26 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   }
 }
 
-/// Whether the server offers `v1/subset-loads`, learnt per source. The first load probes;
-/// concurrent setups wait for its answer instead of each sending their own probe. A 404 or 405
-/// settles it as unavailable for five minutes, so an old instance answering during a rolling
-/// deploy doesn't pin the source to three requests; a successful load settles it as available;
-/// any other failure leaves it unknown for the next setup to probe again.
+private struct LoadedSubset: Sendable {
+  let load: SubsetLoad
+  let mintedAt: ContinuousClock.Instant
+}
+
+/// Whether the server offers `v1/subset-loads`, learnt per source from a 404 or 405. This is only
+/// a timed negative cache: setups never wait for another setup's request to finish. Concurrent
+/// materializations therefore remain independent and cancellation reaches the request that owns it.
 private actor SubsetLoadSupport {
-  private enum State {
-    case unknown
-    case probing
-    case available
-    case unavailable(until: ContinuousClock.Instant)
-  }
-  private var state = State.unknown
-  private var waiters: [CheckedContinuation<Void, Never>] = []
+  private var unavailableUntil: ContinuousClock.Instant?
 
-  /// True when this setup should send the load: the route is known, or this setup is the probe.
-  func shouldLoad() async -> Bool {
-    while true {
-      switch state {
-      case .available: return true
-      case .unavailable(let until):
-        if ContinuousClock.now < until { return false }
-        state = .probing
-        return true
-      case .unknown:
-        state = .probing
-        return true
-      case .probing:
-        await withCheckedContinuation { waiters.append($0) }
-      }
-    }
+  func shouldTryLoad() -> Bool {
+    guard let unavailableUntil else { return true }
+    if ContinuousClock.now < unavailableUntil { return false }
+    self.unavailableUntil = nil
+    return true
   }
 
-  func settle(available: Bool?) {
-    guard case .probing = state else { return }
-    state =
-      switch available {
-      case true?: .available
-      case false?: .unavailable(until: .now + .seconds(300))
-      case nil: .unknown
-      }
-    let resumed = waiters
-    waiters = []
-    for waiter in resumed { waiter.resume() }
+  func markUnavailable() {
+    unavailableUntil = .now + .seconds(300)
   }
 }
 
@@ -403,10 +385,17 @@ private actor PendingSubsetFeedCleanup {
     case claim(ShapeRequest)
   }
   private let client: ElectricCircuitsClient
+  private let recreatePolicy: ShapeSubscriptionRecreatePolicy
+  private let clock: any ShapeSubscriptionClock
   private var pending: [CollectionMaterializationID: Pending] = [:]
 
-  init(client: ElectricCircuitsClient) {
+  init(
+    client: ElectricCircuitsClient, recreatePolicy: ShapeSubscriptionRecreatePolicy,
+    clock: any ShapeSubscriptionClock
+  ) {
     self.client = client
+    self.recreatePolicy = recreatePolicy
+    self.clock = clock
   }
 
   func record(_ handle: ShapeHandle, for materializationID: CollectionMaterializationID) {
@@ -426,12 +415,19 @@ private actor PendingSubsetFeedCleanup {
     case .claim(let request):
       let handle: ShapeHandle
       do {
-        handle = try await client.createSubsetFeed(request)
-      } catch ClientError.http(status: let status, message: _) where (400..<500).contains(status) {
-        // The server refuses this claim outright, so the load cannot have left one behind.
+        handle = try await recreatePolicy.recreatingOnGone(clock: clock) {
+          try await client.createSubsetFeed(request)
+        }
+      } catch ClientError.http(status: let status, message: _)
+        where status == 400 || status == 422
+      {
+        // These feed requests are invalid before the server can create a claim. Other statuses,
+        // including 410 and routing failures, retain cleanup authority for a later retry.
         pending.removeValue(forKey: materializationID)
         return
       }
+      // Keep the recovered handle if DELETE fails; retrying must not POST the claim again.
+      pending[materializationID] = .handle(handle)
       try await client.releaseShape(handle)
     }
     pending.removeValue(forKey: materializationID)

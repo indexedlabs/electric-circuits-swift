@@ -54,21 +54,8 @@ public struct ShapeSubscriptionRetryPolicy: Sendable {
   }
 }
 
-/// Bounds the client-side fall-through for a create/join the engine answered `410 Gone`.
-///
-/// The engine retires a dormant shape whose replay is over budget, and abandons a reactivation
-/// join past its own timeout, as a typed recreate outcome rather than a server fault
-/// (electric-circuits ADR-0011, "Dormant reactivation is bounded"). It normally answers that by
-/// falling through to a fresh create in the same round trip; when that fall-through is exhausted
-/// it answers `410` and expects the client to recreate.
-///
-/// The bound matters because a join that timed out leaves a detached replay running on the
-/// engine: each attempt can cost its full join timeout, and only a later attempt finds the shape
-/// active. A create answered `410` past the bound is a standing condition, not a reactivation
-/// race, and reaches the caller as the terminal `ClientError.http(status: 410, ...)` it already
-/// was. The backoff exists to avoid a hot loop, not to pace the engine's replay.
-/// A claim the caller created before the coordinator started, such as a subset load's feed, with
-/// when the server minted or renewed it.
+/// A claim the caller created before the coordinator started, such as a subset load's feed, and
+/// the time when the server minted or renewed it.
 public struct AdoptedShapeHandle: Sendable, Equatable {
   public let handle: ShapeHandle
   public let mintedAt: ContinuousClock.Instant
@@ -85,6 +72,19 @@ public struct AdoptedShapeHandle: Sendable, Equatable {
   }
 }
 
+/// Bounds the client-side fall-through for a create/join the engine answered `410 Gone`.
+///
+/// The engine retires a dormant shape whose replay is over budget, and abandons a reactivation
+/// join past its own timeout, as a typed recreate outcome rather than a server fault
+/// (electric-circuits ADR-0011, "Dormant reactivation is bounded"). It normally answers that by
+/// falling through to a fresh create in the same round trip; when that fall-through is exhausted
+/// it answers `410` and expects the client to recreate.
+///
+/// The bound matters because a join that timed out leaves a detached replay running on the
+/// engine: each attempt can cost its full join timeout, and only a later attempt finds the shape
+/// active. A create answered `410` past the bound is a standing condition, not a reactivation
+/// race, and reaches the caller as the terminal `ClientError.http(status: 410, ...)` it already
+/// was. The backoff exists to avoid a hot loop, not to pace the engine's replay.
 public struct ShapeSubscriptionRecreatePolicy: Equatable, Sendable {
   /// Recreates attempted after the first `410`. `0` surfaces the first `410` as terminal.
   public let maximumRecreates: Int

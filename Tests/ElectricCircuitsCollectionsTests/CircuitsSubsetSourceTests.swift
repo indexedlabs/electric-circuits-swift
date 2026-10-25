@@ -1062,6 +1062,8 @@ private actor LoadingSubsetTransport: HTTPTransport {
   private(set) var requests: [URLRequest] = []
   private var goneLoads: Int
   private var malformedLoads: Int
+  private let loadDelay: Duration
+  private let leaseSeconds: Int?
   private var goneStreamReads: Int
   private var streamBodies: [String]
   private var streamReads = 0
@@ -1074,6 +1076,8 @@ private actor LoadingSubsetTransport: HTTPTransport {
   init(
     goneLoads: Int = 0,
     malformedLoads: Int = 0,
+    loadDelay: Duration = .zero,
+    leaseSeconds: Int? = nil,
     goneStreamReads: Int = 0,
     streamBodies: [String] = [
       #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"Live"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#
@@ -1081,6 +1085,8 @@ private actor LoadingSubsetTransport: HTTPTransport {
   ) {
     self.goneLoads = goneLoads
     self.malformedLoads = malformedLoads
+    self.loadDelay = loadDelay
+    self.leaseSeconds = leaseSeconds
     self.goneStreamReads = goneStreamReads
     self.streamBodies = streamBodies
   }
@@ -1092,6 +1098,7 @@ private actor LoadingSubsetTransport: HTTPTransport {
     requests.append(request)
     switch (request.httpMethod, request.url?.path ?? "") {
     case ("POST", "/v1/subset-loads"):
+      if loadDelay > .zero { try await Task.sleep(for: loadDelay) }
       if goneLoads > 0 {
         goneLoads -= 1
         return reply("gone", request: request, status: 410)
@@ -1101,7 +1108,8 @@ private actor LoadingSubsetTransport: HTTPTransport {
         malformedLoads -= 1
         return reply("{\(Self.shape),\"offset\":\"10\",\"rows\":\"bad\"}", request: request)
       }
-      return reply("{\(Self.shape),\"offset\":\"10\",\(Self.page)}", request: request)
+      let lease = leaseSeconds.map { ",\"leaseSeconds\":\($0)" } ?? ""
+      return reply("{\(Self.shape)\(lease),\"offset\":\"10\",\(Self.page)}", request: request)
     case ("POST", "/v1/subset-feeds"):
       return reply("{\(Self.shape)}", request: request)
     case ("HEAD", "/streams/shape-1"):
@@ -1146,7 +1154,8 @@ struct SubsetLoadSetupTests {
 
   private func source(
     _ transport: any HTTPTransport, setupRoute: SubsetSetupRoute = .automatic,
-    keyForRow: (@Sendable (NativeIssue) throws -> Int64)? = nil
+    keyForRow: (@Sendable (NativeIssue) throws -> Int64)? = nil,
+    clock: any ShapeSubscriptionClock = SubsetRecreateClock()
   ) -> CircuitsSubsetSource<NativeIssue, Int64> {
     CircuitsSubsetSource<NativeIssue, Int64>(
       client: ElectricCircuitsClient(
@@ -1155,7 +1164,7 @@ struct SubsetLoadSetupTests {
       table: "public.issues",
       columns: ["id", "title"],
       retryPolicy: ShapeSubscriptionRetryPolicy(maxRetries: 0),
-      clock: SubsetRecreateClock(),
+      clock: clock,
       setupRoute: setupRoute,
       decodeRow: NativeIssue.init(row:),
       decodeKey: { key in
@@ -1249,15 +1258,17 @@ struct SubsetLoadSetupTests {
     try await second.stop()
   }
 
-  /// Two setups starting together on an older server send one probe between them.
-  @Test func concurrentSetupsShareOneRouteProbe() async throws {
+  /// Two setups starting together on an older server do not wait on one another's route request.
+  @Test func concurrentSetupsFallbackPerRequestWithoutWaiting() async throws {
     let transport = NativeSubsetTransport()
     let source = self.source(transport)
     async let first = materialize(source, id: "first")
     async let second = materialize(source, id: "second")
     let sessions = try await [first, second]
     let requests = await transport.requests
-    #expect(requests.filter { $0.url?.path == "/v1/subset-loads" }.count == 1)
+    let loadCount = requests.filter { $0.url?.path == "/v1/subset-loads" }.count
+    #expect(loadCount >= 1)
+    #expect(loadCount <= 2)
     for session in sessions { try await session.stop() }
   }
 
@@ -1290,6 +1301,28 @@ struct SubsetLoadSetupTests {
     #expect(Set(loads.compactMap(\.httpBody)).count == 1)
     #expect(!(await transport.calls).contains("POST /v1/subset-feeds"))
     try await session.stop()
+  }
+
+  /// A slow combined response is stamped when its request starts. With a one-second lease, the
+  /// coordinator therefore renews the adopted claim before starting its tail.
+  @Test func slowLoadRenewsAFiniteLeaseBeforeStartingTheTail() async throws {
+    let transport = LoadingSubsetTransport(
+      loadDelay: .milliseconds(500), leaseSeconds: 1,
+      streamBodies: [])
+    let session = try await materialize(
+      source(transport, clock: ContinuousShapeSubscriptionClock()))
+    let run = Task { try await session.run { _ in } }
+    for _ in 0..<10_000 {
+      if (await transport.requests).contains(where: { $0.url?.path == "/v1/subset-feeds" }) {
+        break
+      }
+      await Task.yield()
+    }
+    #expect(
+      (await transport.requests).contains(where: { $0.url?.path == "/v1/subset-feeds" }))
+    try await session.stop()
+    run.cancel()
+    _ = try? await run.value
   }
 
   /// A feed that is gone mid-tail ends the session; setting it up again is one load.
