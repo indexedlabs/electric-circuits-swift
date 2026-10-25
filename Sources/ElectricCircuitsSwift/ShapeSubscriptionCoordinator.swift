@@ -861,18 +861,27 @@ public actor ShapeSubscriptionCoordinator {
         }
       }
     }
-    do {
-      return try await attempt()
-    } catch {
-      // Keep `.failed` terminal while allowing exactly one transient renewal retry. This retry is
-      // intentionally independent of the create/stream retry budget.
-      guard isRetryable(error) else { throw error }
-      try Task.checkCancellation()
-      let delay = retryPolicy.delay(forRetry: 1, retryAfter: retryAfter(for: error))
-      transition(.waitingToRetry(operation: "renew", attempt: 1, delay: delay))
-      try await clock.sleep(for: delay)
-      try Task.checkCancellation()
-      return try await attempt()
+    var retries = 0
+    while true {
+      do {
+        try Task.checkCancellation()
+        return try await attempt()
+      } catch {
+        // Preserve the normal renewal budget and add one final retry. Keeping both attempts inside
+        // the renewal operation means `.failed` is published only after the lease retry budget is
+        // exhausted, while the addendum's one extra recovery attempt still runs for maxRetries=0.
+        guard isRetryable(error), retries < retryPolicy.maxRetries + 1 else {
+          if isRetryable(error) {
+            throw ShapeSubscriptionFailure.retryExhausted(
+              operation: "renew", attempts: retries + 1, cause: retryCause(for: error))
+          }
+          throw error
+        }
+        retries += 1
+        let delay = retryPolicy.delay(forRetry: retries, retryAfter: retryAfter(for: error))
+        transition(.waitingToRetry(operation: "renew", attempt: retries, delay: delay))
+        try await clock.sleep(for: delay)
+      }
     }
   }
 

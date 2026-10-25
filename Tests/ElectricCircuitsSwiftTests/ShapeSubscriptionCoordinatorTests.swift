@@ -649,6 +649,26 @@ struct ShapeSubscriptionCoordinatorTests {
     try await coordinator.stop()
   }
 
+  @Test func renewalReportsExhaustionAfterTheExtraAttempt() async throws {
+    let transport = RenewalTransport(renewFailures: 2)
+    let clock = RecordingClock()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "stable-claim"),
+      materializer: InMemoryShapeMaterializer(),
+      retryPolicy: .init(maxRetries: 0, baseDelay: .seconds(1), jitterRatio: 0), clock: clock)
+    _ = try await coordinator.start()
+    await #expect(throws: ShapeSubscriptionFailure.self) {
+      _ = try await coordinator.renew()
+    }
+    #expect(
+      await coordinator.state
+        == .failed(.retryExhausted(operation: "renew", attempts: 2, cause: .http(status: 503))))
+    try await coordinator.stop()
+  }
+
   @Test func releaseRetriesResponseLossAndTreats404AsSuccess() async throws {
     let transport = ReleaseRetryTransport()
     let clock = RecordingClock()
