@@ -650,7 +650,7 @@ struct ShapeSubscriptionCoordinatorTests {
   }
 
   @Test func renewalReportsExhaustionAfterTheExtraAttempt() async throws {
-    let transport = RenewalTransport(renewFailures: 2)
+    let transport = RenewalTransport(renewFailures: 4)
     let clock = RecordingClock()
     let coordinator = ShapeSubscriptionCoordinator(
       client: ElectricCircuitsClient(
@@ -658,14 +658,15 @@ struct ShapeSubscriptionCoordinatorTests {
       transport: transport,
       request: ShapeRequest(table: "public.items", subscription: "stable-claim"),
       materializer: InMemoryShapeMaterializer(),
-      retryPolicy: .init(maxRetries: 0, baseDelay: .seconds(1), jitterRatio: 0), clock: clock)
+      retryPolicy: .init(maxRetries: 2, baseDelay: .seconds(1), jitterRatio: 0), clock: clock)
     _ = try await coordinator.start()
     await #expect(throws: ShapeSubscriptionFailure.self) {
       _ = try await coordinator.renew()
     }
     #expect(
       await coordinator.state
-        == .failed(.retryExhausted(operation: "renew", attempts: 2, cause: .http(status: 503))))
+        == .failed(.retryExhausted(operation: "renew", attempts: 4, cause: .http(status: 503))))
+    #expect(await transport.requests.filter { $0.httpMethod == "POST" }.count == 5)
     try await coordinator.stop()
   }
 
@@ -679,12 +680,25 @@ struct ShapeSubscriptionCoordinatorTests {
       request: ShapeRequest(table: "public.items", subscription: "stable-claim"),
       materializer: InMemoryShapeMaterializer(),
       retryPolicy: .init(maxRetries: 2, baseDelay: .seconds(1), jitterRatio: 0), clock: clock)
+    let updates = await coordinator.stateUpdates
+    let stateTask = Task {
+      var states: [ShapeSubscriptionState] = []
+      for await state in updates { states.append(state) }
+      return states
+    }
     _ = try await coordinator.start()
     _ = try await coordinator.renew()
     #expect(await transport.requests.filter { $0.httpMethod == "POST" }.count == 5)
     #expect(await clock.delays == [.seconds(1), .seconds(2), .seconds(4)])
     #expect(await coordinator.state == .streaming(.beginning))
     try await coordinator.stop()
+    let states = await stateTask.value
+    #expect(
+      states.contains {
+        if case .waitingToRetry(operation: "renew", attempt: 1, delay: _) = $0 { return true }
+        return false
+      })
+    #expect(!states.contains { if case .failed = $0 { return true }; return false })
   }
 
   @Test func releaseRetriesResponseLossAndTreats404AsSuccess() async throws {
