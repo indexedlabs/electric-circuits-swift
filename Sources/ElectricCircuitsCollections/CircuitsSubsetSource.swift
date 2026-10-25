@@ -404,38 +404,35 @@ private final class KeyedWindowFeedHub: ShapeMaterializer, @unchecked Sendable {
   private var cursor: StreamCursor?
 
   func add(_ id: UUID, callback: @escaping Callback) {
-    lock.lock()
-    defer { lock.unlock() }
-    subscribers[id] = callback
-    subscriberOrder.append(id)
+    lock.withLock {
+      subscribers[id] = callback
+      subscriberOrder.append(id)
+    }
   }
 
   func remove(_ id: UUID) {
-    lock.lock()
-    defer { lock.unlock() }
-    subscribers.removeValue(forKey: id)
-    subscriberOrder.removeAll { $0 == id }
+    lock.withLock {
+      subscribers.removeValue(forKey: id)
+      subscriberOrder.removeAll { $0 == id }
+    }
   }
 
   func prime(_ value: StreamCursor) {
-    lock.lock()
-    defer { lock.unlock() }
-    if cursor == nil { cursor = value }
+    lock.withLock {
+      if cursor == nil { cursor = value }
+    }
   }
 
   func currentCursor() async throws -> StreamCursor? {
-    lock.lock()
-    defer { lock.unlock() }
-    return cursor
+    lock.withLock { cursor }
   }
 
   func apply(
     _ batch: ChangeBatch, expecting expectedCursor: StreamCursor?, advancingTo next: StreamCursor
   ) async throws {
-    lock.lock()
-    let current = cursor
-    let callbacks = subscriberOrder.compactMap { subscribers[$0] }
-    lock.unlock()
+    let (current, callbacks) = lock.withLock {
+      (cursor, subscriberOrder.compactMap { subscribers[$0] })
+    }
     if current == next { return }
     guard current == expectedCursor else {
       throw StreamError.cursorConflict(expected: expectedCursor, actual: current, advancingTo: next)
@@ -445,9 +442,7 @@ private final class KeyedWindowFeedHub: ShapeMaterializer, @unchecked Sendable {
     for callback in callbacks {
       try await callback(batch)
     }
-    lock.lock()
-    defer { lock.unlock() }
-    cursor = next
+    lock.withLock { cursor = next }
   }
 }
 
