@@ -648,8 +648,14 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
         let result = try await fetchPageAndCommit(chunk)
         changes.append(contentsOf: result)
       }
-      try await emit(changes)
-      return changes
+      // Page decoding and membership reconciliation can finish while a tail task is waiting on
+      // the actor. Hold the same FIFO permit across the callback, dropping any page mutation that
+      // a tail has superseded before this page reaches the store.
+      await acquireApplicationPermit()
+      defer { releaseApplicationPermit() }
+      let current = try currentChanges(changes)
+      try await emit(current)
+      return current
     } catch {
       if error is CancellationError || Task.isCancelled {
         for token in addedTokens { claims.removeValue(forKey: token) }
@@ -902,6 +908,20 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
   private func emit(_ changes: [CollectionChange<Model, PrimaryKey>]) async throws {
     guard !changes.isEmpty, let onChanges else { return }
     try await onChanges(changes)
+  }
+
+  private func currentChanges(
+    _ changes: [CollectionChange<Model, PrimaryKey>]
+  ) throws -> [CollectionChange<Model, PrimaryKey>] {
+    try changes.filter { change in
+      switch change {
+      case .upsert(let model, let version):
+        let primary = try primaryKeyForRow(model)
+        return primaryVersions[primary].map { $0.order <= version.order } ?? true
+      case .delete(let primary, let version):
+        return primaryVersions[primary].map { $0.order <= version.order } ?? true
+      }
+    }
   }
 
   private func acquireApplicationPermit() async {
