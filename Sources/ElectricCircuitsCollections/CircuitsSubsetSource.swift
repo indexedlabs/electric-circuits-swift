@@ -664,6 +664,12 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
     }
   }
 
+  public func addKeys(_ keys: [String]) async throws
+    -> [CollectionChange<Model, PrimaryKey>]
+  {
+    try await addKeys(keys.map { .string($0) })
+  }
+
   /// Releases claims without replacing the rows in the canonical store. A later restart will page
   /// only the keys still claimed by the host.
   @discardableResult
@@ -684,6 +690,13 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
     }
     try await emit(changes)
     return changes
+  }
+
+  @discardableResult
+  public func releaseKeys(_ keys: [String]) async throws
+    -> [CollectionChange<Model, PrimaryKey>]
+  {
+    try await releaseKeys(keys.map { .string($0) })
   }
 
   /// Applies a durable-stream batch. Changes for primary keys outside the claimed secondary-key
