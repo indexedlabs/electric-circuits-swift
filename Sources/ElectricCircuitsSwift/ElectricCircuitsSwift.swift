@@ -618,7 +618,10 @@ public actor InMemoryElectricCircuitsStore: ElectricCircuitsStore {
 public actor ElectricCircuitsClient {
   public struct Configuration: Equatable, Sendable {
     public enum SubsetSetup: Equatable, Sendable {
+      /// Use the gateway's one-request route. The client's base URL must already be the gateway's
+      /// `/sync/` base; this mode does not probe or fall back when the route is unavailable.
       case oneRequest
+      /// Use the existing feed, stream HEAD, and snapshot query routes.
       case threeRequests
     }
 

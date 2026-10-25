@@ -1283,8 +1283,7 @@ struct SubsetLoadSetupTests {
     #expect(await transport.calls == ["POST /v1/subset-loads"])
   }
 
-  /// The combined contract validates the feed and page body before creating a claim, so a 4xx
-  /// does not enter the feed recovery path.
+  /// A 4xx load has no client-side recovery or DELETE; any gateway-side claim remains lease-bound.
   @Test func invalidCombinedLoadLeavesNoFeedClaim() async throws {
     let transport = LoadingSubsetTransport(loadStatus: 400)
     await #expect(throws: (any Error).self) {
@@ -1367,6 +1366,22 @@ struct SubsetLoadSetupTests {
     #expect(body.limit == 1)
     #expect(body.orderBy == SubsetOrderBy(column: "modified_at", descending: true))
     #expect(body.where == .and([.isNull(column: "modified_at", isNull: false)]))
+    try await session.stop()
+  }
+
+  @Test func anOrderedUnboundedDemandUsesTheThreeRequestSetup() async throws {
+    let transport = LoadingSubsetTransport()
+    let demand = CollectionDemand<NativeIssue>(
+      unsafePredicateIdentity: "ordered",
+      order: [
+        CollectionOrder(
+          unsafeFieldID: "modified", sourceName: "modified_at", direction: .descending)
+      ])
+    let session = try await materialize(
+      source(transport, subsetSetup: .oneRequest), demand: demand)
+    #expect(Array((await transport.calls).prefix(3)) == [
+      "POST /v1/subset-feeds", "HEAD /streams/shape-1", "POST /v1/subsets/query"
+    ])
     try await session.stop()
   }
 }

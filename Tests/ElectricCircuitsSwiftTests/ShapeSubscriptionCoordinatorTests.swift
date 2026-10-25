@@ -108,11 +108,22 @@ private actor CancellationTransport: HTTPTransport {
 
 private actor RenewalTransport: HTTPTransport {
   private(set) var requests: [URLRequest] = []
+  private var posts = 0
+  private var renewFailures: Int
+
+  init(renewFailures: Int = 0) { self.renewFailures = renewFailures }
+
   func send(_ request: URLRequest) async throws -> HTTPResponse {
     requests.append(request)
     try Task.checkCancellation()
     switch request.httpMethod {
-    case "POST": return shapeResponse()
+    case "POST":
+      posts += 1
+      if posts > 1, renewFailures > 0 {
+        renewFailures -= 1
+        return response("renew failed", status: 503)
+      }
+      return shapeResponse()
     case "GET":
       // Hold the long poll open without busy-waiting: a spin occupies a cooperative-pool thread
       // for the whole test run, and enough of them starve the yield-based progress waits and the
@@ -617,6 +628,24 @@ struct ShapeSubscriptionCoordinatorTests {
       await Task.yield()
     }
     #expect(await clock.delays == [.seconds(2)])
+    try await coordinator.stop()
+  }
+
+  @Test func renewalRetriesOnceBeforePublishingFailure() async throws {
+    let transport = RenewalTransport(renewFailures: 1)
+    let clock = RecordingClock()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "stable-claim"),
+      materializer: InMemoryShapeMaterializer(),
+      retryPolicy: .init(maxRetries: 0, baseDelay: .seconds(1), jitterRatio: 0), clock: clock)
+    _ = try await coordinator.start()
+    _ = try await coordinator.renew()
+    #expect(await transport.requests.filter { $0.httpMethod == "POST" }.count == 3)
+    #expect(await clock.delays == [.seconds(1)])
+    #expect(await coordinator.state == .streaming(.beginning))
     try await coordinator.stop()
   }
 

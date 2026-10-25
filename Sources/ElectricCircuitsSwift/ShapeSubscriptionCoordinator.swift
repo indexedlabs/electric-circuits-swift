@@ -848,31 +848,31 @@ public actor ShapeSubscriptionCoordinator {
   /// reconciliation the durable-stream gone receipt uses, so the application reseeds one explicit
   /// fresh scope instead of inheriting two live server claims.
   private func renewWithRetry() async throws -> ShapeHandle {
-    var retries = 0
-    while true {
-      do {
-        return try await recreatePolicy.recreatingOnGone(
-          clock: clock,
-          willRecreate: { attempt in await self.noteRecreateAttempt(attempt) }
-        ) {
-          switch self.kind {
-          case .shape:
-            try await self.client.renewShape(self.request)
-          case .subsetFeed:
-            try await self.client.createSubsetFeed(self.request)
-          }
+    func attempt() async throws -> ShapeHandle {
+      try await recreatePolicy.recreatingOnGone(
+        clock: clock,
+        willRecreate: { attempt in await self.noteRecreateAttempt(attempt) }
+      ) {
+        switch self.kind {
+        case .shape:
+          try await self.client.renewShape(self.request)
+        case .subsetFeed:
+          try await self.client.createSubsetFeed(self.request)
         }
-      } catch {
-        // Renewal gets one attempt beyond the normal retry budget. Keeping this retry inside the
-        // renewal operation means `.failed` is published only after both attempts are exhausted.
-        guard isRetryable(error), retries < retryPolicy.maxRetries + 1 else {
-          throw exhaustedOrFailure(error, retries: retries, operation: "renew")
-        }
-        retries += 1
-        let delay = retryPolicy.delay(forRetry: retries, retryAfter: retryAfter(for: error))
-        transition(.waitingToRetry(operation: "renew", attempt: retries, delay: delay))
-        try await clock.sleep(for: delay)
       }
+    }
+    do {
+      return try await attempt()
+    } catch {
+      // Keep `.failed` terminal while allowing exactly one transient renewal retry. This retry is
+      // intentionally independent of the create/stream retry budget.
+      guard isRetryable(error) else { throw error }
+      try Task.checkCancellation()
+      let delay = retryPolicy.delay(forRetry: 1, retryAfter: retryAfter(for: error))
+      transition(.waitingToRetry(operation: "renew", attempt: 1, delay: delay))
+      try await clock.sleep(for: delay)
+      try Task.checkCancellation()
+      return try await attempt()
     }
   }
 
