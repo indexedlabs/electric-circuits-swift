@@ -431,6 +431,7 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
   }
 
   private struct PageDraft: Sendable {
+    let id: UUID
     let tokens: Set<String>
     let result: PageResult
     let completion: KeyedPageCompletion<[CollectionChange<Model, PrimaryKey>]>
@@ -582,7 +583,10 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
   public func restart(subscription: String = UUID().uuidString)
     async throws -> [CollectionChange<Model, PrimaryKey>]
   {
+    await acquireApplicationPermit()
     let retained = claims
+    let oldPrimaryKeys = Set(primaryToSecondary.keys)
+    releaseApplicationPermit()
     try await stop()
     try await start(subscription: subscription)
     guard !retained.isEmpty else { return [] }
@@ -601,7 +605,7 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
         changes.append(.upsert(row.model, sourceVersion: result.version))
       }
     }
-    let released = Set(primaryToSecondary.keys).subtracting(next.primaryToSecondary.keys)
+    let released = oldPrimaryKeys.subtracting(next.primaryToSecondary.keys)
     try await emit(changes, membershipReleases: Array(released))
     commit(next)
     return changes
@@ -621,6 +625,9 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
     var ownedTokens = Set<String>()
     var joiners: [KeyedPageCompletion<[CollectionChange<Model, PrimaryKey>]>] = []
     var pages: [PageDraft] = []
+    var permitHeld = false
+    await acquireApplicationPermit()
+    permitHeld = true
     do {
       for key in unique {
         let token = try canonicalToken(key)
@@ -635,12 +642,15 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
           ownedTokens.insert(token)
         }
       }
+      releaseApplicationPermit()
+      permitHeld = false
       let pending = ownedTokens.map { claims[$0]!.value }
       for chunk in chunks(pending) {
         pages.append(try await fetchPageDraft(chunk))
       }
       await acquireApplicationPermit()
-      defer { releaseApplicationPermit() }
+      permitHeld = true
+      defer { if permitHeld { releaseApplicationPermit() } }
       var next = snapshot()
       var changes: [CollectionChange<Model, PrimaryKey>] = []
       var releases: [PrimaryKey] = []
@@ -649,7 +659,6 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
           guard next.versions[row.primary].map({ page.result.version.supersedes($0) }) ?? true else { continue }
           if let old = next.primaryToSecondary[row.primary], old != row.token {
             removePrimary(row.primary, from: &next)
-            releases.append(row.primary)
           }
           nextInstall(row, version: page.result.version, into: &next)
           changes.append(.upsert(row.model, sourceVersion: page.result.version))
@@ -657,17 +666,28 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
       }
       try await emit(changes, membershipReleases: releases)
       commit(next)
-      for page in pages { page.completion.finish(.success(changes)) }
-      for joiner in joiners { _ = try await joiner.value() }
+      for page in pages {
+        retirePage(page)
+        page.completion.finish(.success(changes))
+      }
+      releaseApplicationPermit()
+      permitHeld = false
+      for joiner in joiners { changes.append(contentsOf: try await joiner.value()) }
       return changes
     } catch {
+      if permitHeld { releaseApplicationPermit(); permitHeld = false }
+      await acquireApplicationPermit()
       for token in ownedTokens {
         if var claim = claims[token] {
           claim.holders.remove(holder)
           if claim.holders.isEmpty { claims.removeValue(forKey: token) } else { claims[token] = claim }
         }
       }
-      for page in pages { page.completion.finish(.failure(error)) }
+      releaseApplicationPermit()
+      for page in pages {
+        retirePage(page)
+        page.completion.finish(.failure(error))
+      }
       throw error
     }
   }
@@ -685,6 +705,7 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
   public func releaseKeys(_ keys: [JSONValue], holder: String) async throws
     -> [CollectionChange<Model, PrimaryKey>]
   {
+    await acquireApplicationPermit()
     var next = snapshot()
     var releases: [PrimaryKey] = []
     for key in uniqueValues(keys) {
@@ -701,10 +722,9 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
         next.claims[token] = claim
       }
     }
-    await acquireApplicationPermit()
-    defer { releaseApplicationPermit() }
     try await emit([], membershipReleases: releases)
     commit(next)
+    releaseApplicationPermit()
     return []
   }
 
@@ -763,7 +783,6 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
       }
       if heldSecondary != nil, heldSecondary != token {
         removePrimary(primary, from: &next)
-        releases.append(primary)
       }
       nextInstall(
         (raw: merged, model: model, primary: primary, secondary: secondary, token: token),
@@ -803,19 +822,16 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
     let task = Task { try await client.querySubset(query) }
     inFlight[id] = InFlightPage(id: id, tokens: tokens, completion: completion, task: task)
     for token in tokens { pageForToken[token] = id }
-    defer {
-      inFlight.removeValue(forKey: id)
-      for token in tokens where pageForToken[token] == id { pageForToken.removeValue(forKey: token) }
-    }
     do {
       let response = try await withTaskCancellationHandler(
         operation: { try await task.value },
         onCancel: { task.cancel() })
       try Task.checkCancellation()
       let result = try decodePage(response)
-      return PageDraft(tokens: tokens, result: result, completion: completion)
+      return PageDraft(id: id, tokens: tokens, result: result, completion: completion)
     } catch {
       task.cancel()
+      retirePage(id: id, tokens: tokens)
       completion.finish(.failure(error))
       throw error
     }
@@ -935,6 +951,17 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
   private func gcUnheldVersions(_ next: inout Snapshot) {
     guard inFlight.isEmpty else { return }
     next.versions = next.versions.filter { next.primaryToSecondary[$0.key] != nil }
+  }
+
+  private func retirePage(_ page: PageDraft) {
+    retirePage(id: page.id, tokens: page.tokens)
+  }
+
+  private func retirePage(id: UUID, tokens: Set<String>) {
+    inFlight.removeValue(forKey: id)
+    for token in tokens where pageForToken[token] == id {
+      pageForToken.removeValue(forKey: token)
+    }
   }
 
   private func emit(

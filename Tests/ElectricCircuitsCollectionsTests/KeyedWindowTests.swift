@@ -28,6 +28,22 @@ private struct KeyedRow: Equatable, Sendable {
   struct DecodeError: Error {}
 }
 
+private struct TestTimeout: Error, Sendable {}
+
+private func withTestTimeout<Value: Sendable>(
+  _ operation: @escaping @Sendable () async throws -> Value
+) async throws -> Value {
+  try await withThrowingTaskGroup(of: Value.self) { group in
+    group.addTask { try await operation() }
+    group.addTask {
+      try await Task.sleep(for: .seconds(2))
+      throw TestTimeout()
+    }
+    defer { group.cancelAll() }
+    return try await group.next()!
+  }
+}
+
 private actor KeyedScriptedTransport: HTTPTransport {
   private(set) var requests: [URLRequest] = []
   private var queryBodies: [String]
@@ -106,12 +122,40 @@ private actor KeyedScriptedTransport: HTTPTransport {
   }
 }
 
+private actor RecordedKeyedChanges {
+  private(set) var batches: [[CollectionChange<KeyedRow, String>]] = []
+  private(set) var membershipReleases: [[String]] = []
+  private var failNext = false
+
+  func failNextCallback() { failNext = true }
+
+  func record(_ changes: [CollectionChange<KeyedRow, String>]) throws {
+    if failNext {
+      failNext = false
+      throw CallbackFailure()
+    }
+    batches.append(changes)
+  }
+
+  func release(_ keys: [String]) { membershipReleases.append(keys) }
+
+  func allChanges() -> [CollectionChange<KeyedRow, String>] { batches.flatMap { $0 } }
+
+  struct CallbackFailure: Error, Sendable {}
+}
+
 private func row(_ id: String, _ clientID: String, _ recordID: String, _ title: String) -> String {
   #"{"id":"\#(id)","client_id":"\#(clientID)","record_id":"\#(recordID)","title":"\#(title)"}"#
 }
 
 private func page(_ rows: [String], lsn: String = "0/10") -> String {
   #"{"rows":[\#(rows.joined(separator: ","))],"lsn":"\#(lsn)"}"#
+}
+
+private func fencedPage(
+  _ rows: [String], lsn: String = "0/10", snapshot: String = "10:20:30", horizon: String = "0/20"
+) -> String {
+  #"{"rows":[\#(rows.joined(separator: ","))],"lsn":"\#(lsn)","snapshot":"\#(snapshot)","horizon":"\#(horizon)"}"#
 }
 
 private func tail(
@@ -132,7 +176,8 @@ private func tail(
 private func makeWindow(
   _ transport: KeyedScriptedTransport,
   keyColumn: String = "client_id",
-  onChanges: (@Sendable ([CollectionChange<KeyedRow, String>]) async throws -> Void)? = nil
+  onChanges: (@Sendable ([CollectionChange<KeyedRow, String>]) async throws -> Void)? = nil,
+  onMembershipRelease: (@Sendable ([String]) async throws -> Void)? = nil
 ) -> KeyedWindow<KeyedRow, String> {
   KeyedWindow(
     client: ElectricCircuitsClient(
@@ -146,14 +191,16 @@ private func makeWindow(
     secondaryKeyForRow: { row in
       keyColumn == "client_id" ? .string(row.clientID) : .string(row.recordID)
     },
-    onChanges: onChanges
+    onChanges: onChanges,
+    onMembershipRelease: onMembershipRelease
   )
 }
 
 @Suite("Keyed window")
 struct KeyedWindowTests {
   @Test func S1TailWinsOverPageSnapshotWhilePageIsInFlight() async throws {
-    let transport = KeyedScriptedTransport(queryBodies: [page([row("1", "c1", "r1", "old")])])
+    let transport = KeyedScriptedTransport(
+      queryBodies: [fencedPage([row("1", "c1", "r1", "old")])])
     await transport.setBlockQueries(true)
     let window = makeWindow(transport)
     try await window.start(subscription: "s1")
@@ -248,7 +295,8 @@ struct KeyedWindowTests {
     let second = Task { try await window.addKeys([.string("c1")]) }
     await transport.releaseQueries()
     _ = try await first.value
-    _ = try await second.value
+    let joined = try await withTestTimeout { try await second.value }
+    #expect(joined.contains { if case .upsert(let row, _) = $0 { return row.id == "1" }; return false })
     #expect(await transport.queryCount() == 1)
     _ = try await window.addKeys([.string("c1")])
     #expect(await transport.queryCount() == 1)
@@ -256,7 +304,8 @@ struct KeyedWindowTests {
   }
 
   @Test func S6OlderPageCannotOverwriteAnAcceptedTailVersion() async throws {
-    let transport = KeyedScriptedTransport(queryBodies: [page([row("1", "c1", "r1", "old")])])
+    let transport = KeyedScriptedTransport(
+      queryBodies: [fencedPage([row("1", "c1", "r1", "old")])])
     await transport.setBlockQueries(true)
     let window = makeWindow(transport)
     try await window.start(subscription: "s6")
@@ -271,17 +320,21 @@ struct KeyedWindowTests {
   }
 
   @Test func S7RestartRepagesHeldKeysAndReleasesOmittedRows() async throws {
+    let recorded = RecordedKeyedChanges()
     let transport = KeyedScriptedTransport(
       queryBodies: [page([row("1", "c1", "r1", "held")]), page([], lsn: "0/30")],
       streamStatus: 410)
-    let window = makeWindow(transport)
+    let window = makeWindow(
+      transport,
+      onMembershipRelease: { keys in await recorded.release(keys) })
     try await window.start(subscription: "s7")
     _ = try await window.addKeys([.string("c1")])
-    await #expect(throws: StreamError.self) { try await window.run() }
+    try await window.end()
     #expect(await window.debugState().state == .ended)
     let changes = try await window.restart(subscription: "s7-restart")
-    #expect(changes.contains { if case .delete(let key, _) = $0 { return key == "1" }; return false })
-    #expect(await window.debugState().claimedKeyCount == 0)
+    #expect(changes.isEmpty)
+    #expect(await window.debugState().claimedKeyCount == 1)
+    #expect(await recorded.membershipReleases == [["1"]])
     #expect(await transport.feedCount() == 2)
     try await window.stop()
   }
@@ -332,6 +385,121 @@ struct KeyedWindowTests {
     let queries = try requests.map { try JSONDecoder().decode(SubsetQuery.self, from: #require($0.httpBody)) }
     #expect(queries.count == 2)
     #expect(queries.allSatisfy { if case .or(let leaves) = $0.where { return leaves.count <= 100 }; return false })
+    try await window.stop()
+  }
+
+  @Test func twoHoldersReleaseOnlyAfterTheLastHolderLeaves() async throws {
+    let recorded = RecordedKeyedChanges()
+    let transport = KeyedScriptedTransport(
+      queryBodies: [page([row("1", "c1", "r1", "held")])])
+    let window = makeWindow(
+      transport,
+      onMembershipRelease: { keys in await recorded.release(keys) })
+    try await window.start(subscription: "holders")
+    _ = try await window.addKeys([.string("c1")], holder: "screen-a")
+    _ = try await window.addKeys([.string("c1")], holder: "screen-b")
+    _ = try await window.releaseKeys([.string("c1")], holder: "screen-a")
+    #expect(await window.debugState().heldPrimaryKeyCount == 1)
+    #expect(await recorded.membershipReleases.isEmpty)
+    _ = try await window.releaseKeys([.string("c1")], holder: "screen-b")
+    #expect(await window.debugState().heldPrimaryKeyCount == 0)
+    #expect(await recorded.membershipReleases == [["1"]])
+    try await window.stop()
+  }
+
+  @Test func updateMovingOutDuringPageIsRejectedByTheTailVersion() async throws {
+    let transport = KeyedScriptedTransport(
+      queryBodies: [fencedPage([row("1", "c1", "r1", "old")])])
+    await transport.setBlockQueries(true)
+    let window = makeWindow(transport)
+    try await window.start(subscription: "move-out-page")
+    let adding = Task { try await window.addKeys([.string("c1")]) }
+    await transport.waitForQuery()
+    let tailChanges = try await window.applyTail(
+      tail(operation: .update, key: "1", value: row("1", "c2", "r1", "moved-out"), lsn: "0/20"))
+    await transport.releaseQueries()
+    let pageChanges = try await adding.value
+    #expect(tailChanges.isEmpty)
+    #expect(pageChanges.isEmpty)
+    #expect(await window.debugState().heldPrimaryKeyCount == 0)
+    try await window.stop()
+  }
+
+  @Test func pageCommitsBeforeTailAndCallbackObservesFifoOrder() async throws {
+    let recorded = RecordedKeyedChanges()
+    let transport = KeyedScriptedTransport(
+      queryBodies: [page([row("1", "c1", "r1", "page")])])
+    let window = makeWindow(
+      transport,
+      onChanges: { changes in try await recorded.record(changes) })
+    try await window.start(subscription: "fifo")
+    _ = try await window.addKeys([.string("c1")])
+    _ = try await window.applyTail(
+      tail(operation: .update, key: "1", value: row("1", "c1", "r1", "tail"), lsn: "0/20"))
+    let changes = await recorded.allChanges()
+    #expect(changes.count == 2)
+    guard case .upsert(let first, _) = changes[0], case .upsert(let second, _) = changes[1] else {
+      Issue.record("expected page then tail upserts")
+      return
+    }
+    #expect(first.title == "page")
+    #expect(second.title == "tail")
+    try await window.stop()
+  }
+
+  @Test func partialUpdateMergesWithTheHeldRawRow() async throws {
+    let transport = KeyedScriptedTransport(
+      queryBodies: [page([row("1", "c1", "r1", "old")])])
+    let window = makeWindow(transport)
+    try await window.start(subscription: "partial")
+    _ = try await window.addKeys([.string("c1")])
+    let changes = try await window.applyTail(
+      tail(
+        operation: .update, key: "1", value: #"{"title":"partial"}"#, lsn: "0/20"))
+    guard case .upsert(let updated, _) = try #require(changes.first) else {
+      Issue.record("expected merged partial update")
+      return
+    }
+    #expect(updated == KeyedRow(id: "1", clientID: "c1", recordID: "r1", title: "partial"))
+    try await window.stop()
+  }
+
+  @Test func throwingCallbackLeavesStateReplayable() async throws {
+    let recorded = RecordedKeyedChanges()
+    let transport = KeyedScriptedTransport(
+      queryBodies: [
+        page([row("1", "c1", "r1", "initial")]),
+        page([row("1", "c1", "r1", "initial")]),
+      ])
+    let window = makeWindow(
+      transport,
+      onChanges: { changes in try await recorded.record(changes) })
+    try await window.start(subscription: "throwing")
+    _ = try await window.addKeys([.string("c1")])
+    await recorded.failNextCallback()
+    await #expect(throws: RecordedKeyedChanges.CallbackFailure.self) {
+      try await window.applyTail(
+        tail(operation: .update, key: "1", value: row("1", "c1", "r1", "replay"), lsn: "0/20"))
+    }
+    let replay = try await window.applyTail(
+      tail(operation: .update, key: "1", value: row("1", "c1", "r1", "replay"), lsn: "0/20"))
+    #expect(replay.count == 1)
+    try await window.stop()
+  }
+
+  @Test func compositePrimaryKeyUsesEngineEscaping() async throws {
+    let composite = KeyedWindow<KeyedRow, String>.compositePrimaryKey(["a\u{1f}b", "field"])
+    let transport = KeyedScriptedTransport(
+      queryBodies: [page([row(composite, "client-1", "record-1", "composite")])])
+    let window = makeWindow(transport)
+    try await window.start(subscription: "composite-real")
+    _ = try await window.addKeys([.string("client-1")])
+    let changes = try await window.applyTail(tail(operation: .delete, key: composite, lsn: "0/20"))
+    guard case .delete(let key, _) = try #require(changes.first) else {
+      Issue.record("expected composite key delete")
+      return
+    }
+    #expect(key == composite)
     try await window.stop()
   }
 }
