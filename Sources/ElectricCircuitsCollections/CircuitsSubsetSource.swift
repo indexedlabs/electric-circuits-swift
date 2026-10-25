@@ -794,9 +794,7 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
       }
       let result = try decodePage(response)
       var changes: [CollectionChange<Model, PrimaryKey>] = []
-      var returnedTokens = Set<String>()
       for row in result.rows where tokens.contains(row.token) {
-        returnedTokens.insert(row.token)
         // A tail may have passed this primary key while the page was in flight. Its version map
         // also stores delete tombstones, so a stale page row is ignored instead of resurrecting it.
         if let tailVersion = primaryVersions[row.primary], !result.version.supersedes(tailVersion) {
@@ -806,11 +804,9 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
         install(row, version: result.version)
         changes.append(.upsert(row.model, sourceVersion: result.version))
       }
-      // A missing row is not a durable claim. This is especially important for a first page:
-      // otherwise an id that was absent at mount would unexpectedly be re-paged forever.
-      for token in tokens where !returnedTokens.contains(token) {
-        claims.removeValue(forKey: token)
-      }
+      // Claims accumulate even when a key has no row yet. An update can move a row into this
+      // secondary-key set after the page returns; only an explicit release or a restart page that
+      // omits a still-mounted key retires that claim.
       return changes
     } catch is CancellationError {
       for token in tokens { claims.removeValue(forKey: token) }
