@@ -66,9 +66,6 @@ private actor NativeSubsetTransport: HTTPTransport {
     requests.append(request)
     let path = request.url?.path ?? ""
     switch (request.httpMethod, path) {
-    case ("POST", "/v1/subset-loads"):
-      // A server that predates the one-round-trip route.
-      return response("not found", request: request, status: 404)
     case ("POST", "/v1/subset-feeds"):
       return response(
         #"{"shapeId":"shape-1","table":"public.issues","streamPath":"/streams/shape-1","streamUrl":"https://streams.test/streams/shape-1"}"#,
@@ -156,8 +153,6 @@ private actor GoneSubsetFeedTransport: HTTPTransport {
     requests.append(request)
     let path = request.url?.path ?? ""
     switch (request.httpMethod, path) {
-    case ("POST", "/v1/subset-loads"):
-      return goneResponse("not found", request: request, status: 404)
     case ("POST", "/v1/subset-feeds"):
       creates += 1
       if creates <= goneCreates { return goneResponse("gone", request: request, status: 410) }
@@ -1005,7 +1000,7 @@ struct CircuitsSubsetSourceTests {
       _ = try await source.materialize(
         demand, identity: identity, materializationID: materializationID)
     }
-    let firstRequests = await transport.requests.filter { $0.url?.path != "/v1/subset-loads" }
+    let firstRequests = await transport.requests
     #expect(firstRequests.compactMap(\.httpMethod) == ["POST", "HEAD", "DELETE"])
 
     let session = try await source.materialize(
@@ -1062,6 +1057,7 @@ private actor LoadingSubsetTransport: HTTPTransport {
   private(set) var requests: [URLRequest] = []
   private var goneLoads: Int
   private var malformedLoads: Int
+  private var invalidPageLoads: Int
   private let loadStatus: Int?
   private let loadDelay: Duration
   private let leaseSeconds: Int?
@@ -1077,6 +1073,7 @@ private actor LoadingSubsetTransport: HTTPTransport {
   init(
     goneLoads: Int = 0,
     malformedLoads: Int = 0,
+    invalidPageLoads: Int = 0,
     loadStatus: Int? = nil,
     loadDelay: Duration = .zero,
     leaseSeconds: Int? = nil,
@@ -1087,6 +1084,7 @@ private actor LoadingSubsetTransport: HTTPTransport {
   ) {
     self.goneLoads = goneLoads
     self.malformedLoads = malformedLoads
+    self.invalidPageLoads = invalidPageLoads
     self.loadStatus = loadStatus
     self.loadDelay = loadDelay
     self.leaseSeconds = leaseSeconds
@@ -1100,7 +1098,7 @@ private actor LoadingSubsetTransport: HTTPTransport {
   func send(_ request: URLRequest) async throws -> HTTPResponse {
     requests.append(request)
     switch (request.httpMethod, request.url?.path ?? "") {
-    case ("POST", "/sync/v1/subset-loads"):
+    case ("POST", "/v1/subset-loads"):
       if loadDelay > .zero { try await Task.sleep(for: loadDelay) }
       if let loadStatus { return reply("invalid", request: request, status: loadStatus) }
       if goneLoads > 0 {
@@ -1111,6 +1109,10 @@ private actor LoadingSubsetTransport: HTTPTransport {
         // The claim exists on the server, but the page the client receives is unusable.
         malformedLoads -= 1
         return reply("{\(Self.shape),\"offset\":\"10\",\"rows\":\"bad\"}", request: request)
+      }
+      if invalidPageLoads > 0 {
+        invalidPageLoads -= 1
+        return reply("{\(Self.shape),\"offset\":\"10\",\"rows\":[1],\"lsn\":\"0/10\"}", request: request)
       }
       let lease = leaseSeconds.map { ",\"leaseSeconds\":\($0)" } ?? ""
       return reply("{\(Self.shape)\(lease),\"offset\":\"10\",\(Self.page)}", request: request)
@@ -1214,7 +1216,8 @@ struct SubsetLoadSetupTests {
     try await run.value
 
     let calls = await transport.calls
-    #expect(Array(calls.prefix(2)) == ["POST /sync/v1/subset-loads", "GET /streams/shape-1"])
+    #expect(Array(calls.prefix(2)) == ["POST /v1/subset-loads", "GET /streams/shape-1"])
+    #expect(requests.first?.url?.path == "/v1/subset-loads")
     #expect(!calls.contains("HEAD /streams/shape-1"))
     #expect(!calls.contains("POST /v1/subset-feeds"))
     #expect(!calls.contains("POST /v1/subsets/query"))
@@ -1257,7 +1260,7 @@ struct SubsetLoadSetupTests {
     #expect(Array(requests.prefix(3)).map { $0.httpMethod! + " " + $0.url!.path } == [
       "POST /v1/subset-feeds", "HEAD /streams/shape-1", "POST /v1/subsets/query"
     ])
-    #expect(!requests.contains { $0.url?.path == "/sync/v1/subset-loads" })
+    #expect(!requests.contains { $0.url?.path == "/v1/subset-loads" })
     try await session.stop()
   }
 
@@ -1269,7 +1272,15 @@ struct SubsetLoadSetupTests {
       _ = try await materialize(source)
     }
     let calls = await transport.calls
-    #expect(calls == ["POST /sync/v1/subset-loads"])
+    #expect(calls == ["POST /v1/subset-loads"])
+  }
+
+  @Test func aLoadedPageThatCannotDecodeStillDoesNotDeleteItsClaim() async throws {
+    let transport = LoadingSubsetTransport(invalidPageLoads: 1)
+    await #expect(throws: (any Error).self) {
+      _ = try await materialize(source(transport, subsetSetup: .oneRequest))
+    }
+    #expect(await transport.calls == ["POST /v1/subset-loads"])
   }
 
   /// The combined contract validates the feed and page body before creating a claim, so a 4xx
@@ -1279,7 +1290,7 @@ struct SubsetLoadSetupTests {
     await #expect(throws: (any Error).self) {
       _ = try await materialize(source(transport, subsetSetup: .oneRequest))
     }
-    #expect(await transport.calls == ["POST /sync/v1/subset-loads"])
+    #expect(await transport.calls == ["POST /v1/subset-loads"])
   }
 
   /// A `410` on the load is the engine's exhausted fall-through, answered as for a feed create:
@@ -1288,7 +1299,7 @@ struct SubsetLoadSetupTests {
     let transport = LoadingSubsetTransport(goneLoads: 1)
     let session = try await materialize(source(transport, subsetSetup: .oneRequest))
     #expect(session.snapshot.cursor == StreamCursor(offset: "10", lsn: "0/10"))
-    let loads = await transport.requests.filter { $0.url?.path == "/sync/v1/subset-loads" }
+    let loads = await transport.requests.filter { $0.url?.path == "/v1/subset-loads" }
     #expect(loads.count == 2)
     #expect(Set(loads.compactMap(\.httpBody)).count == 1)
     #expect(!(await transport.calls).contains("POST /v1/subset-feeds"))
@@ -1328,8 +1339,8 @@ struct SubsetLoadSetupTests {
     let before = await transport.requests.count
     let again = try await materialize(source)
     let after = Array(await transport.calls.dropFirst(before))
-    #expect(after.first == "POST /sync/v1/subset-loads")
-    #expect(after.filter { $0 == "POST /sync/v1/subset-loads" }.count == 1)
+    #expect(after.first == "POST /v1/subset-loads")
+    #expect(after.filter { $0 == "POST /v1/subset-loads" }.count == 1)
     #expect(!after.contains("HEAD /streams/shape-1"))
     #expect(!after.contains("POST /v1/subsets/query"))
     try await again.stop()

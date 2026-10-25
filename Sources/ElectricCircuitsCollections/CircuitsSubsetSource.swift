@@ -259,7 +259,9 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     feedRequest: ShapeRequest, pageQuery: SubsetQuery
   ) async throws -> LoadedSubset? {
     let configuration = await client.configuration
-    guard configuration.subsetSetup == .oneRequest, pageQuery.limit == nil else { return nil }
+    guard configuration.subsetSetup == .oneRequest,
+      pageQuery.limit == nil, pageQuery.orderBy == nil
+    else { return nil }
     guard let subscription = feedRequest.subscription else { return nil }
     let request = SubsetLoadRequest(
       table: table,
