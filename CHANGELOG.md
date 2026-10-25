@@ -11,7 +11,9 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   lease-bounded. Lease renewal applies to every coordinator, including `.shape`, and retains its
   configured retry budget plus one final recovery attempt; `maxRetries: 0` still permits that one
   renewal retry while create, stream and release remain unchanged. The additive public API includes
-  `AdoptedShapeHandle` and `ShapeSubscriptionCoordinator.init(adopting:)`.
+  `SubsetLoadRequest`, `SubsetLoad`, `ElectricCircuitsClient.loadSubset(_:)`,
+  `ElectricCircuitsClient.Configuration`/`SubsetSetup`, its `configuration` property and init
+  parameter, `AdoptedShapeHandle`, and `ShapeSubscriptionCoordinator.init(adopting:)`.
 
 ## 0.7.1
 
