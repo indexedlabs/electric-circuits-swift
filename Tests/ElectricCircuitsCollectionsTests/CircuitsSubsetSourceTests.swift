@@ -1216,12 +1216,12 @@ struct SubsetLoadSetupTests {
     try await run.value
 
     let calls = await transport.calls
+    let requests = await transport.requests
     #expect(Array(calls.prefix(2)) == ["POST /v1/subset-loads", "GET /streams/shape-1"])
     #expect(requests.first?.url?.path == "/v1/subset-loads")
     #expect(!calls.contains("HEAD /streams/shape-1"))
     #expect(!calls.contains("POST /v1/subset-feeds"))
     #expect(!calls.contains("POST /v1/subsets/query"))
-    let requests = await transport.requests
     let firstRead = try #require(requests.first { $0.httpMethod == "GET" })
     let items = URLComponents(url: firstRead.url!, resolvingAgainstBaseURL: false)?.queryItems
     #expect(items?.first { $0.name == "offset" }?.value == "10")
