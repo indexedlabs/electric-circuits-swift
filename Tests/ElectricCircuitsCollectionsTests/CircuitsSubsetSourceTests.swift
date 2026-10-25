@@ -1062,6 +1062,7 @@ private actor LoadingSubsetTransport: HTTPTransport {
   private(set) var requests: [URLRequest] = []
   private var goneLoads: Int
   private var malformedLoads: Int
+  private let loadStatus: Int?
   private let loadDelay: Duration
   private let leaseSeconds: Int?
   private var goneStreamReads: Int
@@ -1076,6 +1077,7 @@ private actor LoadingSubsetTransport: HTTPTransport {
   init(
     goneLoads: Int = 0,
     malformedLoads: Int = 0,
+    loadStatus: Int? = nil,
     loadDelay: Duration = .zero,
     leaseSeconds: Int? = nil,
     goneStreamReads: Int = 0,
@@ -1085,6 +1087,7 @@ private actor LoadingSubsetTransport: HTTPTransport {
   ) {
     self.goneLoads = goneLoads
     self.malformedLoads = malformedLoads
+    self.loadStatus = loadStatus
     self.loadDelay = loadDelay
     self.leaseSeconds = leaseSeconds
     self.goneStreamReads = goneStreamReads
@@ -1099,6 +1102,7 @@ private actor LoadingSubsetTransport: HTTPTransport {
     switch (request.httpMethod, request.url?.path ?? "") {
     case ("POST", "/v1/subset-loads"):
       if loadDelay > .zero { try await Task.sleep(for: loadDelay) }
+      if let loadStatus { return reply("invalid", request: request, status: loadStatus) }
       if goneLoads > 0 {
         goneLoads -= 1
         return reply("gone", request: request, status: 410)
@@ -1288,6 +1292,16 @@ struct SubsetLoadSetupTests {
     #expect(try JSONDecoder().decode(ShapeRequest.self, from: feed).subscription == "issues-open")
     let session = try await materialize(source)
     try await session.stop()
+  }
+
+  /// The combined contract validates the feed and page body before creating a claim, so a 4xx
+  /// does not enter the feed recovery path.
+  @Test func invalidCombinedLoadLeavesNoFeedClaim() async throws {
+    let transport = LoadingSubsetTransport(loadStatus: 400)
+    await #expect(throws: (any Error).self) {
+      _ = try await materialize(source(transport))
+    }
+    #expect(await transport.calls == ["POST /v1/subset-loads"])
   }
 
   /// A `410` on the load is the engine's exhausted fall-through, answered as for a feed create:

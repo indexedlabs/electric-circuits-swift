@@ -298,7 +298,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
         return nil
       }
       if let status, (400..<500).contains(status) {
-        // A refused request (400, 409, an exhausted 410) leaves no claim to release.
+        // The combined route validates its whole body before creating or renewing a feed, so a
+        // refused request (400, 409, an exhausted 410) leaves no claim to release.
         throw error
       }
       // The server may have created or renewed the claim before the client rejected the response
