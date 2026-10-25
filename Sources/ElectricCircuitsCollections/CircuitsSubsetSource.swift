@@ -742,7 +742,12 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
       let heldSecondary = next.primaryToSecondary[primary]
       let oldRaw = next.rawRows[primary]
       let merged = mergeRow(old: oldRaw, oldImage: envelope.old, value: envelope.value)
-      let rawSecondary = try merged[keyColumn].map(canonicalToken)
+      let rawSecondary: String?
+      if let merged, let value = merged[keyColumn] {
+        rawSecondary = try canonicalToken(value)
+      } else {
+        rawSecondary = nil
+      }
       let claimed = rawSecondary.map { claimIsActive($0, in: next.claims) } ?? false
       guard heldSecondary != nil || claimed else { continue }
       guard let merged else { throw StreamError.missingValue(key: envelope.key) }
