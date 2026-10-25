@@ -302,13 +302,25 @@ struct KeyedWindowTests {
   }
 
   @Test func S9OneHundredFourteenKeysUseTwoPagesAndOneFeed() async throws {
-    let transport = KeyedScriptedTransport()
+    // Synthetic 2026-27 hockey season: 114 plausible event rows, with no customer data.
+    let season = (1...114).map { index in
+      row(
+        "event-\(index)", "season-client-\(index)", "game-\(index)",
+        "2026-27 Ice Bears vs Wolves game \(index)")
+    }
+    let transport = KeyedScriptedTransport(
+      queryBodies: [
+        page(Array(season.prefix(100))),
+        page(Array(season.dropFirst(100)), lsn: "0/20"),
+      ])
     let window = makeWindow(transport)
     try await window.start(subscription: "s9")
-    let keys = (1...114).map { JSONValue.string("client-\($0)") }
+    let keys = (1...114).map { JSONValue.string("season-client-\($0)") }
     _ = try await window.addKeys(keys)
     #expect(await transport.feedCount() == 1)
     #expect(await transport.queryCount() == 2)
+    #expect(await window.debugState().claimedKeyCount == 114)
+    #expect(await window.debugState().heldPrimaryKeyCount == 114)
     let feedRequest = try #require(
       await transport.requests.first(where: {
         $0.httpMethod == "POST" && $0.url?.path == "/v1/subset-feeds"
