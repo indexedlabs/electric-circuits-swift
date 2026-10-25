@@ -1061,6 +1061,7 @@ struct CircuitsSubsetSourceTests {
 private actor LoadingSubsetTransport: HTTPTransport {
   private(set) var requests: [URLRequest] = []
   private var goneLoads: Int
+  private var malformedLoads: Int
   private var goneStreamReads: Int
   private var streamBodies: [String]
   private var streamReads = 0
@@ -1072,12 +1073,14 @@ private actor LoadingSubsetTransport: HTTPTransport {
 
   init(
     goneLoads: Int = 0,
+    malformedLoads: Int = 0,
     goneStreamReads: Int = 0,
     streamBodies: [String] = [
       #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"Live"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#
     ]
   ) {
     self.goneLoads = goneLoads
+    self.malformedLoads = malformedLoads
     self.goneStreamReads = goneStreamReads
     self.streamBodies = streamBodies
   }
@@ -1092,6 +1095,11 @@ private actor LoadingSubsetTransport: HTTPTransport {
       if goneLoads > 0 {
         goneLoads -= 1
         return reply("gone", request: request, status: 410)
+      }
+      if malformedLoads > 0 {
+        // The claim exists on the server, but the page the client receives is unusable.
+        malformedLoads -= 1
+        return reply("{\(Self.shape),\"offset\":\"10\",\"rows\":\"bad\"}", request: request)
       }
       return reply("{\(Self.shape),\"offset\":\"10\",\(Self.page)}", request: request)
     case ("POST", "/v1/subset-feeds"):
@@ -1239,6 +1247,36 @@ struct SubsetLoadSetupTests {
     #expect(requests.filter { $0.url?.path == "/v1/subset-feeds" }.count == 2)
     try await first.stop()
     try await second.stop()
+  }
+
+  /// Two setups starting together on an older server send one probe between them.
+  @Test func concurrentSetupsShareOneRouteProbe() async throws {
+    let transport = NativeSubsetTransport()
+    let source = self.source(transport)
+    async let first = materialize(source, id: "first")
+    async let second = materialize(source, id: "second")
+    let sessions = try await [first, second]
+    let requests = await transport.requests
+    #expect(requests.filter { $0.url?.path == "/v1/subset-loads" }.count == 1)
+    for session in sessions { try await session.stop() }
+  }
+
+  /// A load the server answered but the client could not use leaves a claim without a handle.
+  /// Setup recovers the handle by renewing the identical claim and releases it.
+  @Test func aRejectedLoadResponseStillReleasesItsClaim() async throws {
+    let transport = LoadingSubsetTransport(malformedLoads: 1)
+    let source = self.source(transport)
+    await #expect(throws: (any Error).self) {
+      _ = try await materialize(source)
+    }
+    let calls = await transport.calls
+    #expect(
+      calls == ["POST /v1/subset-loads", "POST /v1/subset-feeds", "DELETE /v1/shapes/shape-1"])
+    let feed = try #require(
+      await transport.requests.first { $0.url?.path == "/v1/subset-feeds" }?.httpBody)
+    #expect(try JSONDecoder().decode(ShapeRequest.self, from: feed).subscription == "issues-open")
+    let session = try await materialize(source)
+    try await session.stop()
   }
 
   /// A `410` on the load is the engine's exhausted fall-through, answered as for a feed create:

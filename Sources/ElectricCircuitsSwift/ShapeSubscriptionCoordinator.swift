@@ -67,6 +67,24 @@ public struct ShapeSubscriptionRetryPolicy: Sendable {
 /// active. A create answered `410` past the bound is a standing condition, not a reactivation
 /// race, and reaches the caller as the terminal `ClientError.http(status: 410, ...)` it already
 /// was. The backoff exists to avoid a hot loop, not to pace the engine's replay.
+/// A claim the caller created before the coordinator started, such as a subset load's feed, with
+/// when the server minted or renewed it.
+public struct AdoptedShapeHandle: Sendable, Equatable {
+  public let handle: ShapeHandle
+  public let mintedAt: ContinuousClock.Instant
+
+  public init(handle: ShapeHandle, mintedAt: ContinuousClock.Instant = .now) {
+    self.handle = handle
+    self.mintedAt = mintedAt
+  }
+
+  /// Fresh while less than a third of its lease (30 s when the server names no lease) has passed.
+  func isFresh(now: ContinuousClock.Instant = .now) -> Bool {
+    let lease = handle.response.leaseSeconds.map { Duration.seconds($0) / 3 } ?? .seconds(30)
+    return now - mintedAt < lease
+  }
+}
+
 public struct ShapeSubscriptionRecreatePolicy: Equatable, Sendable {
   /// Recreates attempted after the first `410`. `0` surfaces the first `410` as terminal.
   public let maximumRecreates: Int
@@ -279,8 +297,9 @@ public actor ShapeSubscriptionCoordinator {
   private var continuation: AsyncStream<ShapeSubscriptionState>.Continuation?
   private var handle: ShapeHandle?
   // A claim the caller already created (a subset load), adopted by the first create instead of
-  // POSTing the identical claim again. Consumed once; a later recreate POSTs as usual.
-  private var adoptedHandle: ShapeHandle?
+  // POSTing the identical claim again while its lease is fresh. Consumed once; a later recreate
+  // POSTs as usual.
+  private var adoptedHandle: AdoptedShapeHandle?
   private var pendingRelease: [ShapeHandle] = []
   private var generation: UInt64 = 0
   private var stopping = false
@@ -321,7 +340,7 @@ public actor ShapeSubscriptionCoordinator {
     telemetry: TelemetryReporter = .noop,
     kind: ShapeSubscriptionKind = .shape,
     recreatePolicy: ShapeSubscriptionRecreatePolicy = .init(),
-    initialHandle: ShapeHandle? = nil
+    adopting initialHandle: AdoptedShapeHandle? = nil
   ) {
     self.adoptedHandle = initialHandle
     self.client = client
@@ -723,7 +742,10 @@ public actor ShapeSubscriptionCoordinator {
     try Task.checkCancellation()
     if let adopted = adoptedHandle {
       adoptedHandle = nil
-      return adopted
+      // The lease loop's first renewal comes a third of the lease after this start. Adopt only a
+      // claim minted within that third, so admission waits or a slow snapshot write never start
+      // the stream on a lease close to lapsing; an older claim is POSTed again, renewing it.
+      if adopted.isFresh() { return adopted.handle }
     }
     return try await recreatingOnGone(operation: "create") {
       switch self.kind {

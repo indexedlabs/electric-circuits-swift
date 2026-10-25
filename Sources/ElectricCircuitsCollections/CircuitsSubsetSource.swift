@@ -133,7 +133,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     // frontier, then queries the page, in the same order as the three requests below. Like the
     // feed create, it carries the recreate vocabulary: a persisted materialization ID joining a
     // dormant shape whose fall-through the engine has exhausted re-POSTs the identical claim.
-    let loaded = try await loadIfSupported(feedRequest: feedRequest, pageQuery: pageQuery)
+    let loaded = try await loadIfSupported(
+      feedRequest: feedRequest, pageQuery: pageQuery, materializationID: materializationID)
     let feed: ShapeHandle
     if let loaded {
       feed = loaded.handle
@@ -142,6 +143,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
         try await client.createSubsetFeed(feedRequest)
       }
     }
+    let adopted = AdoptedShapeHandle(handle: feed)
 
     do {
       let frontier: StreamCursor
@@ -215,7 +217,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
             kind: .subsetFeed,
             recreatePolicy: recreatePolicy,
             // The tail starts on the feed setup created rather than POSTing its claim again.
-            initialHandle: feed
+            adopting: adopted
           )
           try await lifecycle.install(coordinator)
           let states = await coordinator.stateUpdates
@@ -263,10 +265,11 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
 
   /// The one-round-trip setup, or nil when the server has no `v1/subset-loads` route (remembered
   /// for this source) or the caller asked for three requests.
-  private func loadIfSupported(feedRequest: ShapeRequest, pageQuery: SubsetQuery) async throws
-    -> SubsetLoad?
-  {
-    guard setupRoute == .automatic, await loadSupport.isAvailable else { return nil }
+  private func loadIfSupported(
+    feedRequest: ShapeRequest, pageQuery: SubsetQuery,
+    materializationID: CollectionMaterializationID
+  ) async throws -> SubsetLoad? {
+    guard setupRoute == .automatic, await loadSupport.shouldLoad() else { return nil }
     let request = SubsetLoadRequest(
       table: table,
       where: feedRequest.where,
@@ -275,13 +278,35 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       query: SubsetLoadPage(
         where: pageQuery.where, orderBy: pageQuery.orderBy, limit: pageQuery.limit))
     do {
-      return try await recreatePolicy.recreatingOnGone(clock: clock) {
+      let loaded = try await recreatePolicy.recreatingOnGone(clock: clock) {
         try await client.loadSubset(request)
       }
-    } catch ClientError.http(status: let status, message: _) where status == 404 || status == 405 {
-      await loadSupport.markUnavailable()
-      return nil
+      await loadSupport.settle(available: true)
+      return loaded
+    } catch {
+      let status = Self.httpStatus(error)
+      if let status, status == 404 || status == 405 {
+        await loadSupport.settle(available: false)
+        return nil
+      }
+      if let status, (400..<500).contains(status) {
+        // A refused request (400, 409, an exhausted 410) leaves no claim to release.
+        await loadSupport.settle(available: true)
+        throw error
+      }
+      await loadSupport.settle(available: nil)
+      // The server may have created or renewed the claim before the client rejected the response
+      // or lost the connection. Keep the claim so this attempt, or the next setup or abandonment
+      // cleanup of this materialization, recovers its handle and releases it.
+      await pendingCleanup.recordClaim(feedRequest, for: materializationID)
+      if !Task.isCancelled { try? await pendingCleanup.retry(materializationID) }
+      throw error
     }
+  }
+
+  private static func httpStatus(_ error: any Error) -> Int? {
+    guard let error = error as? ClientError, case .http(let status, _) = error else { return nil }
+    return status
   }
 
   public func cleanupAbandonedMaterialization(
@@ -316,32 +341,100 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   }
 }
 
+/// Whether the server offers `v1/subset-loads`, learnt per source. The first load probes;
+/// concurrent setups wait for its answer instead of each sending their own probe. A 404 or 405
+/// settles it as unavailable for five minutes, so an old instance answering during a rolling
+/// deploy doesn't pin the source to three requests; a successful load settles it as available;
+/// any other failure leaves it unknown for the next setup to probe again.
+private actor SubsetLoadSupport {
+  private enum State {
+    case unknown
+    case probing
+    case available
+    case unavailable(until: ContinuousClock.Instant)
+  }
+  private var state = State.unknown
+  private var waiters: [CheckedContinuation<Void, Never>] = []
+
+  /// True when this setup should send the load: the route is known, or this setup is the probe.
+  func shouldLoad() async -> Bool {
+    while true {
+      switch state {
+      case .available: return true
+      case .unavailable(let until):
+        if ContinuousClock.now < until { return false }
+        state = .probing
+        return true
+      case .unknown:
+        state = .probing
+        return true
+      case .probing:
+        await withCheckedContinuation { waiters.append($0) }
+      }
+    }
+  }
+
+  func settle(available: Bool?) {
+    guard case .probing = state else { return }
+    state =
+      switch available {
+      case true?: .available
+      case false?: .unavailable(until: .now + .seconds(300))
+      case nil: .unknown
+      }
+    let resumed = waiters
+    waiters = []
+    for waiter in resumed { waiter.resume() }
+  }
+}
+
 /// A failed setup has no session to return, but it can already have created a server feed. Keep
 /// the one release handle per materialization until the idempotent DELETE succeeds (or receives
 /// 404, which the client normalizes to success). The registry is bounded by active failed setup
 /// attempts and is drained before another feed with that stable subscription can be created.
-/// Whether the server offers `v1/subset-loads`; learnt once per source from a 404 or 405.
-private actor SubsetLoadSupport {
-  private(set) var isAvailable = true
-  func markUnavailable() { isAvailable = false }
-}
-
+///
+/// A rejected subset load (an over-limit or malformed 2xx, a dropped connection, a cancellation)
+/// can leave a claim the client never received a handle for. Its request is kept instead: the
+/// retry repeats the identical feed create, which renews the same claim and returns its handle,
+/// then releases that.
 private actor PendingSubsetFeedCleanup {
+  private enum Pending {
+    case handle(ShapeHandle)
+    case claim(ShapeRequest)
+  }
   private let client: ElectricCircuitsClient
-  private var handles: [CollectionMaterializationID: ShapeHandle] = [:]
+  private var pending: [CollectionMaterializationID: Pending] = [:]
 
   init(client: ElectricCircuitsClient) {
     self.client = client
   }
 
   func record(_ handle: ShapeHandle, for materializationID: CollectionMaterializationID) {
-    handles[materializationID] = handle
+    pending[materializationID] = .handle(handle)
+  }
+
+  func recordClaim(_ request: ShapeRequest, for materializationID: CollectionMaterializationID) {
+    pending[materializationID] = .claim(request)
   }
 
   func retry(_ materializationID: CollectionMaterializationID) async throws {
-    guard let handle = handles[materializationID] else { return }
-    try await client.releaseShape(handle)
-    handles.removeValue(forKey: materializationID)
+    switch pending[materializationID] {
+    case nil:
+      return
+    case .handle(let handle):
+      try await client.releaseShape(handle)
+    case .claim(let request):
+      let handle: ShapeHandle
+      do {
+        handle = try await client.createSubsetFeed(request)
+      } catch ClientError.http(status: let status, message: _) where (400..<500).contains(status) {
+        // The server refuses this claim outright, so the load cannot have left one behind.
+        pending.removeValue(forKey: materializationID)
+        return
+      }
+      try await client.releaseShape(handle)
+    }
+    pending.removeValue(forKey: materializationID)
   }
 }
 
