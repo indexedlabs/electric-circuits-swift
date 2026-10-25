@@ -657,7 +657,8 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
   /// materializer methods remain available for scripted transport tests.
   public func run() async throws {
     guard let coordinator else { throw KeyedWindowError.notLive }
-    for await update in coordinator.stateUpdates {
+    let updates = await coordinator.stateUpdates
+    for await update in updates {
       switch update {
       case .failed(let failure): throw CircuitsSubsetSourceError.subscription(failure)
       case .reseedRequired(let outcome):
@@ -684,7 +685,8 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
     let request = ShapeRequest(
       table: table, where: basePredicate, columns: columns, changesOnly: true,
       subscription: subscription)
-    let registryKey = feedRegistryKey(request)
+    let baseURL = await client.baseURL
+    let registryKey = feedRegistryKey(request, baseURL: baseURL)
     let lease = try await KeyedWindowFeedRegistry.shared.acquire(
       key: registryKey, client: client, transport: transport, request: request,
       retryPolicy: retryPolicy, clock: clock, recreatePolicy: recreatePolicy,
@@ -782,7 +784,7 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
       }
       var next = snapshot()
       var changes: [CollectionChange<Model, PrimaryKey>] = []
-      var releases: [PrimaryKey] = []
+      let releases: [PrimaryKey] = []
       for page in pages {
         for row in page.result.rows where claimIsActive(row.token, in: next.claims) {
           guard next.versions[row.primary].map({ page.result.version.supersedes($0) }) ?? true else { continue }
@@ -953,13 +955,14 @@ public actor KeyedWindow<Model: Sendable, PrimaryKey: Hashable & Sendable>:
     state = .idle
   }
 
-  private func feedRegistryKey(_ request: ShapeRequest) -> String {
+  private func feedRegistryKey(_ request: ShapeRequest, baseURL: URL) -> String {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys]
     let predicate = (try? encoder.encode(request.where)).map {
       String(decoding: $0, as: UTF8.self)
     } ?? "nil"
-    return "\(client.baseURL.absoluteString)|\(table)|\(predicate)"
+    let columns = request.columns?.joined(separator: ",") ?? "*"
+    return "\(baseURL.absoluteString)|\(table)|\(columns)|\(predicate)"
   }
 
   private func beginPage(_ keys: [JSONValue]) throws -> PageTicket {
