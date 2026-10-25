@@ -1227,8 +1227,6 @@ struct SubsetLoadSetupTests {
     let body = try JSONDecoder().decode(SubsetLoadRequest.self, from: load)
     #expect(body.subscription == "issues-open")
     #expect(body.where == .leaf(column: "status", op: .eq, value: .string("open")))
-    #expect(body.orderBy == nil)
-    #expect(body.limit == nil)
   }
 
   /// The load returns exactly what the three requests return for the same feed, so the snapshot
@@ -1337,9 +1335,8 @@ struct SubsetLoadSetupTests {
     try await again.stop()
   }
 
-  /// A limited window's load carries the page query (order, limit and the sort-key requirement)
-  /// while the feed keeps the demand's predicate.
-  @Test func aLimitedWindowsLoadCarriesItsPageQuery() async throws {
+  /// Limited windows stay on the three-request path; its query keeps the sort-key requirement.
+  @Test func aLimitedWindowUsesTheThreeRequestSetup() async throws {
     let transport = LoadingSubsetTransport()
     let demand = CollectionDemand<NativeIssue>(
       unsafePredicateIdentity: "recent",
@@ -1350,12 +1347,15 @@ struct SubsetLoadSetupTests {
       limit: 1)
     let session = try await materialize(
       source(transport, subsetSetup: .oneRequest, keyForRow: \.id), demand: demand)
-    let load = try #require(await transport.requests.first?.httpBody)
-    #expect(!String(data: load, encoding: .utf8)!.contains("\"query\""))
-    let body = try JSONDecoder().decode(SubsetLoadRequest.self, from: load)
-    #expect(body.where == nil)
+    #expect(Array((await transport.calls).prefix(3)) == [
+      "POST /v1/subset-feeds", "HEAD /streams/shape-1", "POST /v1/subsets/query"
+    ])
+    let query = try #require(
+      await transport.requests.first { $0.url?.path == "/v1/subsets/query" }?.httpBody)
+    let body = try JSONDecoder().decode(SubsetQuery.self, from: query)
     #expect(body.limit == 1)
     #expect(body.orderBy == SubsetOrderBy(column: "modified_at", descending: true))
+    #expect(body.where == .and([.isNull(column: "modified_at", isNull: false)]))
     try await session.stop()
   }
 }

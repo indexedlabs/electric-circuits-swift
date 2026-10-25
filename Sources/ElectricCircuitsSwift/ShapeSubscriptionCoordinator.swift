@@ -300,6 +300,7 @@ public actor ShapeSubscriptionCoordinator {
   // POSTing the identical claim again while its lease is fresh. Consumed once; a later recreate
   // POSTs as usual.
   private var adoptedHandle: AdoptedShapeHandle?
+  private var adoptedLeaseStart: ContinuousClock.Instant?
   private var pendingRelease: [ShapeHandle] = []
   private var generation: UInt64 = 0
   private var stopping = false
@@ -343,6 +344,7 @@ public actor ShapeSubscriptionCoordinator {
     adopting initialHandle: AdoptedShapeHandle? = nil
   ) {
     self.adoptedHandle = initialHandle
+    self.adoptedLeaseStart = initialHandle?.mintedAt
     self.client = client
     self.transport = transport
     self.request = request
@@ -428,8 +430,10 @@ public actor ShapeSubscriptionCoordinator {
       startTask = nil
       handle = created
       currentClaimAcknowledged = false
+      let leaseStart = adoptedLeaseStart
+      adoptedLeaseStart = nil
       generation &+= 1
-      launchStream(for: created, generation: generation)
+      launchStream(for: created, generation: generation, leaseStart: leaseStart)
       return created
     } catch {
       guard isAcceptingOperations else { throw error }
@@ -658,12 +662,22 @@ public actor ShapeSubscriptionCoordinator {
     }
   }
 
-  private func launchStream(for handle: ShapeHandle, generation: UInt64) {
+  private func launchStream(
+    for handle: ShapeHandle, generation: UInt64, leaseStart: ContinuousClock.Instant?
+  ) {
     streamTask = Task { [weak self] in await self?.consume(handle: handle, generation: generation) }
     if let seconds = handle.response.leaseSeconds, seconds > 0 {
       let interval = max(Duration.seconds(Double(seconds) / 3), .seconds(1))
+      let firstDelay: Duration
+      if let leaseStart {
+        let elapsed = ContinuousClock.now - leaseStart
+        firstDelay = elapsed >= interval ? .zero : interval - elapsed
+      } else {
+        firstDelay = interval
+      }
       leaseTask = Task { [weak self] in
-        await self?.renewOnLease(interval: interval, generation: generation)
+        await self?.renewOnLease(
+          firstDelay: firstDelay, interval: interval, generation: generation)
       }
     }
   }
@@ -716,12 +730,27 @@ public actor ShapeSubscriptionCoordinator {
     }
   }
 
-  private func renewOnLease(interval: Duration, generation: UInt64) async {
+  private func renewOnLease(
+    firstDelay: Duration, interval: Duration, generation: UInt64
+  ) async {
+    var delay = firstDelay
     while isCurrent(generation) {
       do {
-        try await clock.sleep(for: interval)
+        try await clock.sleep(for: delay)
         guard isCurrent(generation) else { return }
-        _ = try await renew()
+        do {
+          _ = try await renew()
+        } catch {
+          // A single transient renewal failure must not end a lease loop. Retry once with the
+          // normal bounded backoff; a second failure remains terminal for this coordinator.
+          guard isCurrent(generation), !Task.isCancelled else { return }
+          let retryDelay = retryPolicy.delay(
+            forRetry: 1, retryAfter: retryAfter(for: error))
+          try await clock.sleep(for: retryDelay)
+          guard isCurrent(generation), !Task.isCancelled else { return }
+          _ = try await renew()
+        }
+        delay = interval
       } catch { return }
     }
   }
@@ -746,6 +775,7 @@ public actor ShapeSubscriptionCoordinator {
       // claim minted within that third, so admission waits or a slow snapshot write never start
       // the stream on a lease close to lapsing; an older claim is POSTed again, renewing it.
       if adopted.isFresh() { return adopted.handle }
+      adoptedLeaseStart = nil
     }
     return try await recreatingOnGone(operation: "create") {
       switch self.kind {

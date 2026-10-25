@@ -304,25 +304,21 @@ public struct SubsetResponse: Codable, Equatable, Sendable {
 
 /// `POST sync/v1/subset-loads`: the gateway creates or renews a changes-only feed, reads its stream
 /// frontier, and queries its snapshot page, in that order. The gateway authorizes the feed
-/// predicate once and applies it to both the feed and page query; a limited page adds its own
-/// non-NULL order-key predicate server-side.
+/// predicate once and applies it to both the feed and page query. Its body contains only the feed
+/// fields; limited windows use the established three-request setup in this SDK version.
 public struct SubsetLoadRequest: Codable, Equatable, Sendable {
   public var table: String
   public var `where`: Predicate?
   public var columns: [String]?
-  public var subscription: String?
-  public var orderBy: SubsetOrderBy?
-  public var limit: Int?
+  public var subscription: String
   public init(
     table: String, where predicate: Predicate? = nil, columns: [String]? = nil,
-    subscription: String? = UUID().uuidString, orderBy: SubsetOrderBy? = nil, limit: Int? = nil
+    subscription: String
   ) {
     self.table = table
     self.where = predicate
     self.columns = columns
     self.subscription = subscription
-    self.orderBy = orderBy
-    self.limit = limit
   }
 }
 
@@ -696,12 +692,10 @@ public actor ElectricCircuitsClient {
     let wire: SubsetLoadResponse = try await send(
       path: "sync/v1/subset-loads", method: "POST", body: request)
     var shape = wire.shape
-    if let subscription = request.subscription {
-      if let echoed = shape.subscription, echoed != subscription {
-        throw ClientError.decoding("subset load response subscription does not match request")
-      }
-      shape.subscription = subscription
+    if let echoed = shape.subscription, echoed != request.subscription {
+      throw ClientError.decoding("subset load response subscription does not match request")
     }
+    shape.subscription = request.subscription
     guard !wire.offset.isEmpty else {
       throw ClientError.decoding("subset load response missing offset")
     }
