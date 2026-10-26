@@ -1112,11 +1112,11 @@ private actor LoadingSubsetTransport: HTTPTransport {
       if malformedLoads > 0 {
         // The claim exists on the server, but the page the client receives is unusable.
         malformedLoads -= 1
-        return reply("{\(Self.shape),\"offset\":\"10\",\"rows\":\"bad\"}", request: request)
+        return reply("{\(Self.shape),\"leaseSeconds\":30,\"offset\":\"10\",\"rows\":\"bad\"}", request: request)
       }
       if invalidPageLoads > 0 {
         invalidPageLoads -= 1
-        return reply("{\(Self.shape),\"offset\":\"10\",\"rows\":[1],\"lsn\":\"0/10\"}", request: request)
+        return reply("{\(Self.shape),\"leaseSeconds\":30,\"offset\":\"10\",\"rows\":[1],\"lsn\":\"0/10\"}", request: request)
       }
       let lease = omitLease ? "" : ",\"leaseSeconds\":\(leaseSeconds ?? 30)"
       return reply("{\(Self.shape)\(lease),\"offset\":\"10\",\(Self.page)}", request: request)
@@ -1277,7 +1277,8 @@ struct SubsetLoadSetupTests {
     try await session.stop()
   }
 
-  /// A failed gateway load leaves its claim to the lease; setup does not create or DELETE a feed.
+  /// A failed gateway load leaves its claim to the lease; setup does not recover it with another
+  /// feed POST or DELETE (except a malformed lease-less response, which is released immediately).
   @Test func aRejectedLoadResponseDoesNotDeleteItsClaim() async throws {
     let transport = LoadingSubsetTransport(malformedLoads: 1)
     let source = self.source(transport, subsetSetup: .oneRequest)
@@ -1343,6 +1344,8 @@ struct SubsetLoadSetupTests {
     }
     #expect(
       (await transport.requests).contains(where: { $0.url?.path == "/v1/subset-feeds" }))
+    let calls = await transport.calls
+    #expect(calls.firstIndex(of: "POST /v1/subset-feeds")! < calls.firstIndex(of: "GET /streams/shape-1")!)
     try await session.stop()
     run.cancel()
     _ = try? await run.value
