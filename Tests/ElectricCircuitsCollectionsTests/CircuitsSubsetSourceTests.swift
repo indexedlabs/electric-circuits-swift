@@ -1118,7 +1118,7 @@ private actor LoadingSubsetTransport: HTTPTransport {
         invalidPageLoads -= 1
         return reply("{\(Self.shape),\"leaseSeconds\":30,\"offset\":\"10\",\"rows\":[1],\"lsn\":\"0/10\"}", request: request)
       }
-      let lease = omitLease ? "" : ",\"leaseSeconds\":\(leaseSeconds ?? 30)"
+      let lease = omitLease ? "" : ",\"leaseSeconds\":\(leaseSeconds ?? 300)"
       return reply("{\(Self.shape)\(lease),\"offset\":\"10\",\(Self.page)}", request: request)
     case ("POST", "/v1/subset-feeds"):
       return reply("{\(Self.shape)}", request: request)
