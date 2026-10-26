@@ -1166,8 +1166,11 @@ struct SubsetLoadSetupTests {
     _ transport: any HTTPTransport,
     subsetSetup: ElectricCircuitsClient.Configuration.SubsetSetup = .threeRequests,
     keyForRow: (@Sendable (NativeIssue) throws -> Int64)? = nil,
-    clock: any ShapeSubscriptionClock = SubsetRecreateClock()
+    clock: (any ShapeSubscriptionClock)? = nil
   ) -> CircuitsSubsetSource<NativeIssue, Int64> {
+    let effectiveClock: any ShapeSubscriptionClock =
+      clock ?? (subsetSetup == .oneRequest
+        ? ContinuousShapeSubscriptionClock() : SubsetRecreateClock())
     CircuitsSubsetSource<NativeIssue, Int64>(
       client: ElectricCircuitsClient(
         baseURL: URL(string: "https://engine.test")!, transport: transport,
@@ -1176,7 +1179,7 @@ struct SubsetLoadSetupTests {
       table: "public.issues",
       columns: ["id", "title"],
       retryPolicy: ShapeSubscriptionRetryPolicy(maxRetries: 0),
-      clock: clock,
+      clock: effectiveClock,
       decodeRow: NativeIssue.init(row:),
       decodeKey: { key in
         guard let id = Int64(key) else { throw CircuitsSubsetSourceError.invalidLiveKey(key) }
