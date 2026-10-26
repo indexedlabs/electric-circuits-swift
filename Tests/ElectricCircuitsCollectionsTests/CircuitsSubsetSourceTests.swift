@@ -195,7 +195,7 @@ private actor SubsetRecreateClock: ShapeSubscriptionClock {
     delays.append(duration)
     // Lease renewals use a seconds-long cadence; keep those sleeps pending until the owning
     // session is stopped so a test clock cannot turn the lease loop into a busy renewal storm.
-    if duration >= .seconds(1) {
+    if duration >= .seconds(10) {
       try await Task.sleep(for: .seconds(3_600))
     }
   }
