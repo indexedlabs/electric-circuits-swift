@@ -302,6 +302,61 @@ public struct SubsetResponse: Codable, Equatable, Sendable {
   }
 }
 
+/// The gateway's `POST /sync/v1/subsets/load` route (the client path is relative to the configured
+/// `/sync/` base URL) creates or renews a changes-only feed, reads its stream frontier, and queries
+/// its snapshot page in that order. The gateway authorizes the feed predicate once and applies it
+/// to both the feed and page query. When present, `orderBy` and `limit` must be supplied together;
+/// the gateway adds the page's non-NULL order-key predicate.
+public struct SubsetLoadRequest: Codable, Equatable, Sendable {
+  public var table: String
+  public var `where`: Predicate?
+  public var columns: [String]?
+  public var subscription: String
+  public var orderBy: SubsetOrderBy?
+  public var limit: Int?
+  public init(
+    table: String, where predicate: Predicate? = nil, columns: [String]? = nil,
+    subscription: String, orderBy: SubsetOrderBy? = nil, limit: Int? = nil
+  ) {
+    self.table = table
+    self.where = predicate
+    self.columns = columns
+    self.subscription = subscription
+    self.orderBy = orderBy
+    self.limit = limit
+  }
+}
+
+/// A one-round-trip subset load: the feed's handle, the frontier its snapshot is fenced at, and
+/// the snapshot page. These are exactly the values `createSubsetFeed`, `streamCursor(for:)` and
+/// `querySubset` return for the same feed, so callers fence and apply them identically.
+public struct SubsetLoad: Equatable, Sendable {
+  public let handle: ShapeHandle
+  public let frontier: StreamCursor
+  public let page: SubsetResponse
+  public init(handle: ShapeHandle, frontier: StreamCursor, page: SubsetResponse) {
+    self.handle = handle
+    self.frontier = frontier
+    self.page = page
+  }
+}
+
+/// The wire response of `POST sync/v1/subsets/load`: the shape fields, `offset`, and page fields
+/// side by side in one object.
+private struct SubsetLoadResponse: Decodable {
+  let shape: ShapeResponse
+  let offset: String
+  let page: SubsetResponse
+
+  private enum CodingKeys: String, CodingKey { case offset }
+
+  init(from decoder: any Decoder) throws {
+    shape = try ShapeResponse(from: decoder)
+    page = try SubsetResponse(from: decoder)
+    offset = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .offset)
+  }
+}
+
 public enum AggregateFunction: String, Codable, Sendable {
   case count, sum, avg, min, max
 }
@@ -565,7 +620,24 @@ public actor InMemoryElectricCircuitsStore: ElectricCircuitsStore {
 }
 
 public actor ElectricCircuitsClient {
+  public struct Configuration: Equatable, Sendable {
+    public enum SubsetSetup: Equatable, Sendable {
+      /// Use the gateway's one-request route. The client's base URL must already be the gateway's
+      /// `/sync/` base; this mode does not probe or fall back when the route is unavailable.
+      case oneRequest
+      /// Use the existing feed, stream HEAD, and snapshot query routes.
+      case threeRequests
+    }
+
+    public var subsetSetup: SubsetSetup
+
+    public init(subsetSetup: SubsetSetup = .threeRequests) {
+      self.subsetSetup = subsetSetup
+    }
+  }
+
   public let baseURL: URL
+  public let configuration: Configuration
   public let responseDecodingLimits: ResponseDecodingLimits
   private let transport: any HTTPTransport
   private let telemetry: TelemetryReporter
@@ -575,9 +647,11 @@ public actor ElectricCircuitsClient {
   public init(
     baseURL: URL, transport: any HTTPTransport = URLSessionTransport(),
     telemetry: TelemetryReporter = .noop,
-    responseDecodingLimits: ResponseDecodingLimits = .default
+    responseDecodingLimits: ResponseDecodingLimits = .default,
+    configuration: Configuration = .init()
   ) {
     self.baseURL = baseURL
+    self.configuration = configuration
     self.responseDecodingLimits = responseDecodingLimits
     self.transport = transport
     self.telemetry = telemetry
@@ -618,6 +692,24 @@ public actor ElectricCircuitsClient {
   }
   public func querySubset(_ request: SubsetQuery) async throws -> SubsetResponse {
     try await send(path: "v1/subsets/query", method: "POST", body: request)
+  }
+
+  /// One gateway round trip for what `createSubsetFeed`, `streamCursor(for:)` and `querySubset` do
+  /// in three. This route is selected explicitly in `Configuration`; it is never probed.
+  public func loadSubset(_ request: SubsetLoadRequest) async throws -> SubsetLoad {
+    let wire: SubsetLoadResponse = try await send(
+      path: "v1/subsets/load", method: "POST", body: request)
+    var shape = wire.shape
+    if let echoed = shape.subscription, echoed != request.subscription {
+      throw ClientError.decoding("subset load response subscription does not match request")
+    }
+    shape.subscription = request.subscription
+    guard !wire.offset.isEmpty else {
+      throw ClientError.decoding("subset load response missing offset")
+    }
+    return SubsetLoad(
+      handle: ShapeHandle(response: shape), frontier: StreamCursor(offset: wire.offset),
+      page: wire.page)
   }
 
   /// Reads the durable stream's current frontier without consuming a batch. Subset-feed clients

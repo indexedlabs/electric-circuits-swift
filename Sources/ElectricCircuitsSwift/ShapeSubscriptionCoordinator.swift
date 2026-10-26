@@ -54,6 +54,26 @@ public struct ShapeSubscriptionRetryPolicy: Sendable {
   }
 }
 
+/// A claim the caller created before the coordinator started, such as a subset load's feed, and
+/// the time when the server minted or renewed it.
+public struct AdoptedShapeHandle: Sendable, Equatable {
+  public let handle: ShapeHandle
+  public let mintedAt: ContinuousClock.Instant
+
+  public init(handle: ShapeHandle, mintedAt: ContinuousClock.Instant = .now) {
+    self.handle = handle
+    self.mintedAt = mintedAt
+  }
+
+  /// Fresh while less than a third of its lease (30 s when the server names no lease) has passed.
+  func isFresh(now: ContinuousClock.Instant = .now) -> Bool {
+    let lease = handle.response.leaseSeconds.map {
+      max(Duration.seconds($0) / 3, .seconds(1))
+    } ?? .seconds(30)
+    return now - mintedAt < lease
+  }
+}
+
 /// Bounds the client-side fall-through for a create/join the engine answered `410 Gone`.
 ///
 /// The engine retires a dormant shape whose replay is over budget, and abandons a reactivation
@@ -278,6 +298,11 @@ public actor ShapeSubscriptionCoordinator {
   private let recreatePolicy: ShapeSubscriptionRecreatePolicy
   private var continuation: AsyncStream<ShapeSubscriptionState>.Continuation?
   private var handle: ShapeHandle?
+  // A claim the caller already created (a subset load), adopted by the first create instead of
+  // POSTing the identical claim again while its lease is fresh. Consumed once; a later recreate
+  // POSTs as usual.
+  private var adoptedHandle: AdoptedShapeHandle?
+  private var adoptedLeaseStart: ContinuousClock.Instant?
   private var pendingRelease: [ShapeHandle] = []
   private var generation: UInt64 = 0
   private var stopping = false
@@ -317,8 +342,11 @@ public actor ShapeSubscriptionCoordinator {
     responseDecodingLimits: ResponseDecodingLimits = .default,
     telemetry: TelemetryReporter = .noop,
     kind: ShapeSubscriptionKind = .shape,
-    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init()
+    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init(),
+    adopting initialHandle: AdoptedShapeHandle? = nil
   ) {
+    self.adoptedHandle = initialHandle
+    self.adoptedLeaseStart = initialHandle?.mintedAt
     self.client = client
     self.transport = transport
     self.request = request
@@ -404,8 +432,10 @@ public actor ShapeSubscriptionCoordinator {
       startTask = nil
       handle = created
       currentClaimAcknowledged = false
+      let leaseStart = adoptedLeaseStart
+      adoptedLeaseStart = nil
       generation &+= 1
-      launchStream(for: created, generation: generation)
+      launchStream(for: created, generation: generation, leaseStart: leaseStart)
       return created
     } catch {
       guard isAcceptingOperations else { throw error }
@@ -603,6 +633,7 @@ public actor ShapeSubscriptionCoordinator {
       generation &+= 1
       transition(.stopping)
       if let handle { appendRelease(handle) }
+      if let adoptedHandle { appendRelease(adoptedHandle.handle) }
       handle = nil
     }
     let create = startTask
@@ -634,12 +665,22 @@ public actor ShapeSubscriptionCoordinator {
     }
   }
 
-  private func launchStream(for handle: ShapeHandle, generation: UInt64) {
+  private func launchStream(
+    for handle: ShapeHandle, generation: UInt64, leaseStart: ContinuousClock.Instant?
+  ) {
     streamTask = Task { [weak self] in await self?.consume(handle: handle, generation: generation) }
     if let seconds = handle.response.leaseSeconds, seconds > 0 {
       let interval = max(Duration.seconds(Double(seconds) / 3), .seconds(1))
+      let firstDelay: Duration
+      if let leaseStart {
+        let elapsed = ContinuousClock.now - leaseStart
+        firstDelay = elapsed >= interval ? .zero : interval - elapsed
+      } else {
+        firstDelay = interval
+      }
       leaseTask = Task { [weak self] in
-        await self?.renewOnLease(interval: interval, generation: generation)
+        await self?.renewOnLease(
+          firstDelay: firstDelay, interval: interval, generation: generation)
       }
     }
   }
@@ -692,12 +733,16 @@ public actor ShapeSubscriptionCoordinator {
     }
   }
 
-  private func renewOnLease(interval: Duration, generation: UInt64) async {
+  private func renewOnLease(
+    firstDelay: Duration, interval: Duration, generation: UInt64
+  ) async {
+    var delay = firstDelay
     while isCurrent(generation) {
       do {
-        try await clock.sleep(for: interval)
+        try await clock.sleep(for: delay)
         guard isCurrent(generation) else { return }
         _ = try await renew()
+        delay = interval
       } catch { return }
     }
   }
@@ -716,6 +761,36 @@ public actor ShapeSubscriptionCoordinator {
       throw MaterializerFailure()
     }
     try Task.checkCancellation()
+    if let adopted = adoptedHandle {
+      // The lease loop's first renewal comes a third of the lease after this start. Adopt only a
+      // claim minted within that third, so admission waits or a slow snapshot write never start
+      // the stream on a lease close to lapsing; an older claim is POSTed again, renewing it.
+      if adopted.isFresh() {
+        adoptedHandle = nil
+        return adopted.handle
+      }
+      adoptedLeaseStart = nil
+      let renewed = try await recreatingOnGone(operation: "create") {
+        switch self.kind {
+        case .shape:
+          try await self.client.createShape(self.request)
+        case .subsetFeed:
+          try await self.client.createSubsetFeed(self.request)
+        }
+      }
+      if renewed.id != adopted.handle.id {
+        let outcome = ShapeSubscriptionReseedRequired(
+          reason: .replacement(
+            previousShapeID: adopted.handle.id, replacementShapeID: renewed.id),
+          previous: adopted.handle, replacement: renewed)
+        handle = adopted.handle
+        try await requireReseed(outcome, extraRelease: renewed)
+        adoptedHandle = nil
+        throw ShapeSubscriptionFailure.reseedRequired(outcome)
+      }
+      adoptedHandle = nil
+      return renewed
+    }
     return try await recreatingOnGone(operation: "create") {
       switch self.kind {
       case .shape:
@@ -798,12 +873,40 @@ public actor ShapeSubscriptionCoordinator {
   /// reconciliation the durable-stream gone receipt uses, so the application reseeds one explicit
   /// fresh scope instead of inheriting two live server claims.
   private func renewWithRetry() async throws -> ShapeHandle {
-    try await recreatingOnGone(operation: "renew") {
-      switch self.kind {
-      case .shape:
-        try await self.client.renewShape(self.request)
-      case .subsetFeed:
-        try await self.client.createSubsetFeed(self.request)
+    func attempt() async throws -> ShapeHandle {
+      try await recreatePolicy.recreatingOnGone(
+        clock: clock,
+        willRecreate: { attempt in await self.noteRecreateAttempt(attempt) }
+      ) {
+        switch self.kind {
+        case .shape:
+          try await self.client.renewShape(self.request)
+        case .subsetFeed:
+          try await self.client.createSubsetFeed(self.request)
+        }
+      }
+    }
+    var retries = 0
+    while true {
+      do {
+        try Task.checkCancellation()
+        return try await attempt()
+      } catch {
+        // Preserve the normal renewal budget and add one final retry. Keeping both attempts inside
+        // the renewal operation means `.failed` is published only after the lease retry budget is
+        // exhausted. The prototype gateway contract clause is: "renewal keeps the configured
+        // budget plus one final recovery attempt"; maxRetries=0 still gets that extra attempt.
+        guard isRetryable(error), retries < retryPolicy.maxRetries + 1 else {
+          if isRetryable(error) {
+            throw ShapeSubscriptionFailure.retryExhausted(
+              operation: "renew", attempts: retries + 1, cause: retryCause(for: error))
+          }
+          throw error
+        }
+        retries += 1
+        let delay = retryPolicy.delay(forRetry: retries, retryAfter: retryAfter(for: error))
+        transition(.waitingToRetry(operation: "renew", attempt: retries, delay: delay))
+        try await clock.sleep(for: delay)
       }
     }
   }

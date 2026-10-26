@@ -108,11 +108,22 @@ private actor CancellationTransport: HTTPTransport {
 
 private actor RenewalTransport: HTTPTransport {
   private(set) var requests: [URLRequest] = []
+  private var posts = 0
+  private var renewFailures: Int
+
+  init(renewFailures: Int = 0) { self.renewFailures = renewFailures }
+
   func send(_ request: URLRequest) async throws -> HTTPResponse {
     requests.append(request)
     try Task.checkCancellation()
     switch request.httpMethod {
-    case "POST": return shapeResponse()
+    case "POST":
+      posts += 1
+      if posts > 1, renewFailures > 0 {
+        renewFailures -= 1
+        return response("renew failed", status: 503)
+      }
+      return shapeResponse()
     case "GET":
       // Hold the long poll open without busy-waiting: a spin occupies a cooperative-pool thread
       // for the whole test run, and enough of them starve the yield-based progress waits and the
@@ -180,6 +191,21 @@ private actor ReplacementTransport: HTTPTransport {
       try await Task.sleep(for: .seconds(3_600))
       throw CancellationError()
     case "DELETE": return response("", status: 404)
+    default: throw CancellationError()
+    }
+  }
+}
+
+private actor StaleAdoptionTransport: HTTPTransport {
+  private(set) var requests: [URLRequest] = []
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    switch request.httpMethod {
+    case "POST":
+      return shapeResponse(id: "s2", leaseSeconds: 1)
+    case "DELETE": return response("", status: 404)
+    case "GET": throw CancellationError()
     default: throw CancellationError()
     }
   }
@@ -620,6 +646,76 @@ struct ShapeSubscriptionCoordinatorTests {
     try await coordinator.stop()
   }
 
+  @Test func renewalRetriesOnceBeforePublishingFailure() async throws {
+    let transport = RenewalTransport(renewFailures: 1)
+    let clock = RecordingClock()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "stable-claim"),
+      materializer: InMemoryShapeMaterializer(),
+      retryPolicy: .init(maxRetries: 0, baseDelay: .seconds(1), jitterRatio: 0), clock: clock)
+    _ = try await coordinator.start()
+    _ = try await coordinator.renew()
+    #expect(await transport.requests.filter { $0.httpMethod == "POST" }.count == 3)
+    #expect(await clock.delays == [.seconds(1)])
+    #expect(await coordinator.state == .streaming(.beginning))
+    try await coordinator.stop()
+  }
+
+  @Test func renewalReportsExhaustionAfterTheExtraAttempt() async throws {
+    let transport = RenewalTransport(renewFailures: 4)
+    let clock = RecordingClock()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "stable-claim"),
+      materializer: InMemoryShapeMaterializer(),
+      retryPolicy: .init(maxRetries: 2, baseDelay: .seconds(1), jitterRatio: 0), clock: clock)
+    _ = try await coordinator.start()
+    await #expect(throws: ShapeSubscriptionFailure.self) {
+      _ = try await coordinator.renew()
+    }
+    #expect(
+      await coordinator.state
+        == .failed(.retryExhausted(operation: "renew", attempts: 4, cause: .http(status: 503))))
+    #expect(await transport.requests.filter { $0.httpMethod == "POST" }.count == 5)
+    try await coordinator.stop()
+  }
+
+  @Test func renewalKeepsItsConfiguredBudgetBeforeTheExtraAttempt() async throws {
+    let transport = RenewalTransport(renewFailures: 3)
+    let clock = RecordingClock()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "stable-claim"),
+      materializer: InMemoryShapeMaterializer(),
+      retryPolicy: .init(maxRetries: 2, baseDelay: .seconds(1), jitterRatio: 0), clock: clock)
+    let updates = await coordinator.stateUpdates
+    let stateTask = Task {
+      var states: [ShapeSubscriptionState] = []
+      for await state in updates { states.append(state) }
+      return states
+    }
+    _ = try await coordinator.start()
+    _ = try await coordinator.renew()
+    #expect(await transport.requests.filter { $0.httpMethod == "POST" }.count == 5)
+    #expect(await clock.delays == [.seconds(1), .seconds(2), .seconds(4)])
+    #expect(await coordinator.state == .streaming(.beginning))
+    try await coordinator.stop()
+    let states = await stateTask.value
+    #expect(
+      states.contains {
+        if case .waitingToRetry(operation: "renew", attempt: 1, delay: _) = $0 { return true }
+        return false
+      })
+    #expect(!states.contains { if case .failed = $0 { return true }; return false })
+  }
+
   @Test func releaseRetriesResponseLossAndTreats404AsSuccess() async throws {
     let transport = ReleaseRetryTransport()
     let clock = RecordingClock()
@@ -679,6 +775,48 @@ struct ShapeSubscriptionCoordinatorTests {
     let deletes = await transport.requests.filter { $0.httpMethod == "DELETE" }
     #expect(deletes.count == 2)
     try await coordinator.stop()
+  }
+
+  @Test func staleAdoptedReplacementDoesNotUseTheOldSnapshot() async throws {
+    let transport = StaleAdoptionTransport()
+    let old = ShapeHandle(
+      response: ShapeResponse(
+        shapeId: "s1", table: "public.items", streamPath: "/v1/streams/s1",
+        streamURL: URL(string: "https://streams.test/s1")!, subscription: "stable-claim",
+        leaseSeconds: 1))
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "stable-claim"),
+      materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0),
+      adopting: AdoptedShapeHandle(handle: old, mintedAt: .now - .seconds(10)))
+    await #expect(throws: (any Error).self) { _ = try await coordinator.start() }
+    #expect(await transport.requests.filter { $0.httpMethod == "POST" }.count == 1)
+    let deletes = await transport.requests.filter { $0.httpMethod == "DELETE" }
+    #expect(deletes.count == 2)
+    #expect(deletes.contains { $0.url?.path == "/v1/shapes/s1" })
+    #expect(deletes.contains { $0.url?.path == "/v1/shapes/s2" })
+    #expect(await coordinator.state != .streaming(.beginning))
+  }
+
+  @Test func failedAdoptedStartReleasesThePendingClaim() async throws {
+    let transport = CancellationTransport()
+    let old = ShapeHandle(
+      response: ShapeResponse(
+        shapeId: "s1", table: "public.items", streamPath: "/v1/streams/s1",
+        streamURL: URL(string: "https://streams.test/s1")!, subscription: "stable-claim"))
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "stable-claim"),
+      materializer: UnavailableCursorMaterializer(),
+      adopting: AdoptedShapeHandle(handle: old))
+
+    await #expect(throws: ShapeSubscriptionFailure.materializer) { _ = try await coordinator.start() }
+    try await coordinator.stop()
+    #expect(await transport.requests.map(\.httpMethod) == ["DELETE"])
   }
 
   @Test func stopWaitsForRenewResponseAndCompensatesLandedClaim() async throws {

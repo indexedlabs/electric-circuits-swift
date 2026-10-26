@@ -66,6 +66,11 @@ private actor NativeSubsetTransport: HTTPTransport {
     requests.append(request)
     let path = request.url?.path ?? ""
     switch (request.httpMethod, path) {
+    case ("POST", "/v1/subsets/load"):
+      let page = queryBodies.count > 1 ? queryBodies.removeFirst() : queryBodies[0]
+      return response(
+        #"{"shapeId":"shape-1","table":"public.issues","streamPath":"/streams/shape-1","streamUrl":"https://streams.test/streams/shape-1","leaseSeconds":300,"offset":"10",\#(page.dropFirst())"#,
+        request: request)
     case ("POST", "/v1/subset-feeds"):
       return response(
         #"{"shapeId":"shape-1","table":"public.issues","streamPath":"/streams/shape-1","streamUrl":"https://streams.test/streams/shape-1"}"#,
@@ -186,7 +191,14 @@ private func goneResponse(
 
 private actor SubsetRecreateClock: ShapeSubscriptionClock {
   private(set) var delays: [Duration] = []
-  func sleep(for duration: Duration) async throws { delays.append(duration) }
+  func sleep(for duration: Duration) async throws {
+    delays.append(duration)
+    // Lease renewals use a seconds-long cadence; keep those sleeps pending until the owning
+    // session is stopped so a test clock cannot turn the lease loop into a busy renewal storm.
+    if duration >= .seconds(10) {
+      try await Task.sleep(for: .seconds(3_600))
+    }
+  }
 }
 
 private actor AppliedNativeBatches {
@@ -337,6 +349,8 @@ struct CircuitsSubsetSourceTests {
     let subsetCreates = requests.filter {
       $0.httpMethod == "POST" && $0.url?.path == "/v1/subset-feeds"
     }
+    // Main's three-request setup creates the feed for the snapshot and again when the coordinator
+    // starts its tail.
     #expect(subsetCreates.count == 2)
     #expect(requests.contains { $0.httpMethod == "HEAD" && $0.url?.path == "/streams/shape-1" })
     #expect(requests.contains { $0.httpMethod == "POST" && $0.url?.path == "/v1/subsets/query" })
@@ -555,14 +569,49 @@ struct CircuitsSubsetSourceTests {
     #expect(feedBodies.allSatisfy { $0.where == nil })
   }
 
+  @Test func limitedOneRequestLoadSeedsThenConvergesAfterAnEdgeCrossingChange() async throws {
+    let clock = SubsetRecreateClock()
+    let transport = NativeSubsetTransport(
+      streamBodies: [
+        #"[{"type":"public.issues","key":"2","value":{"id":2,"title":"Newer"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#
+      ],
+      queryBodies: [
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/10"}"#,
+        #"{"rows":[{"id":2,"title":"Newer"}],"lsn":"0/21"}"#,
+      ]
+    )
+    let session = try await materializeLimited(
+      makeLimitedSource(transport, clock: clock, subsetSetup: .oneRequest))
+    #expect(session.snapshot.rows == [NativeIssue(id: 1, title: "Snapshot")])
+
+    let batches = try await collectBatches(session, count: 1)
+    let batch = try #require(batches.first)
+    #expect(batch.changes.count == 2)
+    #expect(batch.sourceVersion == .init(rawValue: "0/21", order: 33))
+    for _ in 0..<100 {
+      if await transport.requests.contains(where: { $0.httpMethod == "GET" }) { break }
+      await Task.yield()
+    }
+    let calls = (await transport.requests).map { "\($0.httpMethod ?? "") \($0.url?.path ?? "")" }
+    #expect(Array(calls.prefix(2)) == ["POST /v1/subsets/load", "GET /streams/shape-1"])
+    #expect(calls.filter { $0 == "POST /v1/subsets/query" }.count == 1)
+    #expect(calls.filter { $0 == "POST /v1/subset-feeds" }.isEmpty)
+    let load = try #require(await transport.requests.first { $0.url?.path == "/v1/subsets/load" })
+    let body = try JSONDecoder().decode(SubsetLoadRequest.self, from: #require(load.httpBody))
+    #expect(body.orderBy == SubsetOrderBy(column: "modified_at", descending: true))
+    #expect(body.limit == 1)
+  }
+
   /// A limited source over `public.issues` with a recording clock and a short retry budget, so
   /// window retries are observable without sleeping.
   private func makeLimitedSource(
-    _ transport: NativeSubsetTransport, clock: SubsetRecreateClock, maxRetries: Int = 3
+    _ transport: NativeSubsetTransport, clock: SubsetRecreateClock, maxRetries: Int = 3,
+    subsetSetup: ElectricCircuitsClient.Configuration.SubsetSetup = .threeRequests
   ) -> CircuitsSubsetSource<NativeIssue, Int64> {
     CircuitsSubsetSource<NativeIssue, Int64>(
       client: ElectricCircuitsClient(
-        baseURL: URL(string: "https://engine.test")!, transport: transport),
+        baseURL: URL(string: "https://engine.test")!, transport: transport,
+        configuration: .init(subsetSetup: subsetSetup)),
       transport: transport,
       table: "public.issues",
       retryPolicy: ShapeSubscriptionRetryPolicy(
@@ -630,7 +679,8 @@ struct CircuitsSubsetSourceTests {
         #"{"rows":[{"id":2,"title":"Newer"}],"lsn":"0/21"}"#,
       ]
     )
-    let session = try await materializeLimited(makeLimitedSource(transport, clock: clock))
+    let session = try await materializeLimited(
+      makeLimitedSource(transport, clock: clock, subsetSetup: .oneRequest))
 
     let batch = try #require(try await collectBatches(session, count: 1).first)
 
@@ -643,8 +693,14 @@ struct CircuitsSubsetSourceTests {
     #expect(entered == NativeIssue(id: 2, title: "Newer"))
     #expect(version == .init(rawValue: "0/21", order: 33))
     let pageQueries = await transport.requests.filter { $0.url?.path == "/v1/subsets/query" }
-    #expect(pageQueries.count == 3)
-    #expect(await clock.delays.count == 1)
+    #expect(pageQueries.count == 2)
+    let delays = await clock.delays
+    #expect(delays.filter { $0 < .seconds(10) }.count == 1)
+    #expect(delays.filter { $0 >= .seconds(10) }.count == 1)
+    #expect(
+      await transport.requests.filter {
+        $0.httpMethod == "POST" && $0.url?.path == "/v1/subset-feeds"
+      }.isEmpty)
   }
 
   /// A page that never catches up must not be applied: the window gives up with `stalePage`
@@ -1047,5 +1103,361 @@ struct CircuitsSubsetSourceTests {
     #expect(record.sourceVersion == CollectionSourceVersion(rawValue: "0/10", order: 16))
     #expect(await transport.requests.contains { $0.httpMethod == "DELETE" })
     try await lease.release()
+  }
+}
+
+/// Serves the gateway subset-load route as well as the three setup routes, so one-round-trip and three-request
+/// setups can be compared over the same data.
+private actor LoadingSubsetTransport: HTTPTransport {
+  private(set) var requests: [URLRequest] = []
+  private var goneLoads: Int
+  private var malformedLoads: Int
+  private var invalidPageLoads: Int
+  private let loadStatus: Int?
+  private let loadDelay: Duration
+  private let leaseSeconds: Int?
+  private let omitLease: Bool
+  private var goneStreamReads: Int
+  private var streamBodies: [String]
+  private var streamReads = 0
+
+  static let shape =
+    #""shapeId":"shape-1","table":"public.issues","streamPath":"/streams/shape-1","streamUrl":"https://streams.test/streams/shape-1""#
+  static let page =
+    #""rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/10","snapshot":"100:110:105","horizon":"0/18""#
+
+  init(
+    goneLoads: Int = 0,
+    malformedLoads: Int = 0,
+    invalidPageLoads: Int = 0,
+    loadStatus: Int? = nil,
+    loadDelay: Duration = .zero,
+    leaseSeconds: Int? = nil,
+    omitLease: Bool = false,
+    goneStreamReads: Int = 0,
+    streamBodies: [String] = [
+      #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"Live"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#
+    ]
+  ) {
+    self.goneLoads = goneLoads
+    self.malformedLoads = malformedLoads
+    self.invalidPageLoads = invalidPageLoads
+    self.loadStatus = loadStatus
+    self.loadDelay = loadDelay
+    self.leaseSeconds = leaseSeconds
+    self.omitLease = omitLease
+    self.goneStreamReads = goneStreamReads
+    self.streamBodies = streamBodies
+  }
+
+  /// `METHOD /path` for every request, in order.
+  var calls: [String] { requests.map { "\($0.httpMethod ?? "") \($0.url?.path ?? "")" } }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    switch (request.httpMethod, request.url?.path ?? "") {
+    case ("POST", "/v1/subsets/load"):
+      if loadDelay > .zero { try await Task.sleep(for: loadDelay) }
+      if let loadStatus { return reply("invalid", request: request, status: loadStatus) }
+      if goneLoads > 0 {
+        goneLoads -= 1
+        return reply("gone", request: request, status: 410)
+      }
+      if malformedLoads > 0 {
+        // The claim exists on the server, but the page the client receives is unusable.
+        malformedLoads -= 1
+        return reply("{\(Self.shape),\"leaseSeconds\":30,\"offset\":\"10\",\"rows\":\"bad\"}", request: request)
+      }
+      if invalidPageLoads > 0 {
+        invalidPageLoads -= 1
+        return reply("{\(Self.shape),\"leaseSeconds\":30,\"offset\":\"10\",\"rows\":[1],\"lsn\":\"0/10\"}", request: request)
+      }
+      let lease = omitLease ? "" : ",\"leaseSeconds\":\(leaseSeconds ?? 300)"
+      return reply("{\(Self.shape)\(lease),\"offset\":\"10\",\(Self.page)}", request: request)
+    case ("POST", "/v1/subset-feeds"):
+      return reply("{\(Self.shape)}", request: request)
+    case ("HEAD", "/streams/shape-1"):
+      return reply("", request: request, headers: ["stream-next-offset": "10"])
+    case ("POST", "/v1/subsets/query"):
+      return reply("{\(Self.page)}", request: request)
+    case ("GET", "/streams/shape-1"):
+      if goneStreamReads > 0 {
+        goneStreamReads -= 1
+        return reply("gone", request: request, status: 410)
+      }
+      streamReads += 1
+      if !streamBodies.isEmpty {
+        return reply(
+          streamBodies.removeFirst(), request: request,
+          headers: ["stream-next-offset": "\(10 + streamReads)"])
+      }
+      try await Task.sleep(for: .seconds(3_600))
+      throw CancellationError()
+    case ("DELETE", "/v1/shapes/shape-1"):
+      return reply("", request: request, status: 204)
+    default:
+      return reply("unexpected", request: request, status: 500)
+    }
+  }
+
+  private func reply(
+    _ body: String, request: URLRequest, status: Int = 200, headers: [String: String] = [:]
+  ) -> HTTPResponse {
+    HTTPResponse(
+      data: Data(body.utf8),
+      response: HTTPURLResponse(
+        url: request.url!, statusCode: status, httpVersion: nil, headerFields: headers)!)
+  }
+}
+
+@Suite("One-round-trip subset setup")
+struct SubsetLoadSetupTests {
+  private let definition = CollectionDefinition<NativeIssue, Int64>(
+    id: CollectionID(rawValue: "issues"), key: \.id)
+  private let scope = CollectionScope(principal: "u", authorization: "a", generation: "g")
+
+  private func source(
+    _ transport: any HTTPTransport,
+    subsetSetup: ElectricCircuitsClient.Configuration.SubsetSetup = .threeRequests,
+    keyForRow: (@Sendable (NativeIssue) throws -> Int64)? = nil,
+    clock: (any ShapeSubscriptionClock)? = nil
+  ) -> CircuitsSubsetSource<NativeIssue, Int64> {
+    let effectiveClock: any ShapeSubscriptionClock =
+      clock ?? (subsetSetup == .oneRequest
+        ? ContinuousShapeSubscriptionClock() : SubsetRecreateClock())
+    return CircuitsSubsetSource<NativeIssue, Int64>(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport,
+        configuration: .init(subsetSetup: subsetSetup)),
+      transport: transport,
+      table: "public.issues",
+      columns: ["id", "title"],
+      retryPolicy: ShapeSubscriptionRetryPolicy(maxRetries: 0),
+      clock: effectiveClock,
+      decodeRow: NativeIssue.init(row:),
+      decodeKey: { key in
+        guard let id = Int64(key) else { throw CircuitsSubsetSourceError.invalidLiveKey(key) }
+        return id
+      },
+      keyForRow: keyForRow
+    )
+  }
+
+  private func materialize(
+    _ source: CircuitsSubsetSource<NativeIssue, Int64>, id: String = "issues-open",
+    demand: CollectionDemand<NativeIssue>? = nil
+  ) async throws -> CollectionSourceSession<NativeIssue, Int64> {
+    let demand =
+      demand
+      ?? CollectionDemand<NativeIssue>(
+        unsafePredicateIdentity: "status=open",
+        sourcePredicate: .leaf(column: "status", op: .eq, value: .string("open")))
+    return try await source.materialize(
+      demand, identity: demand.identity(for: definition, scope: scope),
+      materializationID: CollectionMaterializationID(rawValue: id))
+  }
+
+  /// Setup is one request, and the session's first request is the long-poll from the loaded
+  /// offset: no stream HEAD, no snapshot query, and no second POST of the feed's claim.
+  @Test func setupIsOneLoadThenTheTailLongPollsFromItsOffset() async throws {
+    let transport = LoadingSubsetTransport()
+    let session = try await materialize(source(transport, subsetSetup: .oneRequest))
+    #expect(session.snapshot.rows == [NativeIssue(id: 1, title: "Snapshot")])
+    #expect(session.snapshot.cursor == StreamCursor(offset: "10", lsn: "0/10"))
+
+    let applied = AppliedNativeBatches()
+    let run = Task { try await session.run { batch in await applied.append(batch) } }
+    for _ in 0..<10_000 {
+      if await applied.values().count == 1 { break }
+      await Task.yield()
+    }
+    let batch = try #require(await applied.values().first)
+    #expect(batch.expectedCursor == StreamCursor(offset: "10", lsn: "0/10"))
+    try await session.stop()
+    try await run.value
+
+    let calls = await transport.calls
+    let requests = await transport.requests
+    #expect(Array(calls.prefix(2)) == ["POST /v1/subsets/load", "GET /streams/shape-1"])
+    #expect(requests.first?.url?.path == "/v1/subsets/load")
+    #expect(!calls.contains("HEAD /streams/shape-1"))
+    #expect(!calls.contains("POST /v1/subset-feeds"))
+    #expect(!calls.contains("POST /v1/subsets/query"))
+    let firstRead = try #require(requests.first { $0.httpMethod == "GET" })
+    let items = URLComponents(url: firstRead.url!, resolvingAgainstBaseURL: false)?.queryItems
+    #expect(items?.first { $0.name == "offset" }?.value == "10")
+    let load = try #require(requests.first?.httpBody)
+    #expect(!String(data: load, encoding: .utf8)!.contains("\"query\""))
+    let body = try JSONDecoder().decode(SubsetLoadRequest.self, from: load)
+    #expect(body.subscription == "issues-open")
+    #expect(body.where == .leaf(column: "status", op: .eq, value: .string("open")))
+  }
+
+  /// The load returns exactly what the three requests return for the same feed, so the snapshot
+  /// rows, fence, source version and cursor are identical either way.
+  @Test func loadedSnapshotFencesExactlyLikeTheThreeRequests() async throws {
+    let loaded = try await materialize(
+      source(LoadingSubsetTransport(), subsetSetup: .oneRequest))
+    let threeTransport = LoadingSubsetTransport()
+    let three = try await materialize(source(threeTransport, subsetSetup: .threeRequests))
+    #expect(
+      Array(await threeTransport.calls.prefix(3)) == [
+        "POST /v1/subset-feeds", "HEAD /streams/shape-1", "POST /v1/subsets/query",
+      ])
+    #expect(loaded.snapshot.rows == three.snapshot.rows)
+    #expect(loaded.snapshot.fence == three.snapshot.fence)
+    #expect(loaded.snapshot.sourceVersion == three.snapshot.sourceVersion)
+    #expect(loaded.snapshot.cursor == three.snapshot.cursor)
+    try await loaded.stop()
+    try await three.stop()
+  }
+
+  /// Three-request mode remains the default and does not touch the gateway-only route.
+  @Test func threeRequestModeMatchesMainIncludingCoordinatorCreate() async throws {
+    let transport = LoadingSubsetTransport()
+    let source = self.source(transport)
+    let session = try await materialize(source)
+    let run = Task { try await session.run { _ in } }
+    for _ in 0..<10_000 {
+      if (await transport.requests).contains(where: { $0.httpMethod == "GET" }) { break }
+      await Task.yield()
+    }
+    try await session.stop()
+    _ = try? await run.value
+    #expect(Array((await transport.calls).prefix(5)) == [
+      "POST /v1/subset-feeds", "HEAD /streams/shape-1", "POST /v1/subsets/query",
+      "POST /v1/subset-feeds", "GET /streams/shape-1"
+    ])
+    try await session.stop()
+  }
+
+  /// A failed gateway load leaves its claim to the lease; setup does not recover it with another
+  /// feed POST or DELETE (except a malformed lease-less response, which is released immediately).
+  @Test func aRejectedLoadResponseDoesNotDeleteItsClaim() async throws {
+    let transport = LoadingSubsetTransport(malformedLoads: 1)
+    let source = self.source(transport, subsetSetup: .oneRequest)
+    await #expect(throws: (any Error).self) {
+      _ = try await materialize(source)
+    }
+    let calls = await transport.calls
+    #expect(calls == ["POST /v1/subsets/load"])
+  }
+
+  @Test func oneRequestLoadRequiresALease() async throws {
+    let transport = LoadingSubsetTransport(omitLease: true)
+    await #expect(throws: (any Error).self) {
+      _ = try await materialize(source(transport, subsetSetup: .oneRequest))
+    }
+    #expect(await transport.calls == ["POST /v1/subsets/load", "DELETE /v1/shapes/shape-1"])
+  }
+
+  @Test func aLoadedPageThatCannotDecodeStillDoesNotDeleteItsClaim() async throws {
+    let transport = LoadingSubsetTransport(invalidPageLoads: 1)
+    await #expect(throws: (any Error).self) {
+      _ = try await materialize(source(transport, subsetSetup: .oneRequest))
+    }
+    #expect(await transport.calls == ["POST /v1/subsets/load"])
+  }
+
+  /// A 4xx load has no client-side recovery; any gateway-side claim remains lease-bound.
+  @Test func invalidCombinedLoadLeavesNoFeedClaim() async throws {
+    let transport = LoadingSubsetTransport(loadStatus: 400)
+    await #expect(throws: (any Error).self) {
+      _ = try await materialize(source(transport, subsetSetup: .oneRequest))
+    }
+    #expect(await transport.calls == ["POST /v1/subsets/load"])
+  }
+
+  /// A `410` on the load is the engine's exhausted fall-through, answered as for a feed create:
+  /// the identical load is POSTed again.
+  @Test func goneOnTheLoadRepeatsTheIdenticalLoad() async throws {
+    let transport = LoadingSubsetTransport(goneLoads: 1)
+    let session = try await materialize(source(transport, subsetSetup: .oneRequest))
+    #expect(session.snapshot.cursor == StreamCursor(offset: "10", lsn: "0/10"))
+    let loads = await transport.requests.filter { $0.url?.path == "/v1/subsets/load" }
+    #expect(loads.count == 2)
+    #expect(Set(loads.compactMap(\.httpBody)).count == 1)
+    #expect(!(await transport.calls).contains("POST /v1/subset-feeds"))
+    try await session.stop()
+  }
+
+  /// A slow combined response is stamped when its request starts. With a two-second lease, the
+  /// coordinator therefore renews the adopted claim before starting its tail.
+  @Test func slowLoadRenewsAFiniteLeaseBeforeStartingTheTail() async throws {
+    let transport = LoadingSubsetTransport(
+      loadDelay: .milliseconds(1_200), leaseSeconds: 2,
+      streamBodies: [])
+    let session = try await materialize(
+      source(transport, subsetSetup: .oneRequest, clock: ContinuousShapeSubscriptionClock()))
+    let run = Task { try await session.run { _ in } }
+    for _ in 0..<10_000 {
+      if (await transport.calls).contains("GET /streams/shape-1") { break }
+      await Task.yield()
+    }
+    let calls = await transport.calls
+    let renew = try #require(calls.firstIndex(of: "POST /v1/subset-feeds"))
+    let tail = try #require(calls.firstIndex(of: "GET /streams/shape-1"))
+    #expect(renew < tail)
+    try await session.stop()
+    run.cancel()
+    _ = try? await run.value
+  }
+
+  /// A feed that is gone mid-tail ends the session; setting it up again is one load.
+  @Test func aFeedGoneMidTailIsSetUpAgainWithOneLoad() async throws {
+    let transport = LoadingSubsetTransport(goneStreamReads: 1, streamBodies: [])
+    let source = self.source(transport, subsetSetup: .oneRequest)
+    let session = try await materialize(source)
+    await #expect(throws: (any Error).self) {
+      try await session.run { _ in }
+    }
+    let before = await transport.requests.count
+    let again = try await materialize(source)
+    let after = Array(await transport.calls.dropFirst(before))
+    #expect(after.first == "POST /v1/subsets/load")
+    #expect(after.filter { $0 == "POST /v1/subsets/load" }.count == 1)
+    #expect(!after.contains("HEAD /streams/shape-1"))
+    #expect(!after.contains("POST /v1/subsets/query"))
+    try await again.stop()
+  }
+
+  /// Limited windows stay on the three-request path; its query keeps the sort-key requirement.
+  @Test func aLimitedWindowUsesTheThreeRequestSetup() async throws {
+    let transport = LoadingSubsetTransport()
+    let demand = CollectionDemand<NativeIssue>(
+      unsafePredicateIdentity: "recent",
+      order: [
+        CollectionOrder(
+          unsafeFieldID: "modified", sourceName: "modified_at", direction: .descending)
+      ],
+      limit: 1)
+    let session = try await materialize(
+      source(transport, subsetSetup: .threeRequests, keyForRow: \.id), demand: demand)
+    #expect(Array((await transport.calls).prefix(3)) == [
+      "POST /v1/subset-feeds", "HEAD /streams/shape-1", "POST /v1/subsets/query"
+    ])
+    let query = try #require(
+      await transport.requests.first { $0.url?.path == "/v1/subsets/query" }?.httpBody)
+    let body = try JSONDecoder().decode(SubsetQuery.self, from: query)
+    #expect(body.limit == 1)
+    #expect(body.orderBy == SubsetOrderBy(column: "modified_at", descending: true))
+    #expect(body.where == .and([.isNull(column: "modified_at", isNull: false)]))
+    try await session.stop()
+  }
+
+  @Test func anOrderedUnboundedDemandUsesTheThreeRequestSetup() async throws {
+    let transport = LoadingSubsetTransport()
+    let demand = CollectionDemand<NativeIssue>(
+      unsafePredicateIdentity: "ordered",
+      order: [
+        CollectionOrder(
+          unsafeFieldID: "modified", sourceName: "modified_at", direction: .descending)
+      ])
+    let session = try await materialize(
+      source(transport, subsetSetup: .oneRequest), demand: demand)
+    #expect(Array((await transport.calls).prefix(3)) == [
+      "POST /v1/subset-feeds", "HEAD /streams/shape-1", "POST /v1/subsets/query"
+    ])
+    try await session.stop()
   }
 }
