@@ -1337,15 +1337,13 @@ struct SubsetLoadSetupTests {
       source(transport, subsetSetup: .oneRequest, clock: ContinuousShapeSubscriptionClock()))
     let run = Task { try await session.run { _ in } }
     for _ in 0..<10_000 {
-      if (await transport.requests).contains(where: { $0.url?.path == "/v1/subset-feeds" }) {
-        break
-      }
+      if (await transport.calls).contains("GET /streams/shape-1") { break }
       await Task.yield()
     }
-    #expect(
-      (await transport.requests).contains(where: { $0.url?.path == "/v1/subset-feeds" }))
     let calls = await transport.calls
-    #expect(calls.firstIndex(of: "POST /v1/subset-feeds")! < calls.firstIndex(of: "GET /streams/shape-1")!)
+    let renew = try #require(calls.firstIndex(of: "POST /v1/subset-feeds"))
+    let tail = try #require(calls.firstIndex(of: "GET /streams/shape-1"))
+    #expect(renew < tail)
     try await session.stop()
     run.cancel()
     _ = try? await run.value
