@@ -694,7 +694,13 @@ struct CircuitsSubsetSourceTests {
     #expect(version == .init(rawValue: "0/21", order: 33))
     let pageQueries = await transport.requests.filter { $0.url?.path == "/v1/subsets/query" }
     #expect(pageQueries.count == 2)
-    #expect(await clock.delays.count == 1)
+    let delays = await clock.delays
+    #expect(delays.filter { $0 < .seconds(10) }.count == 1)
+    #expect(delays.filter { $0 >= .seconds(10) }.count == 1)
+    #expect(
+      await transport.requests.filter {
+        $0.httpMethod == "POST" && $0.url?.path == "/v1/subset-feeds"
+      }.isEmpty)
   }
 
   /// A page that never catches up must not be applied: the window gives up with `stalePage`
