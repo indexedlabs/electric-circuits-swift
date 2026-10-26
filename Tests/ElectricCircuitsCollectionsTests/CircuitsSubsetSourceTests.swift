@@ -1252,15 +1252,21 @@ struct SubsetLoadSetupTests {
   }
 
   /// Three-request mode remains the default and does not touch the gateway-only route.
-  @Test func threeRequestModeRemainsThreeCalls() async throws {
-    let transport = NativeSubsetTransport()
+  @Test func threeRequestModeMatchesMainIncludingCoordinatorCreate() async throws {
+    let transport = LoadingSubsetTransport()
     let source = self.source(transport)
     let session = try await materialize(source)
-    let requests = await transport.requests
-    #expect(Array(requests.prefix(3)).map { $0.httpMethod! + " " + $0.url!.path } == [
-      "POST /v1/subset-feeds", "HEAD /streams/shape-1", "POST /v1/subsets/query"
+    let run = Task { try await session.run { _ in } }
+    for _ in 0..<10_000 {
+      if (await transport.requests).contains(where: { $0.httpMethod == "GET" }) { break }
+      await Task.yield()
+    }
+    try await session.stop()
+    _ = try? await run.value
+    #expect(Array((await transport.calls).prefix(5)) == [
+      "POST /v1/subset-feeds", "HEAD /streams/shape-1", "POST /v1/subsets/query",
+      "POST /v1/subset-feeds", "GET /streams/shape-1"
     ])
-    #expect(!requests.contains { $0.url?.path == "/v1/subset-loads" })
     try await session.stop()
   }
 

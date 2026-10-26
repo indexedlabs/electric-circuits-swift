@@ -119,19 +119,19 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     let loaded = try await loadIfConfigured(
       feedRequest: feedRequest, pageQuery: pageQuery)
     let feed: ShapeHandle
-    let mintedAt: ContinuousClock.Instant
+    let adopted: AdoptedShapeHandle?
     if let loaded {
       feed = loaded.load.handle
-      mintedAt = loaded.mintedAt
+      adopted = AdoptedShapeHandle(handle: feed, mintedAt: loaded.mintedAt)
     } else {
-      // Stamp before the fallback request starts so a slow create can only make the adopted
-      // handle look older.
-      mintedAt = .now
       feed = try await recreatePolicy.recreatingOnGone(clock: clock) {
         try await client.createSubsetFeed(feedRequest)
       }
+      // Three-request setup deliberately does not adopt this handle: the coordinator repeats the
+      // feed POST, preserving main's lifecycle and letting the configuration flag fully revert
+      // the one-request optimization.
+      adopted = nil
     }
-    let adopted = AdoptedShapeHandle(handle: feed, mintedAt: mintedAt)
 
     do {
       let frontier: StreamCursor

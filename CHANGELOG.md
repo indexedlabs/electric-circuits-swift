@@ -14,6 +14,7 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   `SubsetLoadRequest`, `SubsetLoad`, `ElectricCircuitsClient.loadSubset(_:)`,
   `ElectricCircuitsClient.Configuration`/`SubsetSetup`, its `configuration` property and init
   parameter, `AdoptedShapeHandle`, and `ShapeSubscriptionCoordinator.init(adopting:)`.
+  Renewal retry behavior is unconditional and has no configuration switch.
 
 ## 0.7.1
 
