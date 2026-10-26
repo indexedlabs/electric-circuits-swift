@@ -1293,7 +1293,7 @@ struct SubsetLoadSetupTests {
     await #expect(throws: (any Error).self) {
       _ = try await materialize(source(transport, subsetSetup: .oneRequest))
     }
-    #expect(await transport.calls == ["POST /v1/subset-loads"])
+    #expect(await transport.calls == ["POST /v1/subset-loads", "DELETE /v1/shapes/shape-1"])
   }
 
   @Test func aLoadedPageThatCannotDecodeStillDoesNotDeleteItsClaim() async throws {
@@ -1304,7 +1304,7 @@ struct SubsetLoadSetupTests {
     #expect(await transport.calls == ["POST /v1/subset-loads"])
   }
 
-  /// A 4xx load has no client-side recovery or DELETE; any gateway-side claim remains lease-bound.
+  /// A 4xx load has no client-side recovery; any gateway-side claim remains lease-bound.
   @Test func invalidCombinedLoadLeavesNoFeedClaim() async throws {
     let transport = LoadingSubsetTransport(loadStatus: 400)
     await #expect(throws: (any Error).self) {
@@ -1326,11 +1326,11 @@ struct SubsetLoadSetupTests {
     try await session.stop()
   }
 
-  /// A slow combined response is stamped when its request starts. With a one-second lease, the
+  /// A slow combined response is stamped when its request starts. With a two-second lease, the
   /// coordinator therefore renews the adopted claim before starting its tail.
   @Test func slowLoadRenewsAFiniteLeaseBeforeStartingTheTail() async throws {
     let transport = LoadingSubsetTransport(
-      loadDelay: .milliseconds(500), leaseSeconds: 1,
+      loadDelay: .milliseconds(1_200), leaseSeconds: 2,
       streamBodies: [])
     let session = try await materialize(
       source(transport, subsetSetup: .oneRequest, clock: ContinuousShapeSubscriptionClock()))
