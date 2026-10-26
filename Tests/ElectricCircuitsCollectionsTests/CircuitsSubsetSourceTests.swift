@@ -69,7 +69,7 @@ private actor NativeSubsetTransport: HTTPTransport {
     case ("POST", "/v1/subsets/load"):
       let page = queryBodies.count > 1 ? queryBodies.removeFirst() : queryBodies[0]
       return response(
-        #"{"shapeId":"shape-1","table":"public.issues","streamPath":"/streams/shape-1","streamUrl":"https://streams.test/streams/shape-1","leaseSeconds":300,"offset":"10",\#(page.dropFirst())}"#,
+        #"{"shapeId":"shape-1","table":"public.issues","streamPath":"/streams/shape-1","streamUrl":"https://streams.test/streams/shape-1","leaseSeconds":300,"offset":"10",\#(page.dropFirst())"#,
         request: request)
     case ("POST", "/v1/subset-feeds"):
       return response(
