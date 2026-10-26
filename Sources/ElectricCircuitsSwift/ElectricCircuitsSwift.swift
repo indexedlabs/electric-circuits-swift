@@ -302,24 +302,28 @@ public struct SubsetResponse: Codable, Equatable, Sendable {
   }
 }
 
-/// The gateway's `POST /sync/v1/subset-loads` route (the client path is relative to the configured
+/// The gateway's `POST /sync/v1/subsets/load` route (the client path is relative to the configured
 /// `/sync/` base URL) creates or renews a changes-only feed, reads its stream frontier, and queries
 /// its snapshot page in that order. The gateway authorizes the feed predicate once and applies it
-/// to both the feed and page query. Its body contains only the feed fields; limited windows use
-/// the established three-request setup in this SDK version.
+/// to both the feed and page query. When present, `orderBy` and `limit` must be supplied together;
+/// the gateway adds the page's non-NULL order-key predicate.
 public struct SubsetLoadRequest: Codable, Equatable, Sendable {
   public var table: String
   public var `where`: Predicate?
   public var columns: [String]?
   public var subscription: String
+  public var orderBy: SubsetOrderBy?
+  public var limit: Int?
   public init(
     table: String, where predicate: Predicate? = nil, columns: [String]? = nil,
-    subscription: String
+    subscription: String, orderBy: SubsetOrderBy? = nil, limit: Int? = nil
   ) {
     self.table = table
     self.where = predicate
     self.columns = columns
     self.subscription = subscription
+    self.orderBy = orderBy
+    self.limit = limit
   }
 }
 
@@ -337,7 +341,7 @@ public struct SubsetLoad: Equatable, Sendable {
   }
 }
 
-/// The wire response of `POST sync/v1/subset-loads`: the shape fields, `offset`, and page fields
+/// The wire response of `POST sync/v1/subsets/load`: the shape fields, `offset`, and page fields
 /// side by side in one object.
 private struct SubsetLoadResponse: Decodable {
   let shape: ShapeResponse
@@ -694,7 +698,7 @@ public actor ElectricCircuitsClient {
   /// in three. This route is selected explicitly in `Configuration`; it is never probed.
   public func loadSubset(_ request: SubsetLoadRequest) async throws -> SubsetLoad {
     let wire: SubsetLoadResponse = try await send(
-      path: "v1/subset-loads", method: "POST", body: request)
+      path: "v1/subsets/load", method: "POST", body: request)
     var shape = wire.shape
     if let echoed = shape.subscription, echoed != request.subscription {
       throw ClientError.decoding("subset load response subscription does not match request")

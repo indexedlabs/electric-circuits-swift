@@ -259,15 +259,16 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     feedRequest: ShapeRequest, pageQuery: SubsetQuery
   ) async throws -> LoadedSubset? {
     let configuration = await client.configuration
-    guard configuration.subsetSetup == .oneRequest,
-      pageQuery.limit == nil, pageQuery.orderBy == nil
-    else { return nil }
+    guard configuration.subsetSetup == .oneRequest else { return nil }
+    guard (pageQuery.limit == nil) == (pageQuery.orderBy == nil) else { return nil }
     guard let subscription = feedRequest.subscription else { return nil }
     let request = SubsetLoadRequest(
       table: table,
       where: feedRequest.where,
       columns: columns,
-      subscription: subscription)
+      subscription: subscription,
+      orderBy: pageQuery.orderBy,
+      limit: pageQuery.limit)
     // Stamp before sending: the response includes the page and may consume much of the lease.
     // A failure after the gateway creates the feed, including authority_changed, leaves that
     // lease-bounded claim to expire; a later materialization retries this subscription.

@@ -66,6 +66,11 @@ private actor NativeSubsetTransport: HTTPTransport {
     requests.append(request)
     let path = request.url?.path ?? ""
     switch (request.httpMethod, path) {
+    case ("POST", "/v1/subsets/load"):
+      let page = queryBodies.count > 1 ? queryBodies.removeFirst() : queryBodies[0]
+      return response(
+        #"{"shapeId":"shape-1","table":"public.issues","streamPath":"/streams/shape-1","streamUrl":"https://streams.test/streams/shape-1","leaseSeconds":300,"offset":"10",\#(page.dropFirst())}"#,
+        request: request)
     case ("POST", "/v1/subset-feeds"):
       return response(
         #"{"shapeId":"shape-1","table":"public.issues","streamPath":"/streams/shape-1","streamUrl":"https://streams.test/streams/shape-1"}"#,
@@ -557,14 +562,44 @@ struct CircuitsSubsetSourceTests {
     #expect(feedBodies.allSatisfy { $0.where == nil })
   }
 
+  @Test func limitedOneRequestLoadSeedsThenConvergesAfterAnEdgeCrossingChange() async throws {
+    let clock = SubsetRecreateClock()
+    let transport = NativeSubsetTransport(
+      streamBodies: [
+        #"[{"type":"public.issues","key":"2","value":{"id":2,"title":"Newer"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#
+      ],
+      queryBodies: [
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/10"}"#,
+        #"{"rows":[{"id":2,"title":"Newer"}],"lsn":"0/21"}"#,
+      ]
+    )
+    let session = try await materializeLimited(
+      makeLimitedSource(transport, clock: clock, subsetSetup: .oneRequest))
+    #expect(session.snapshot.rows == [NativeIssue(id: 1, title: "Snapshot")])
+
+    let batches = try await collectBatches(session, count: 1)
+    let batch = try #require(batches.first)
+    #expect(batch.changes.count == 2)
+    #expect(batch.sourceVersion == .init(rawValue: "0/21", order: 33))
+    let calls = await transport.calls
+    #expect(Array(calls.prefix(2)) == ["POST /v1/subsets/load", "GET /streams/shape-1"])
+    #expect(calls.filter { $0 == "POST /v1/subsets/query" }.count == 1)
+    let load = try #require(await transport.requests.first { $0.url?.path == "/v1/subsets/load" })
+    let body = try JSONDecoder().decode(SubsetLoadRequest.self, from: #require(load.httpBody))
+    #expect(body.orderBy == SubsetOrderBy(column: "modified_at", descending: true))
+    #expect(body.limit == 1)
+  }
+
   /// A limited source over `public.issues` with a recording clock and a short retry budget, so
   /// window retries are observable without sleeping.
   private func makeLimitedSource(
-    _ transport: NativeSubsetTransport, clock: SubsetRecreateClock, maxRetries: Int = 3
+    _ transport: NativeSubsetTransport, clock: SubsetRecreateClock, maxRetries: Int = 3,
+    subsetSetup: ElectricCircuitsClient.Configuration.SubsetSetup = .threeRequests
   ) -> CircuitsSubsetSource<NativeIssue, Int64> {
     CircuitsSubsetSource<NativeIssue, Int64>(
       client: ElectricCircuitsClient(
-        baseURL: URL(string: "https://engine.test")!, transport: transport),
+        baseURL: URL(string: "https://engine.test")!, transport: transport,
+        configuration: .init(subsetSetup: subsetSetup)),
       transport: transport,
       table: "public.issues",
       retryPolicy: ShapeSubscriptionRetryPolicy(
@@ -632,7 +667,8 @@ struct CircuitsSubsetSourceTests {
         #"{"rows":[{"id":2,"title":"Newer"}],"lsn":"0/21"}"#,
       ]
     )
-    let session = try await materializeLimited(makeLimitedSource(transport, clock: clock))
+    let session = try await materializeLimited(
+      makeLimitedSource(transport, clock: clock, subsetSetup: .oneRequest))
 
     let batch = try #require(try await collectBatches(session, count: 1).first)
 
@@ -645,7 +681,7 @@ struct CircuitsSubsetSourceTests {
     #expect(entered == NativeIssue(id: 2, title: "Newer"))
     #expect(version == .init(rawValue: "0/21", order: 33))
     let pageQueries = await transport.requests.filter { $0.url?.path == "/v1/subsets/query" }
-    #expect(pageQueries.count == 3)
+    #expect(pageQueries.count == 2)
     #expect(await clock.delays.count == 1)
   }
 
@@ -1102,7 +1138,7 @@ private actor LoadingSubsetTransport: HTTPTransport {
   func send(_ request: URLRequest) async throws -> HTTPResponse {
     requests.append(request)
     switch (request.httpMethod, request.url?.path ?? "") {
-    case ("POST", "/v1/subset-loads"):
+    case ("POST", "/v1/subsets/load"):
       if loadDelay > .zero { try await Task.sleep(for: loadDelay) }
       if let loadStatus { return reply("invalid", request: request, status: loadStatus) }
       if goneLoads > 0 {
@@ -1224,8 +1260,8 @@ struct SubsetLoadSetupTests {
 
     let calls = await transport.calls
     let requests = await transport.requests
-    #expect(Array(calls.prefix(2)) == ["POST /v1/subset-loads", "GET /streams/shape-1"])
-    #expect(requests.first?.url?.path == "/v1/subset-loads")
+    #expect(Array(calls.prefix(2)) == ["POST /v1/subsets/load", "GET /streams/shape-1"])
+    #expect(requests.first?.url?.path == "/v1/subsets/load")
     #expect(!calls.contains("HEAD /streams/shape-1"))
     #expect(!calls.contains("POST /v1/subset-feeds"))
     #expect(!calls.contains("POST /v1/subsets/query"))
@@ -1286,7 +1322,7 @@ struct SubsetLoadSetupTests {
       _ = try await materialize(source)
     }
     let calls = await transport.calls
-    #expect(calls == ["POST /v1/subset-loads"])
+    #expect(calls == ["POST /v1/subsets/load"])
   }
 
   @Test func oneRequestLoadRequiresALease() async throws {
@@ -1294,7 +1330,7 @@ struct SubsetLoadSetupTests {
     await #expect(throws: (any Error).self) {
       _ = try await materialize(source(transport, subsetSetup: .oneRequest))
     }
-    #expect(await transport.calls == ["POST /v1/subset-loads", "DELETE /v1/shapes/shape-1"])
+    #expect(await transport.calls == ["POST /v1/subsets/load", "DELETE /v1/shapes/shape-1"])
   }
 
   @Test func aLoadedPageThatCannotDecodeStillDoesNotDeleteItsClaim() async throws {
@@ -1302,7 +1338,7 @@ struct SubsetLoadSetupTests {
     await #expect(throws: (any Error).self) {
       _ = try await materialize(source(transport, subsetSetup: .oneRequest))
     }
-    #expect(await transport.calls == ["POST /v1/subset-loads"])
+    #expect(await transport.calls == ["POST /v1/subsets/load"])
   }
 
   /// A 4xx load has no client-side recovery; any gateway-side claim remains lease-bound.
@@ -1311,7 +1347,7 @@ struct SubsetLoadSetupTests {
     await #expect(throws: (any Error).self) {
       _ = try await materialize(source(transport, subsetSetup: .oneRequest))
     }
-    #expect(await transport.calls == ["POST /v1/subset-loads"])
+    #expect(await transport.calls == ["POST /v1/subsets/load"])
   }
 
   /// A `410` on the load is the engine's exhausted fall-through, answered as for a feed create:
@@ -1320,7 +1356,7 @@ struct SubsetLoadSetupTests {
     let transport = LoadingSubsetTransport(goneLoads: 1)
     let session = try await materialize(source(transport, subsetSetup: .oneRequest))
     #expect(session.snapshot.cursor == StreamCursor(offset: "10", lsn: "0/10"))
-    let loads = await transport.requests.filter { $0.url?.path == "/v1/subset-loads" }
+    let loads = await transport.requests.filter { $0.url?.path == "/v1/subsets/load" }
     #expect(loads.count == 2)
     #expect(Set(loads.compactMap(\.httpBody)).count == 1)
     #expect(!(await transport.calls).contains("POST /v1/subset-feeds"))
@@ -1360,8 +1396,8 @@ struct SubsetLoadSetupTests {
     let before = await transport.requests.count
     let again = try await materialize(source)
     let after = Array(await transport.calls.dropFirst(before))
-    #expect(after.first == "POST /v1/subset-loads")
-    #expect(after.filter { $0 == "POST /v1/subset-loads" }.count == 1)
+    #expect(after.first == "POST /v1/subsets/load")
+    #expect(after.filter { $0 == "POST /v1/subsets/load" }.count == 1)
     #expect(!after.contains("HEAD /streams/shape-1"))
     #expect(!after.contains("POST /v1/subsets/query"))
     try await again.stop()
@@ -1378,7 +1414,7 @@ struct SubsetLoadSetupTests {
       ],
       limit: 1)
     let session = try await materialize(
-      source(transport, subsetSetup: .oneRequest, keyForRow: \.id), demand: demand)
+      source(transport, subsetSetup: .threeRequests, keyForRow: \.id), demand: demand)
     #expect(Array((await transport.calls).prefix(3)) == [
       "POST /v1/subset-feeds", "HEAD /streams/shape-1", "POST /v1/subsets/query"
     ])

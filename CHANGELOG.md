@@ -5,7 +5,7 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 
 ## Unreleased
 
-- Prototype one-request subset setup through the gateway's `/sync/v1/subset-loads` route, selected
+- Prototype one-request subset setup through the gateway's `/sync/v1/subsets/load` route, selected
   explicitly with `ElectricCircuitsClient.Configuration.subsetSetup`; three-request setup remains
   the default. The one-request body requires a stable subscription and leaves failed-load claims
   lease-bounded; one-request responses must include a positive `leaseSeconds` (a malformed
@@ -17,6 +17,8 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   parameter, `AdoptedShapeHandle`, and `ShapeSubscriptionCoordinator.init(adopting:)`.
   Renewal retry behavior is unconditional and has no configuration switch.
   Lease renewal retains the existing one-second minimum cadence for all coordinators.
+  Limited windows now use the one-request page as their initial seed; later window re-queries stay
+  on `querySubset`.
 
 ## 0.7.1
 
