@@ -800,6 +800,25 @@ struct ShapeSubscriptionCoordinatorTests {
     #expect(await coordinator.state != .streaming(.beginning))
   }
 
+  @Test func failedAdoptedStartReleasesThePendingClaim() async throws {
+    let transport = CancellationTransport()
+    let old = ShapeHandle(
+      response: ShapeResponse(
+        shapeId: "s1", table: "public.items", streamPath: "/v1/streams/s1",
+        streamURL: URL(string: "https://streams.test/s1")!, subscription: "stable-claim"))
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "stable-claim"),
+      materializer: UnavailableCursorMaterializer(),
+      adopting: AdoptedShapeHandle(handle: old))
+
+    await #expect(throws: ShapeSubscriptionFailure.materializer) { _ = try await coordinator.start() }
+    try await coordinator.stop()
+    #expect(await transport.requests.map(\.httpMethod) == ["DELETE"])
+  }
+
   @Test func stopWaitsForRenewResponseAndCompensatesLandedClaim() async throws {
     let transport = GatedRenewTransport()
     let coordinator = ShapeSubscriptionCoordinator(

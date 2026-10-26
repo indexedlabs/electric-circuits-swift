@@ -191,7 +191,14 @@ private func goneResponse(
 
 private actor SubsetRecreateClock: ShapeSubscriptionClock {
   private(set) var delays: [Duration] = []
-  func sleep(for duration: Duration) async throws { delays.append(duration) }
+  func sleep(for duration: Duration) async throws {
+    delays.append(duration)
+    // Lease renewals use a seconds-long cadence; keep those sleeps pending until the owning
+    // session is stopped so a test clock cannot turn the lease loop into a busy renewal storm.
+    if duration >= .seconds(1) {
+      try await Task.sleep(for: .seconds(3_600))
+    }
+  }
 }
 
 private actor AppliedNativeBatches {
@@ -581,9 +588,14 @@ struct CircuitsSubsetSourceTests {
     let batch = try #require(batches.first)
     #expect(batch.changes.count == 2)
     #expect(batch.sourceVersion == .init(rawValue: "0/21", order: 33))
+    for _ in 0..<100 {
+      if await transport.requests.contains(where: { $0.httpMethod == "GET" }) { break }
+      await Task.yield()
+    }
     let calls = (await transport.requests).map { "\($0.httpMethod ?? "") \($0.url?.path ?? "")" }
     #expect(Array(calls.prefix(2)) == ["POST /v1/subsets/load", "GET /streams/shape-1"])
     #expect(calls.filter { $0 == "POST /v1/subsets/query" }.count == 1)
+    #expect(calls.filter { $0 == "POST /v1/subset-feeds" }.isEmpty)
     let load = try #require(await transport.requests.first { $0.url?.path == "/v1/subsets/load" })
     let body = try JSONDecoder().decode(SubsetLoadRequest.self, from: #require(load.httpBody))
     #expect(body.orderBy == SubsetOrderBy(column: "modified_at", descending: true))
@@ -682,7 +694,7 @@ struct CircuitsSubsetSourceTests {
     #expect(version == .init(rawValue: "0/21", order: 33))
     let pageQueries = await transport.requests.filter { $0.url?.path == "/v1/subsets/query" }
     #expect(pageQueries.count == 2)
-    #expect(await clock.delays.count >= 1)
+    #expect(await clock.delays.count == 1)
   }
 
   /// A page that never catches up must not be applied: the window gives up with `stalePage`

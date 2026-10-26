@@ -633,6 +633,7 @@ public actor ShapeSubscriptionCoordinator {
       generation &+= 1
       transition(.stopping)
       if let handle { appendRelease(handle) }
+      if let adoptedHandle { appendRelease(adoptedHandle.handle) }
       handle = nil
     }
     let create = startTask
@@ -761,11 +762,13 @@ public actor ShapeSubscriptionCoordinator {
     }
     try Task.checkCancellation()
     if let adopted = adoptedHandle {
-      adoptedHandle = nil
       // The lease loop's first renewal comes a third of the lease after this start. Adopt only a
       // claim minted within that third, so admission waits or a slow snapshot write never start
       // the stream on a lease close to lapsing; an older claim is POSTed again, renewing it.
-      if adopted.isFresh() { return adopted.handle }
+      if adopted.isFresh() {
+        adoptedHandle = nil
+        return adopted.handle
+      }
       adoptedLeaseStart = nil
       let renewed = try await recreatingOnGone(operation: "create") {
         switch self.kind {
@@ -782,8 +785,10 @@ public actor ShapeSubscriptionCoordinator {
           previous: adopted.handle, replacement: renewed)
         handle = adopted.handle
         try await requireReseed(outcome, extraRelease: renewed)
+        adoptedHandle = nil
         throw ShapeSubscriptionFailure.reseedRequired(outcome)
       }
+      adoptedHandle = nil
       return renewed
     }
     return try await recreatingOnGone(operation: "create") {
