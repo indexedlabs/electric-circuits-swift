@@ -67,7 +67,9 @@ public struct AdoptedShapeHandle: Sendable, Equatable {
 
   /// Fresh while less than a third of its lease (30 s when the server names no lease) has passed.
   func isFresh(now: ContinuousClock.Instant = .now) -> Bool {
-    let lease = handle.response.leaseSeconds.map { Duration.seconds($0) / 3 } ?? .seconds(30)
+    let lease = handle.response.leaseSeconds.map {
+      max(Duration.seconds($0) / 3, .seconds(1))
+    } ?? .seconds(30)
     return now - mintedAt < lease
   }
 }
@@ -667,7 +669,7 @@ public actor ShapeSubscriptionCoordinator {
   ) {
     streamTask = Task { [weak self] in await self?.consume(handle: handle, generation: generation) }
     if let seconds = handle.response.leaseSeconds, seconds > 0 {
-      let interval = Duration.seconds(Double(seconds) / 3)
+      let interval = max(Duration.seconds(Double(seconds) / 3), .seconds(1))
       let firstDelay: Duration
       if let leaseStart {
         let elapsed = ContinuousClock.now - leaseStart

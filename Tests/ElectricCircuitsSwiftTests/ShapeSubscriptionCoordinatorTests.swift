@@ -198,15 +198,12 @@ private actor ReplacementTransport: HTTPTransport {
 
 private actor StaleAdoptionTransport: HTTPTransport {
   private(set) var requests: [URLRequest] = []
-  private var posts = 0
 
   func send(_ request: URLRequest) async throws -> HTTPResponse {
     requests.append(request)
     switch request.httpMethod {
     case "POST":
-      posts += 1
-      let id = posts == 1 ? "s1" : "s2"
-      return shapeResponse(id: id, leaseSeconds: 1)
+      return shapeResponse(id: "s2", leaseSeconds: 1)
     case "DELETE": return response("", status: 404)
     case "GET": throw CancellationError()
     default: throw CancellationError()
@@ -795,8 +792,11 @@ struct ShapeSubscriptionCoordinatorTests {
       materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0),
       adopting: AdoptedShapeHandle(handle: old, mintedAt: .now - .seconds(10)))
     await #expect(throws: (any Error).self) { _ = try await coordinator.start() }
-    #expect(await transport.requests.filter { $0.httpMethod == "POST" }.count == 2)
-    #expect(await transport.requests.filter { $0.httpMethod == "DELETE" }.count == 2)
+    #expect(await transport.requests.filter { $0.httpMethod == "POST" }.count == 1)
+    let deletes = await transport.requests.filter { $0.httpMethod == "DELETE" }
+    #expect(deletes.count == 2)
+    #expect(deletes.contains { $0.url?.path == "/v1/shapes/s1" })
+    #expect(deletes.contains { $0.url?.path == "/v1/shapes/s2" })
     #expect(await coordinator.state != .streaming(.beginning))
   }
 

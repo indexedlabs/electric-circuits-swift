@@ -15,6 +15,7 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   `ElectricCircuitsClient.Configuration`/`SubsetSetup`, its `configuration` property and init
   parameter, `AdoptedShapeHandle`, and `ShapeSubscriptionCoordinator.init(adopting:)`.
   Renewal retry behavior is unconditional and has no configuration switch.
+  Lease renewal retains the existing one-second minimum cadence for all coordinators.
 
 ## 0.7.1
 
