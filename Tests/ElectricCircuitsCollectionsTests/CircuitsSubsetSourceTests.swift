@@ -581,7 +581,7 @@ struct CircuitsSubsetSourceTests {
     let batch = try #require(batches.first)
     #expect(batch.changes.count == 2)
     #expect(batch.sourceVersion == .init(rawValue: "0/21", order: 33))
-    let calls = await transport.calls
+    let calls = (await transport.requests).map { "\($0.httpMethod ?? \"\") \($0.url?.path ?? \"\")" }
     #expect(Array(calls.prefix(2)) == ["POST /v1/subsets/load", "GET /streams/shape-1"])
     #expect(calls.filter { $0 == "POST /v1/subsets/query" }.count == 1)
     let load = try #require(await transport.requests.first { $0.url?.path == "/v1/subsets/load" })
