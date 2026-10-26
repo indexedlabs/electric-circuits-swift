@@ -337,8 +337,9 @@ struct CircuitsSubsetSourceTests {
     let subsetCreates = requests.filter {
       $0.httpMethod == "POST" && $0.url?.path == "/v1/subset-feeds"
     }
-    // Setup creates the feed once; the session's tail starts on it without POSTing the claim again.
-    #expect(subsetCreates.count == 1)
+    // Main's three-request setup creates the feed for the snapshot and again when the coordinator
+    // starts its tail.
+    #expect(subsetCreates.count == 2)
     #expect(requests.contains { $0.httpMethod == "HEAD" && $0.url?.path == "/streams/shape-1" })
     #expect(requests.contains { $0.httpMethod == "POST" && $0.url?.path == "/v1/subsets/query" })
     #expect(requests.contains { $0.httpMethod == "DELETE" && $0.url?.path == "/v1/shapes/shape-1" })
