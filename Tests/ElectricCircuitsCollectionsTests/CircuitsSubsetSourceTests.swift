@@ -1171,7 +1171,7 @@ struct SubsetLoadSetupTests {
     let effectiveClock: any ShapeSubscriptionClock =
       clock ?? (subsetSetup == .oneRequest
         ? ContinuousShapeSubscriptionClock() : SubsetRecreateClock())
-    CircuitsSubsetSource<NativeIssue, Int64>(
+    return CircuitsSubsetSource<NativeIssue, Int64>(
       client: ElectricCircuitsClient(
         baseURL: URL(string: "https://engine.test")!, transport: transport,
         configuration: .init(subsetSetup: subsetSetup)),
