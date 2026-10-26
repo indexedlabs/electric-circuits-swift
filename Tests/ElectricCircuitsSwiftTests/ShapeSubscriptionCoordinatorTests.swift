@@ -196,6 +196,24 @@ private actor ReplacementTransport: HTTPTransport {
   }
 }
 
+private actor StaleAdoptionTransport: HTTPTransport {
+  private(set) var requests: [URLRequest] = []
+  private var posts = 0
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    switch request.httpMethod {
+    case "POST":
+      posts += 1
+      let id = posts == 1 ? "s1" : "s2"
+      return shapeResponse(id: id, leaseSeconds: 1)
+    case "DELETE": return response("", status: 404)
+    case "GET": throw CancellationError()
+    default: throw CancellationError()
+    }
+  }
+}
+
 private actor GatedRenewTransport: HTTPTransport {
   private(set) var requests: [URLRequest] = []
   private var posts = 0
@@ -760,6 +778,26 @@ struct ShapeSubscriptionCoordinatorTests {
     let deletes = await transport.requests.filter { $0.httpMethod == "DELETE" }
     #expect(deletes.count == 2)
     try await coordinator.stop()
+  }
+
+  @Test func staleAdoptedReplacementDoesNotUseTheOldSnapshot() async throws {
+    let transport = StaleAdoptionTransport()
+    let old = ShapeHandle(
+      response: ShapeResponse(
+        shapeId: "s1", table: "public.items", streamPath: "/v1/streams/s1",
+        streamURL: URL(string: "https://streams.test/s1")!, subscription: "stable-claim",
+        leaseSeconds: 1))
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "stable-claim"),
+      materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0),
+      adopting: AdoptedShapeHandle(handle: old, mintedAt: .now - .seconds(10)))
+    await #expect(throws: (any Error).self) { _ = try await coordinator.start() }
+    #expect(await transport.requests.filter { $0.httpMethod == "POST" }.count == 2)
+    #expect(await transport.requests.filter { $0.httpMethod == "DELETE" }.count == 2)
+    #expect(await coordinator.state != .streaming(.beginning))
   }
 
   @Test func stopWaitsForRenewResponseAndCompensatesLandedClaim() async throws {

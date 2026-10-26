@@ -275,6 +275,9 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     let loaded = try await recreatePolicy.recreatingOnGone(clock: clock) {
       try await client.loadSubset(request)
     }
+    guard let leaseSeconds = loaded.handle.response.leaseSeconds, leaseSeconds > 0 else {
+      throw ClientError.decoding("subset load response must include a positive leaseSeconds")
+    }
     return LoadedSubset(load: loaded, mintedAt: mintedAt)
   }
 

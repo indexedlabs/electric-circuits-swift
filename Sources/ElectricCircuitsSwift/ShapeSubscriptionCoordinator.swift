@@ -667,7 +667,7 @@ public actor ShapeSubscriptionCoordinator {
   ) {
     streamTask = Task { [weak self] in await self?.consume(handle: handle, generation: generation) }
     if let seconds = handle.response.leaseSeconds, seconds > 0 {
-      let interval = max(Duration.seconds(Double(seconds) / 3), .seconds(1))
+      let interval = Duration.seconds(Double(seconds) / 3)
       let firstDelay: Duration
       if let leaseStart {
         let elapsed = ContinuousClock.now - leaseStart
@@ -765,6 +765,24 @@ public actor ShapeSubscriptionCoordinator {
       // the stream on a lease close to lapsing; an older claim is POSTed again, renewing it.
       if adopted.isFresh() { return adopted.handle }
       adoptedLeaseStart = nil
+      let renewed = try await recreatingOnGone(operation: "create") {
+        switch self.kind {
+        case .shape:
+          try await self.client.createShape(self.request)
+        case .subsetFeed:
+          try await self.client.createSubsetFeed(self.request)
+        }
+      }
+      if renewed.id != adopted.handle.id {
+        let outcome = ShapeSubscriptionReseedRequired(
+          reason: .replacement(
+            previousShapeID: adopted.handle.id, replacementShapeID: renewed.id),
+          previous: adopted.handle, replacement: renewed)
+        handle = adopted.handle
+        try await requireReseed(outcome, extraRelease: renewed)
+        throw ShapeSubscriptionFailure.reseedRequired(outcome)
+      }
+      return renewed
     }
     return try await recreatingOnGone(operation: "create") {
       switch self.kind {

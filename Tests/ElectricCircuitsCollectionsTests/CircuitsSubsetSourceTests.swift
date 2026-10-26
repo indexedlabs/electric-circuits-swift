@@ -1062,6 +1062,7 @@ private actor LoadingSubsetTransport: HTTPTransport {
   private let loadStatus: Int?
   private let loadDelay: Duration
   private let leaseSeconds: Int?
+  private let omitLease: Bool
   private var goneStreamReads: Int
   private var streamBodies: [String]
   private var streamReads = 0
@@ -1078,6 +1079,7 @@ private actor LoadingSubsetTransport: HTTPTransport {
     loadStatus: Int? = nil,
     loadDelay: Duration = .zero,
     leaseSeconds: Int? = nil,
+    omitLease: Bool = false,
     goneStreamReads: Int = 0,
     streamBodies: [String] = [
       #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"Live"},"headers":{"operation":"upsert","lsn":"0/20"}}]"#
@@ -1089,6 +1091,7 @@ private actor LoadingSubsetTransport: HTTPTransport {
     self.loadStatus = loadStatus
     self.loadDelay = loadDelay
     self.leaseSeconds = leaseSeconds
+    self.omitLease = omitLease
     self.goneStreamReads = goneStreamReads
     self.streamBodies = streamBodies
   }
@@ -1115,7 +1118,7 @@ private actor LoadingSubsetTransport: HTTPTransport {
         invalidPageLoads -= 1
         return reply("{\(Self.shape),\"offset\":\"10\",\"rows\":[1],\"lsn\":\"0/10\"}", request: request)
       }
-      let lease = leaseSeconds.map { ",\"leaseSeconds\":\($0)" } ?? ""
+      let lease = omitLease ? "" : ",\"leaseSeconds\":\(leaseSeconds ?? 30)"
       return reply("{\(Self.shape)\(lease),\"offset\":\"10\",\(Self.page)}", request: request)
     case ("POST", "/v1/subset-feeds"):
       return reply("{\(Self.shape)}", request: request)
@@ -1280,6 +1283,14 @@ struct SubsetLoadSetupTests {
     }
     let calls = await transport.calls
     #expect(calls == ["POST /v1/subset-loads"])
+  }
+
+  @Test func oneRequestLoadRequiresALease() async throws {
+    let transport = LoadingSubsetTransport(omitLease: true)
+    await #expect(throws: (any Error).self) {
+      _ = try await materialize(source(transport, subsetSetup: .oneRequest))
+    }
+    #expect(await transport.calls == ["POST /v1/subset-loads"])
   }
 
   @Test func aLoadedPageThatCannotDecodeStillDoesNotDeleteItsClaim() async throws {
