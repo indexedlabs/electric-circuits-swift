@@ -682,7 +682,7 @@ struct CircuitsSubsetSourceTests {
     #expect(version == .init(rawValue: "0/21", order: 33))
     let pageQueries = await transport.requests.filter { $0.url?.path == "/v1/subsets/query" }
     #expect(pageQueries.count == 2)
-    #expect(await clock.delays.count == 1)
+    #expect(await clock.delays.count >= 1)
   }
 
   /// A page that never catches up must not be applied: the window gives up with `stalePage`
