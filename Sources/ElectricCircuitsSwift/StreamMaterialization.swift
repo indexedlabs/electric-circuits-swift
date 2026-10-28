@@ -312,6 +312,7 @@ public struct ShapeStreamReader: Sendable {
   public let responseDecodingLimits: ResponseDecodingLimits
   private let resumesFromMaterializer: Bool
   private let liveReadState: LiveReadState
+  private let silenceTimeout: Duration
   private static let sseSilenceTimeout: Duration = .seconds(45)
 
   public init(
@@ -347,6 +348,7 @@ public struct ShapeStreamReader: Sendable {
     self.materializer = materializer
     self.telemetry = telemetry
     self.responseDecodingLimits = responseDecodingLimits
+    self.silenceTimeout = sseSilenceTimeout
     initialCursor = cursor ?? .beginning
     resumesFromMaterializer = cursor == nil
   }
@@ -455,7 +457,7 @@ public struct ShapeStreamReader: Sendable {
             onBytes: { try await receiver.receive($0) })
         }
         group.addTask {
-          try await receiver.waitForSilence(timeout: sseSilenceTimeout)
+          try await receiver.waitForSilence(timeout: silenceTimeout)
         }
         defer { group.cancelAll() }
         _ = try await group.next()
