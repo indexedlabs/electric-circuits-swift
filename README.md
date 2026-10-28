@@ -28,6 +28,13 @@ typed `CollectionPredicate` values compile logical field IDs into native Circuit
 fences, and live cursors. `InMemoryCollectionStore` is the reference provider; applications can
 implement the same contract with GRDB or another store.
 
+A source can throw `CollectionLoadFailure.transport(errorType:message:)` or
+`.authority(errorType:message:)` from materialization, its live run, or cleanup. The coordinator
+preserves that value in the lease's `.failed` state so callers can distinguish the reasons when
+retrying and logging. The source classifies the failure and supplies a redacted type and message;
+the coordinator does not inspect HTTP bodies or log these strings. Unclassified source errors
+still produce `.sourceUnavailable`, and store errors still produce `.storeUnavailable`.
+
 To revalidate stored stale marks, provide the definition's optional `rebuildDemand` closure and
 `subscriptionKind` label, and run `startStaleRevalidation(clock:telemetry:)` in an app-owned task.
 The gate starts closed: call `setStaleRevalidationGate(isOpen:)` after first paint, keeping it open
