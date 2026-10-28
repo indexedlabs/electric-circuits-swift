@@ -458,7 +458,7 @@ public struct ShapeStreamReader: Sendable {
 
   private func shouldFallBackFromSSE(_ error: Error, sawControl: Bool) -> Bool {
     guard !sawControl else { return false }
-    if error is SSEFallback || error is StreamingUnsupported { return true }
+    if error is SSEFallback { return true }
     if let streamError = error as? StreamError {
       switch streamError {
       case .responseTooLarge, .batchTooLarge, .decoding:
