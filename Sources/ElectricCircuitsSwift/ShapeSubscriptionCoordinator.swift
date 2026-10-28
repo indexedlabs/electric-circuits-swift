@@ -653,7 +653,7 @@ public actor ShapeSubscriptionCoordinator {
     if let configured = self.configuration {
       configuration = configured
     } else {
-      configuration = await client.configuration
+      configuration = client.configuration
     }
     let reader = ShapeStreamReader(
       streamURL: streamHandle.stream.url, transport: transport,
