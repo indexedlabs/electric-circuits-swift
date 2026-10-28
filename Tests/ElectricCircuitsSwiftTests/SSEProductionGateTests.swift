@@ -278,7 +278,7 @@ struct SSEProductionGateTests {
     defer { rig.session.invalidateAndCancel() }
     let reader = ShapeStreamReader(
       streamURL: sseGateURL, transport: rig.transport, materializer: rig.store,
-      configuration: rig.client.configuration)
+      configuration: await rig.client.configuration)
     let outcome = SSEGateOutcome()
     let task = Task {
       do {
