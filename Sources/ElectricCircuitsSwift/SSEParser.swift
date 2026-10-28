@@ -44,6 +44,10 @@ struct SSEParser {
       let lineEnd = newline ?? bytes.endIndex
       if index < lineEnd {
         line.append(contentsOf: bytes[index..<lineEnd])
+        if firstLine, line.count >= 3 {
+          if line.starts(with: [0xEF, 0xBB, 0xBF]) { line.removeFirst(3) }
+          firstLine = false
+        }
         try checkLineLimit()
       }
       guard let newline else { break }
