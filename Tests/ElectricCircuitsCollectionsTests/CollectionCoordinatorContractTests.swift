@@ -369,7 +369,7 @@ struct CollectionCoordinatorContractTests {
     _ failure: CollectionLoadFailure
   ) async throws {
     let row = CoordinatorIssue(id: 1, title: "Cached")
-    let source = ScriptedIssueSource(outcomes: [.success([row])])
+    let source = ScriptedIssueSource(outcomes: [.success([row])], stopFailures: 1)
     let store = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
     let coordinator = CollectionCoordinator(
       definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
@@ -389,6 +389,7 @@ struct CollectionCoordinatorContractTests {
     #expect(await store.rows() == [row.id: row])
     #expect(try await store.materialization(for: identity) == committed)
     try await lease.release()
+    #expect(await source.releaseAttempts() == 2)
   }
 
   @Test func refreshCleanupPreservesClassifiedFailureWithoutStartingAReplacement() async throws {

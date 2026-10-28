@@ -785,14 +785,19 @@ public actor CollectionCoordinator<
       _ = await cleanup(stop, identity: identity, attempt: attempt)
       return
     } catch is CollectionStoreApplyFailure {
-      _ = await cleanup(stop, identity: identity, attempt: attempt)
-      fail(identity: identity, attempt: attempt, with: .storeUnavailable)
+      if await cleanup(
+        stop, identity: identity, attempt: attempt, primaryFailure: .storeUnavailable
+      ) {
+        fail(identity: identity, attempt: attempt, with: .storeUnavailable)
+      }
       return
     } catch {
-      _ = await cleanup(stop, identity: identity, attempt: attempt)
-      fail(
-        identity: identity, attempt: attempt,
-        with: error as? CollectionLoadFailure ?? .sourceUnavailable)
+      let failure = error as? CollectionLoadFailure ?? .sourceUnavailable
+      if await cleanup(
+        stop, identity: identity, attempt: attempt, primaryFailure: failure
+      ) {
+        fail(identity: identity, attempt: attempt, with: failure)
+      }
       return
     }
 
@@ -820,7 +825,8 @@ public actor CollectionCoordinator<
   }
 
   private func cleanup(
-    _ stop: AtMostOnceStop, identity: CollectionDemandIdentity, attempt: UUID
+    _ stop: AtMostOnceStop, identity: CollectionDemandIdentity, attempt: UUID,
+    primaryFailure: CollectionLoadFailure? = nil
   ) async -> Bool {
     do {
       try await stop.call()
@@ -830,7 +836,7 @@ public actor CollectionCoordinator<
       // Keep the failed stop installed so a lease release can retry the same server authority.
       fail(
         identity: identity, attempt: attempt,
-        with: error as? CollectionLoadFailure ?? .sourceUnavailable)
+        with: primaryFailure ?? (error as? CollectionLoadFailure ?? .sourceUnavailable))
       return false
     }
   }
