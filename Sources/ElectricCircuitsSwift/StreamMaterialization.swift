@@ -483,6 +483,7 @@ public struct ShapeStreamReader: Sendable {
     private(set) var maximumEventBytes: Int
     private let clock = ContinuousClock()
     private var lastActivity: ContinuousClock.Instant
+    private var committing = false
     private(set) var sawControl = false
 
     init(
@@ -501,10 +502,14 @@ public struct ShapeStreamReader: Sendable {
 
     func waitForSilence(timeout: Duration) async throws {
       while true {
+        if committing {
+          try await Task.sleep(for: .milliseconds(10))
+          continue
+        }
         let deadline = lastActivity.advanced(by: timeout)
         if clock.now >= deadline { throw SSEStalled() }
         try await Task.sleep(until: deadline, clock: clock)
-        if clock.now >= lastActivity.advanced(by: timeout) { throw SSEStalled() }
+        if !committing && clock.now >= lastActivity.advanced(by: timeout) { throw SSEStalled() }
       }
     }
 
@@ -555,10 +560,14 @@ public struct ShapeStreamReader: Sendable {
           sawControl = true
           if let offset = control.streamNextOffset, !offset.isEmpty, offset != cursor.offset {
             let lsn = pending.envelopes.reversed().compactMap { $0.headers.lsn }.first ?? cursor.lsn
+            committing = true
+            defer {
+              committing = false
+              lastActivity = clock.now
+            }
             cursor = try await reader.commit(
               PollResult(batch: pending, cursor: StreamCursor(offset: offset, lsn: lsn)),
               expecting: expectedCursor)
-            lastActivity = clock.now
             expectedCursor = cursor
             pending = ChangeBatch()
           }
