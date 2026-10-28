@@ -9,6 +9,12 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   retry backoff and budget, while failures without progress still exhaust the configured policy.
   This patch changes no public API, provider schema, or native-v1 contract.
 
+## 0.8.0
+
+- Add opt-in SSE live reads through `ElectricCircuitsClient.Configuration`. The reader holds one
+  response per stream, commits data frames with each control offset, resumes after clean response
+  ends, and falls back to long-poll when SSE setup is unavailable. Long-poll remains the default.
+
 ## 0.7.0
 
 - Add `CollectionCoordinator.resumeAndDrainStaleRevalidation() async -> Bool` to reopen lifecycle

@@ -74,6 +74,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     identity: CollectionDemandIdentity,
     materializationID: CollectionMaterializationID
   ) async throws -> CollectionSourceSession<Model, Key> {
+    let clientConfiguration = await client.configuration
     // A limited live demand is a window: the snapshot is the ordered page and every accepted tail
     // change re-queries that page so membership follows the source. The window needs exactly one
     // order column to be well defined and a row key to diff the page against the held keys.
@@ -180,6 +181,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
             capacity: capacity,
             responseDecodingLimits: responseDecodingLimits,
             telemetry: telemetry,
+            configuration: clientConfiguration,
             kind: .subsetFeed,
             recreatePolicy: recreatePolicy
           )

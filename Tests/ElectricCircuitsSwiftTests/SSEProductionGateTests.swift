@@ -160,14 +160,38 @@ private actor SSEGateOutcome {
   func finish() { finished = true }
 }
 
+private actor SSEFallbackTransport: HTTPTransport {
+  private(set) var requests: [URLRequest] = []
+
+  func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes: @Sendable (Data) async throws -> Void
+  ) async throws {
+    requests.append(request)
+    try await onResponse(HTTPURLResponse(
+      url: request.url!, statusCode: 200, httpVersion: nil,
+      headerFields: ["Content-Type": "application/json"])!)
+  }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    return HTTPResponse(
+      data: Data(),
+      response: HTTPURLResponse(
+        url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
+  }
+}
+
 private struct SSEGateRig {
   let server = SSEGateServer()
   let store = SSEGateStore()
   let session: URLSession
   let transport: URLSessionTransport
   let client: ElectricCircuitsClient
+  let responseDecodingLimits: ResponseDecodingLimits
 
-  init() {
+  init(initialLimit: Int = ResponseDecodingLimits.default.maximumDecodedResponseBytes) {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [SSEGateProtocol.self]
     // The SDK's 45-second frame watchdog must fire before Foundation's own idle timeout.
@@ -175,8 +199,10 @@ private struct SSEGateRig {
     configuration.timeoutIntervalForResource = 300
     session = URLSession(configuration: configuration)
     transport = URLSessionTransport(session: session)
+    responseDecodingLimits = .init(maximumDecodedResponseBytes: initialLimit)
     client = ElectricCircuitsClient(
       baseURL: URL(string: "https://sse-gate.test")!, transport: transport,
+      responseDecodingLimits: responseDecodingLimits,
       configuration: .init(liveReadMode: .sse))
     SSEGateProtocol.registry.install(server)
   }
@@ -185,6 +211,7 @@ private struct SSEGateRig {
     ShapeSubscriptionCoordinator(
       client: client, transport: transport,
       request: ShapeRequest(table: "public.items", subscription: "sse-gate"), materializer: store,
+      responseDecodingLimits: responseDecodingLimits,
       retryPolicy: .init(maxRetries: 2, baseDelay: .zero, maximumDelay: .zero, jitterRatio: 0))
   }
 
@@ -225,11 +252,12 @@ private func gateControl(_ offset: String) -> Data {
 /// Generates a complete SSE data event of the exact wire length without retaining a second
 /// event-sized fixture. The row's string proves that the decoder received the whole payload.
 @discardableResult
-private func sendSizedGateEvent(_ size: Int, server: SSEGateServer, read: Int) -> Int {
-  let prefix = Data("event: data\ndata: ".utf8)
-    + Data(#"[{"type":"public.items","key":"large","value":{"padding":""#.utf8)
-  let suffix = Data(#""},"headers":{"operation":"upsert"}}]"#.utf8) + Data("\n\n".utf8)
-  let paddingCount = size - prefix.count - suffix.count
+private func sendSizedGateEvent(_ payloadSize: Int, server: SSEGateServer, read: Int) -> Int {
+  let jsonPrefix = Data(#"[{"type":"public.items","key":"large","value":{"padding":""#.utf8)
+  let jsonSuffix = Data(#""},"headers":{"operation":"upsert"}}]"#.utf8)
+  let prefix = Data("event: data\ndata: ".utf8) + jsonPrefix
+  let suffix = jsonSuffix + Data("\n\n".utf8)
+  let paddingCount = payloadSize - jsonPrefix.count - jsonSuffix.count
   guard server.send(prefix, to: read) else { return paddingCount }
   let chunk = Data(repeating: 0x78, count: 64 * 1024)
   var remaining = paddingCount
@@ -247,7 +275,7 @@ struct SSEProductionGateTests {
   @Test(
     arguments: [16 * 1024 * 1024, 16 * 1024 * 1024 + 1, 64 * 1024 * 1024, 64 * 1024 * 1024 + 1])
   func largeEventsParseWholeAndCommit(size: Int) async throws {
-    let rig = SSEGateRig()
+    let rig = SSEGateRig(initialLimit: size <= 16 * 1024 * 1024 + 1 ? 16 * 1024 * 1024 : 64 * 1024 * 1024)
     defer { rig.session.invalidateAndCancel() }
     let coordinator = rig.coordinator()
     do {
@@ -294,8 +322,15 @@ struct SSEProductionGateTests {
       let ceiling = 512 * 1024 * 1024
       sendSizedGateEvent(ceiling + 1, server: rig.server, read: 0)
       try await gateWait("oversized event refusal", timeout: .seconds(120)) { await outcome.finished }
-      await #expect(throws: StreamError.responseTooLarge(limit: ceiling, observed: ceiling + 1)) {
-        try await task.value
+      do {
+        _ = try await task.value
+        Issue.record("An event above the 512 MiB ceiling unexpectedly completed")
+      } catch let error as StreamError {
+        if case .responseTooLarge(let limit, _) = error {
+          #expect(limit == ceiling)
+        } else {
+          Issue.record("Unexpected stream error: \(error)")
+        }
       }
       #expect(await rig.store.offsets().isEmpty)
       #expect(try await rig.store.currentCursor()?.offset == "10")
@@ -306,6 +341,73 @@ struct SSEProductionGateTests {
     }
     task.cancel()
     _ = await task.result
+  }
+
+  @Test func severalDataEventsCommitTogetherAtOneControlFrame() async throws {
+    let rig = SSEGateRig()
+    defer { rig.session.invalidateAndCancel() }
+    let coordinator = rig.coordinator()
+    do {
+      _ = try await coordinator.start()
+      try await rig.requireSSERead(0, offset: "10")
+      rig.server.send(gateData("first"), to: 0)
+      rig.server.send(gateData("second"), to: 0)
+      #expect(await rig.store.offsets().isEmpty)
+      rig.server.send(gateControl("20"), to: 0)
+      try await gateWait("combined data commit") { await rig.store.offsets() == ["20"] }
+      #expect(await rig.store.appliedKeys() == [["first", "second"]])
+      try await coordinator.stop()
+    } catch {
+      try? await coordinator.stop()
+      throw error
+    }
+  }
+
+  @Test func cleanResponseEndsReopenFromCommittedOffsetWithoutRetryState() async throws {
+    let rig = SSEGateRig()
+    defer { rig.session.invalidateAndCancel() }
+    let coordinator = rig.coordinator()
+    do {
+      _ = try await coordinator.start()
+      try await rig.requireSSERead(0, offset: "10")
+      rig.server.send(gateData("first"), to: 0)
+      rig.server.send(gateControl("20"), to: 0)
+      try await gateWait("clean-end baseline") { await rig.store.offsets() == ["20"] }
+      for index in 0..<4 {
+        rig.server.finish(index)
+        try await rig.requireSSERead(index + 1, offset: "20")
+        let state = await coordinator.state
+        if case .failed = state { Issue.record("clean response end failed the subscription") }
+        if case .waitingToRetry = state { Issue.record("clean response end entered retry state") }
+      }
+      try await coordinator.stop()
+    } catch {
+      try? await coordinator.stop()
+      throw error
+    }
+  }
+
+  @Test func parserSplitsEveryByteAndDropsKeepAliveAndTrailingPartialEvent() throws {
+    let first = gateData("first")
+    let control = gateControl("20")
+    let keepAlive = Data(": keep-alive\n\n".utf8)
+    let partial = Data("event: data\ndata: [{\"incomplete\":true}".utf8)
+    let source = first + keepAlive + control + partial
+    let expected = [
+      SSEParser.Event(name: "data", data: Data("[{\"type\":\"public.items\",\"key\":\"first\",\"value\":{\"id\":\"first\"},\"headers\":{\"operation\":\"upsert\"}}]".utf8)),
+      SSEParser.Event(name: "control", data: Data("{\"streamNextOffset\":\"20\"}".utf8)),
+    ]
+    for split in 0...source.count {
+      var parser = SSEParser(maximumEventBytes: 1_024)
+      var events: [SSEParser.Event] = []
+      for byte in source.prefix(split) {
+        if let event = try parser.append(byte) { events.append(event) }
+      }
+      for byte in source.dropFirst(split) {
+        if let event = try parser.append(byte) { events.append(event) }
+      }
+      #expect(events == expected)
+    }
   }
 
   @Test func cutHeldResponseThenServerRestartResumesWithoutDuplicateOrMissingRows() async throws {
@@ -363,4 +465,20 @@ struct SSEProductionGateTests {
       throw error
     }
   }
+}
+
+
+@Test("SSE fallback and keep-alive")
+func sseFallbackAndKeepAliveVerification() async throws {
+  let transport = SSEFallbackTransport()
+  let reader = ShapeStreamReader(
+    streamURL: sseGateURL, transport: transport, materializer: InMemoryShapeMaterializer(),
+    configuration: .init(liveReadMode: .sse))
+  await #expect(throws: StreamError.terminal(path: "/stream", status: 404, reason: .notFound)) {
+    try await reader.run()
+  }
+  let requests = await transport.requests
+  #expect(requests.count == 2)
+  #expect(requests[0].url?.query?.contains("live=sse") == true)
+  #expect(requests[1].url?.query?.contains("live=long-poll") == true)
 }

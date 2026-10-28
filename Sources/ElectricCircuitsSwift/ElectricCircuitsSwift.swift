@@ -389,13 +389,31 @@ public struct ResponseDecodingLimits: Sendable, Equatable {
 public protocol HTTPTransport: Sendable {
   func prepare(_ request: URLRequest) -> URLRequest
   func send(_ request: URLRequest) async throws -> HTTPResponse
+  /// Delivers headers once, then bytes incrementally, awaiting each callback before reading more.
+  /// Returning or throwing must close the response; cancellation must stop the underlying request.
+  /// The default reports unsupported streaming so existing transports fall back to long-poll.
+  func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes: @Sendable (Data) async throws -> Void
+  ) async throws
   /// Sends a request with a caller-specific successful-response byte ceiling. Custom transports
   /// can preserve their existing behavior by implementing only `send(_:)`; the default forwards
   /// to it. The built-in Foundation transport enforces the ceiling while receiving bytes.
   func send(_ request: URLRequest, maximumResponseBytes: Int) async throws -> HTTPResponse
 }
 
+private struct StreamingUnsupported: Error {}
+
 extension HTTPTransport {
+  public func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes: @Sendable (Data) async throws -> Void
+  ) async throws {
+    throw StreamingUnsupported()
+  }
+
   /// Lets a transport apply caller-owned request configuration before telemetry adds propagation.
   /// The identity default keeps existing custom transports source-compatible.
   public func prepare(_ request: URLRequest) -> URLRequest { request }
@@ -451,6 +469,44 @@ public struct URLSessionTransport: HTTPTransport {
       request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
     }
     return request
+  }
+
+  public func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes: @Sendable (Data) async throws -> Void
+  ) async throws {
+    do {
+      let (bytes, response) = try await session.bytes(for: prepare(request))
+      defer { bytes.task.cancel() }
+      guard let response = response as? HTTPURLResponse else { throw ClientError.invalidResponse }
+      try await withTaskCancellationHandler {
+        try Task.checkCancellation()
+        try await onResponse(response)
+        // Pull from Foundation without a producer task or an unbounded queue. A suspended store
+        // commit stops consumption here; Foundation owns any socket/session buffering.
+        var chunk = Data()
+        chunk.reserveCapacity(16 * 1024)
+        for try await byte in bytes {
+          try Task.checkCancellation()
+          chunk.append(byte)
+          if chunk.count == 16 * 1024 {
+            try await onBytes(chunk)
+            chunk.removeAll(keepingCapacity: true)
+          }
+        }
+        if !chunk.isEmpty {
+          try await onBytes(chunk)
+        }
+      } onCancel: {
+        bytes.task.cancel()
+      }
+    } catch {
+      if Task.isCancelled || (error as? URLError)?.code == .cancelled {
+        throw CancellationError()
+      }
+      throw error
+    }
   }
 
   public func send(_ request: URLRequest) async throws -> HTTPResponse {
