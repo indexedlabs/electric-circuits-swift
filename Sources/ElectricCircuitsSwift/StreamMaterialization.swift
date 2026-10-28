@@ -459,15 +459,17 @@ public struct ShapeStreamReader: Sendable {
   private func shouldFallBackFromSSE(_ error: Error, sawControl: Bool) -> Bool {
     guard !sawControl else { return false }
     if error is SSEFallback { return true }
-    if let clientError = error as? ClientError {
-      if case .http(let status, _) = clientError {
-        return (400..<500).contains(status) && status != 404 && status != 410
+    if let streamError = error as? StreamError {
+      switch streamError {
+      case .responseTooLarge, .batchTooLarge, .decoding:
+        return false
+      case .terminal:
+        return false
+      default:
+        return true
       }
     }
-    // Transport errors, retryable HTTP responses (including 408/425/429), and parser/provider
-    // failures stay on SSE so the coordinator can apply its shared retry policy and resume from
-    // the committed cursor. A non-event-stream response is the distinct SSEFallback case above.
-    return false
+    return true
   }
 
   private struct SSEFallback: Error {}

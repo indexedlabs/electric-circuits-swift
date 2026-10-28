@@ -588,8 +588,8 @@ struct TransportFaultMatrixTests {
 
   @Test func sseReconnectsResumeFromCommittedOffsetWithoutDuplicatesOrGaps() async throws {
     let transport = SSEFaultTransport([
-      .bytes(
-        [sseFaultData("1"), sseFaultControl("1"), sseFaultData("2")], thenFail: true),
+      .bytes([sseFaultData("1"), sseFaultControl("1")], thenFail: true),
+      .bytes([sseFaultData("2")], thenFail: true),
       .bytes([sseFaultData("2"), sseFaultControl("2")], thenFail: false),
       .status(404, contentType: nil),
     ])
@@ -610,10 +610,11 @@ struct TransportFaultMatrixTests {
       await Task.yield()
     }
     let requests = await transport.streamRequests
-    #expect(requests.count == 3)
+    #expect(requests.count == 4)
     #expect(URLComponents(url: requests[0].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "-1")
     #expect(URLComponents(url: requests[1].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "1")
-    #expect(URLComponents(url: requests[2].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "2")
+    #expect(URLComponents(url: requests[2].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "1")
+    #expect(URLComponents(url: requests[3].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "2")
     #expect(await materializer.cursor() == StreamCursor(offset: "2"))
     #expect(await materializer.rows().keys.sorted() == ["1", "2"])
     try await coordinator.stop()
@@ -645,5 +646,33 @@ struct TransportFaultMatrixTests {
     }
     #expect(await goneTransport.streamRequests.count == 1)
     #expect(await goneTransport.requests.isEmpty)
+
+    let transientTransport = SSEFaultTransport([
+      .status(503, contentType: nil),
+      .bytes([sseFaultData("dropped")], thenFail: true),
+      .status(400, contentType: nil),
+    ])
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transientTransport,
+        configuration: .init(liveReadMode: .sse)),
+      transport: transientTransport,
+      request: ShapeRequest(table: "public.items", subscription: "claim"),
+      materializer: InMemoryShapeMaterializer(),
+      retryPolicy: .init(maxRetries: 3, baseDelay: .zero, maximumDelay: .zero, jitterRatio: 0),
+      clock: ImmediateFaultClock())
+    _ = try await coordinator.start()
+    for _ in 0..<2_000 {
+      if case .reseedRequired = await coordinator.state { break }
+      await Task.yield()
+    }
+    let transientStreams = await transientTransport.streamRequests
+    #expect(transientStreams.count == 3)
+    #expect(transientStreams.allSatisfy { $0.url?.query?.contains("live=sse") == true })
+    let transientPolls = await transientTransport.requests.filter {
+      $0.url?.query?.contains("live=long-poll") == true
+    }
+    #expect(transientPolls.count == 1)
+    try await coordinator.stop()
   }
 }
