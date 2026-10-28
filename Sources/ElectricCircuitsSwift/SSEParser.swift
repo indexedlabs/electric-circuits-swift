@@ -11,7 +11,7 @@ struct SSEParser {
 
   private(set) var maximumEventBytes: Int
   private let maximumEventBytesCeiling = 512 * 1024 * 1024
-  private let dataField = Data("data:".utf8)
+  private let dataField = Array("data:".utf8)
   private var line = Data()
   private var name = ""
   private var data = Data()
