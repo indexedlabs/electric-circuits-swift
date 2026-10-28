@@ -316,7 +316,8 @@ public struct ShapeStreamReader: Sendable {
     materializer: any ShapeMaterializer,
     startingAt cursor: StreamCursor? = nil,
     telemetry: TelemetryReporter = .noop,
-    responseDecodingLimits: ResponseDecodingLimits = .default
+    responseDecodingLimits: ResponseDecodingLimits = .default,
+    configuration: ElectricCircuitsClient.Configuration = .default
   ) {
     self.streamURL = streamURL
     self.transport = transport

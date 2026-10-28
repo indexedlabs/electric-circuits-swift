@@ -564,7 +564,25 @@ public actor InMemoryElectricCircuitsStore: ElectricCircuitsStore {
   }
 }
 
+public enum LiveReadMode: String, Sendable, Equatable {
+  case longPoll = "long-poll"
+  case sse
+}
+
+extension ElectricCircuitsClient {
+  public struct Configuration: Sendable, Equatable {
+    public var liveReadMode: LiveReadMode
+
+    public init(liveReadMode: LiveReadMode = .longPoll) {
+      self.liveReadMode = liveReadMode
+    }
+
+    public static let `default` = Configuration()
+  }
+}
+
 public actor ElectricCircuitsClient {
+  public let configuration: Configuration
   public let baseURL: URL
   public let responseDecodingLimits: ResponseDecodingLimits
   private let transport: any HTTPTransport
@@ -575,8 +593,10 @@ public actor ElectricCircuitsClient {
   public init(
     baseURL: URL, transport: any HTTPTransport = URLSessionTransport(),
     telemetry: TelemetryReporter = .noop,
-    responseDecodingLimits: ResponseDecodingLimits = .default
+    responseDecodingLimits: ResponseDecodingLimits = .default,
+    configuration: Configuration = .default
   ) {
+    self.configuration = configuration
     self.baseURL = baseURL
     self.responseDecodingLimits = responseDecodingLimits
     self.transport = transport
