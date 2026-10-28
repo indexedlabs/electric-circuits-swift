@@ -448,15 +448,15 @@ struct SSEProductionGateTests {
       _ = try await coordinator.start()
       try await rig.requireSSERead(0, offset: "10")
       rig.server.send(gateData("first"), to: 0)
-      let lastFrameSent = ContinuousClock.now
       rig.server.send(gateControl("20"), to: 0)
       try await gateWait("pre-stall commit") { await rig.store.offsets() == ["20"] }
-      try await rig.requireSSERead(1, offset: "20", timeout: .seconds(55))
-      #expect(lastFrameSent.duration(to: ContinuousClock.now) >= .seconds(45))
-      #expect(rig.server.wasStopped(0))
+      for index in 1...3 {
+        try await rig.requireSSERead(index, offset: "20", timeout: .seconds(55))
+        #expect(rig.server.wasStopped(index - 1))
+      }
       #expect(rig.server.peakLiveReads() == 1)
-      rig.server.send(gateData("second"), to: 1)
-      rig.server.send(gateControl("30"), to: 1)
+      rig.server.send(gateData("second"), to: 3)
+      rig.server.send(gateControl("30"), to: 3)
       try await gateWait("post-stall commit") { await rig.store.offsets() == ["20", "30"] }
       #expect(await rig.store.appliedKeys() == [["first"], ["second"]])
       try await coordinator.stop()

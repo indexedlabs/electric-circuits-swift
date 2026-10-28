@@ -276,7 +276,6 @@ public actor ShapeSubscriptionCoordinator {
   private let telemetry: TelemetryReporter
   private let kind: ShapeSubscriptionKind
   private let recreatePolicy: ShapeSubscriptionRecreatePolicy
-  private let configuration: ElectricCircuitsClient.Configuration?
   private var continuation: AsyncStream<ShapeSubscriptionState>.Continuation?
   private var handle: ShapeHandle?
   private var pendingRelease: [ShapeHandle] = []
@@ -318,8 +317,7 @@ public actor ShapeSubscriptionCoordinator {
     responseDecodingLimits: ResponseDecodingLimits = .default,
     telemetry: TelemetryReporter = .noop,
     kind: ShapeSubscriptionKind = .shape,
-    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init(),
-    configuration: ElectricCircuitsClient.Configuration? = nil
+    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init()
   ) {
     self.client = client
     self.transport = transport
@@ -332,7 +330,6 @@ public actor ShapeSubscriptionCoordinator {
     self.telemetry = telemetry
     self.kind = kind
     self.recreatePolicy = recreatePolicy
-    self.configuration = configuration
     let updates = AsyncStream<ShapeSubscriptionState>.makeStream()
     stateUpdates = updates.stream
     continuation = updates.continuation
@@ -649,12 +646,7 @@ public actor ShapeSubscriptionCoordinator {
 
   private func consume(handle streamHandle: ShapeHandle, generation: UInt64) async {
     // Keep this reader across retries so a stream's SSE fallback lasts until source setup.
-    let configuration: ElectricCircuitsClient.Configuration
-    if let configured = self.configuration {
-      configuration = configured
-    } else {
-      configuration = client.configuration
-    }
+    let configuration = client.configuration
     let reader = ShapeStreamReader(
       streamURL: streamHandle.stream.url, transport: transport,
       materializer: CoordinatedMaterializer(base: materializer), telemetry: telemetry,
