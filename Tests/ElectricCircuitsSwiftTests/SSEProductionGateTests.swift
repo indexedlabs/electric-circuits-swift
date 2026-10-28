@@ -521,8 +521,8 @@ struct SSEProductionGateTests {
   @Test func parserRejectsDataAfterCommentWhenEventWouldCrossCeiling() throws {
     let half = 256 * 1024 * 1024
     var parser = SSEParser(maximumEventBytes: half)
-    try parser.append(Data("data: ".utf8) + Data(repeating: 0x78, count: half) + Data("\n".utf8))
-    try parser.append(Data(": keep-alive\n".utf8))
+    _ = try parser.append(Data("data: ".utf8) + Data(repeating: 0x78, count: half) + Data("\n".utf8))
+    _ = try parser.append(Data(": keep-alive\n".utf8))
     do {
       _ = try parser.append(
         Data("data: ".utf8) + Data(repeating: 0x78, count: half + 1))
