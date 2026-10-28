@@ -245,8 +245,8 @@ private struct SSEGateRig {
     ShapeSubscriptionCoordinator(
       client: client, transport: transport,
       request: ShapeRequest(table: "public.items", subscription: "sse-gate"), materializer: store,
-      responseDecodingLimits: responseDecodingLimits,
-      retryPolicy: .init(maxRetries: 2, baseDelay: .zero, maximumDelay: .zero, jitterRatio: 0))
+      retryPolicy: .init(maxRetries: 2, baseDelay: .zero, maximumDelay: .zero, jitterRatio: 0),
+      responseDecodingLimits: responseDecodingLimits)
   }
 
   func requireSSERead(_ index: Int, offset: String, timeout: Duration = .seconds(10)) async throws {
