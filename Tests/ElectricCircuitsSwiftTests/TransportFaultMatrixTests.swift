@@ -677,4 +677,26 @@ struct TransportFaultMatrixTests {
     #expect(transientPolls.count == 1)
     try await coordinator.stop()
   }
+
+  @Test func sendOnlyTransportFallsBackToLongPoll() async throws {
+    let transport = FaultScriptTransport([
+      HTTPResponse(
+        data: Data(),
+        response: HTTPURLResponse(
+          url: URL(string: "https://streams.test/s1")!, statusCode: 404,
+          httpVersion: nil, headerFields: nil)!)
+    ])
+    let reader = ShapeStreamReader(
+      streamURL: URL(string: "https://streams.test/s1")!, transport: transport,
+      materializer: InMemoryShapeMaterializer(), configuration: .init(liveReadMode: .sse))
+
+    await #expect(throws: StreamError.terminal(
+      path: "/s1", status: 404, reason: .notFound)) {
+      try await reader.run()
+    }
+    let requests = await transport.requests
+    #expect(requests.count == 1)
+    #expect(requests[0].url?.query?.contains("live=long-poll") == true)
+    #expect(requests[0].value(forHTTPHeaderField: "Accept") == "application/json")
+  }
 }

@@ -459,6 +459,7 @@ public struct ShapeStreamReader: Sendable {
   private func shouldFallBackFromSSE(_ error: Error, sawControl: Bool) -> Bool {
     guard !sawControl else { return false }
     if error is SSEFallback { return true }
+    if error is StreamingUnsupported { return true }
     if let clientError = error as? ClientError {
       if case .http(let status, _) = clientError {
         return (400..<500).contains(status) && status != 404 && status != 410
