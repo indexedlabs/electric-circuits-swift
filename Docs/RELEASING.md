@@ -14,7 +14,9 @@ module stability.
 
 The 0.8.0 minor release adds opt-in SSE live reads through `ElectricCircuitsClient.Configuration`.
 SSE holds one response per stream, commits data frames with each control offset, resumes from the
-committed offset after clean ends, and falls back to long-poll when SSE setup is unavailable.
+committed offset after clean ends, and falls back to long-poll only when the server refuses SSE
+(a non-event-stream response or a nonterminal 4xx) or the configured transport cannot stream.
+Transport failures, 5xx responses, and retryable 4xx responses remain on SSE and use shared retry.
 Long-poll remains the default; no store protocol or persisted schema changes.
 
 ## Consumer installation
