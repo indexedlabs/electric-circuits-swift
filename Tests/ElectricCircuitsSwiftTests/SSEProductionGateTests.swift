@@ -1,0 +1,832 @@
+import Foundation
+import Testing
+
+@testable import ElectricCircuitsSwift
+
+private let sseGateURL = URL(string: "https://sse-gate.test/stream")!
+
+private enum SSEGateFailure: Error {
+  case timedOut(String)
+}
+
+/// All URLProtocol callbacks for a connection are driven by the test. The lock protects registry
+/// access from Foundation's start/stop callbacks; tests in this suite run serially.
+private final class SSEGateServer: @unchecked Sendable {
+  struct Read: Sendable {
+    let request: URLRequest
+    let generation: Int
+  }
+
+  private let lock = NSLock()
+  private var reads: [Read] = []
+  private var connections: [Int: SSEGateProtocol] = [:]
+  private var stopped: Set<Int> = []
+  private var sends: [Int: Int] = [:]
+  private var lastActivity: [Int: ContinuousClock.Instant] = [:]
+  private var generation = 0
+  private var peak = 0
+
+  func open(_ connection: SSEGateProtocol) {
+    guard let client = connection.client, let url = connection.request.url else { return }
+    if connection.request.httpMethod == "POST" {
+      let body = Data(
+        #"{"shapeId":"sse-gate","table":"public.items","streamPath":"/stream","streamUrl":"https://sse-gate.test/stream"}"#.utf8)
+      client.urlProtocol(
+        connection,
+        didReceive: HTTPURLResponse(
+          url: url, statusCode: 200, httpVersion: nil,
+          headerFields: ["Content-Type": "application/json"])!, cacheStoragePolicy: .notAllowed)
+      client.urlProtocol(connection, didLoad: body)
+      client.urlProtocolDidFinishLoading(connection)
+    } else if connection.request.httpMethod == "DELETE" {
+      client.urlProtocol(
+        connection,
+        didReceive: HTTPURLResponse(
+          url: url, statusCode: 204, httpVersion: nil, headerFields: nil)!,
+        cacheStoragePolicy: .notAllowed)
+      client.urlProtocolDidFinishLoading(connection)
+    } else {
+      client.urlProtocol(
+        connection,
+        didReceive: HTTPURLResponse(
+          url: url, statusCode: 200, httpVersion: nil,
+          headerFields: ["Content-Type": "text/event-stream; charset=utf-8"])!,
+        cacheStoragePolicy: .notAllowed)
+      lock.withLock {
+        connections[reads.count] = connection
+        let openedAt = ContinuousClock().now
+        reads.append(Read(request: connection.request, generation: generation))
+        lastActivity[reads.count - 1] = openedAt
+        peak = max(peak, connections.count)
+      }
+    }
+  }
+
+  func stop(_ connection: SSEGateProtocol) {
+    lock.withLock {
+      if let index = connections.first(where: { $0.value === connection })?.key {
+        connections.removeValue(forKey: index)
+        stopped.insert(index)
+      }
+    }
+  }
+
+  @discardableResult
+  func send(_ data: Data, to index: Int) -> Bool {
+    let now = ContinuousClock().now
+    let connection: SSEGateProtocol? = lock.withLock {
+      guard let connection = connections[index] else { return nil }
+      sends[index, default: 0] += 1
+      lastActivity[index] = now
+      return connection
+    }
+    guard let connection else { return false }
+    connection.client?.urlProtocol(connection, didLoad: data)
+    return true
+  }
+
+  func finish(_ index: Int) {
+    guard let connection = lock.withLock({ connections.removeValue(forKey: index) }) else { return }
+    connection.client?.urlProtocolDidFinishLoading(connection)
+  }
+
+  /// A server restart kills every held response. The next connection belongs to a new generation.
+  func restart() {
+    let old = lock.withLock {
+      generation += 1
+      let old = Array(connections.values)
+      connections.removeAll()
+      return old
+    }
+    for connection in old {
+      connection.client?.urlProtocol(connection, didFailWithError: URLError(.networkConnectionLost))
+    }
+  }
+
+  func snapshot() -> [Read] { lock.withLock { reads } }
+  func peakLiveReads() -> Int { lock.withLock { peak } }
+  func wasStopped(_ index: Int) -> Bool { lock.withLock { stopped.contains(index) } }
+  func sendCount(_ index: Int) -> Int { lock.withLock { sends[index, default: 0] } }
+  func elapsedSinceActivity(_ index: Int) -> Duration? {
+    lock.withLock { lastActivity[index].map { $0.duration(to: ContinuousClock().now) } }
+  }
+}
+
+private final class SSEGateRegistry: @unchecked Sendable {
+  private let lock = NSLock()
+  private var server = SSEGateServer()
+  func install(_ server: SSEGateServer) { lock.withLock { self.server = server } }
+  func current() -> SSEGateServer { lock.withLock { server } }
+}
+
+private final class SSEGateProtocol: URLProtocol, @unchecked Sendable {
+  static let registry = SSEGateRegistry()
+  private var server: SSEGateServer?
+
+  override class func canInit(with request: URLRequest) -> Bool {
+    request.url?.host == "sse-gate.test"
+  }
+
+  override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+  override func startLoading() {
+    let server = Self.registry.current()
+    self.server = server
+    server.open(self)
+  }
+
+  override func stopLoading() { server?.stop(self) }
+}
+
+private actor SSEGateStore: ShapeMaterializer {
+  private var rows: [String: ChangeRow] = [:]
+  private var cursor: StreamCursor? = StreamCursor(offset: "10")
+  private var commits: [(keys: [String], offset: String)] = []
+
+  func currentCursor() async throws -> StreamCursor? { cursor }
+
+  func apply(
+    _ batch: ChangeBatch, expecting expectedCursor: StreamCursor?, advancingTo next: StreamCursor
+  ) throws {
+    guard cursor == expectedCursor else {
+      throw StreamError.cursorConflict(expected: expectedCursor, actual: cursor, advancingTo: next)
+    }
+    var updated = rows
+    for envelope in batch.envelopes {
+      if envelope.headers.operation == .delete {
+        updated.removeValue(forKey: envelope.key)
+      } else {
+        updated[envelope.key] = envelope.value
+      }
+    }
+    rows = updated
+    cursor = next
+    commits.append((batch.envelopes.map(\.key), next.offset))
+  }
+
+  func row(_ key: String) -> ChangeRow? { rows[key] }
+  func keys() -> [String] { rows.keys.sorted() }
+  func offsets() -> [String] { commits.map(\.offset) }
+  func appliedKeys() -> [[String]] { commits.map(\.keys) }
+}
+
+private actor SSEGateOutcome {
+  private(set) var finished = false
+  func finish() { finished = true }
+}
+
+private actor SSEFallbackTransport: HTTPTransport {
+  private(set) var requests: [URLRequest] = []
+  private var pollCount = 0
+
+  func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes: @Sendable (Data) async throws -> Void
+  ) async throws {
+    requests.append(request)
+    try await onResponse(HTTPURLResponse(
+      url: request.url!, statusCode: 200, httpVersion: nil,
+      headerFields: ["Content-Type": "application/json"])!)
+  }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    pollCount += 1
+    return HTTPResponse(
+      data: Data(),
+      response: HTTPURLResponse(
+        url: request.url!, statusCode: pollCount == 1 ? 204 : 404, httpVersion: nil,
+        headerFields: nil)!)
+  }
+}
+
+private actor SSESetupFailureTransport: HTTPTransport {
+  private(set) var requests: [URLRequest] = []
+
+  func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes: @Sendable (Data) async throws -> Void
+  ) async throws {
+    requests.append(request)
+    throw URLError(.networkConnectionLost)
+  }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    return HTTPResponse(
+      data: Data(), response: HTTPURLResponse(
+        url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
+  }
+}
+
+private actor SSEDelayedHeaderTransport: HTTPTransport {
+  private(set) var streamCalls = 0
+
+  func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes _: @Sendable (Data) async throws -> Void
+  ) async throws {
+    streamCalls += 1
+    if streamCalls == 1 { try await Task.sleep(for: .milliseconds(50)) }
+    try await onResponse(HTTPURLResponse(
+      url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
+  }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    Issue.record("Long-poll fallback was unexpectedly used")
+    return HTTPResponse(
+      data: Data(), response: HTTPURLResponse(
+        url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!)
+  }
+}
+
+private actor SSECoordinatorFallbackTransport: HTTPTransport {
+  private(set) var requests: [URLRequest] = []
+  private(set) var streamCalls = 0
+  private var pollCalls = 0
+
+  func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes _: @Sendable (Data) async throws -> Void
+  ) async throws {
+    requests.append(request)
+    streamCalls += 1
+    try await onResponse(HTTPURLResponse(
+      url: request.url!, statusCode: 200, httpVersion: nil,
+      headerFields: ["Content-Type": "application/json"])!)
+  }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    switch request.httpMethod {
+    case "POST":
+      let body = Data(
+        #"{"shapeId":"sse-gate","table":"public.items","streamPath":"/stream","streamUrl":"https://sse-gate.test/stream"}"#.utf8)
+      return HTTPResponse(
+        data: body,
+        response: HTTPURLResponse(
+          url: request.url!, statusCode: 200, httpVersion: nil,
+          headerFields: ["Content-Type": "application/json"])!)
+    case "GET":
+      pollCalls += 1
+      let status = pollCalls <= 2 ? 503 : 404
+      return HTTPResponse(
+        data: Data(), response: HTTPURLResponse(
+          url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!)
+    case "DELETE":
+      return HTTPResponse(
+        data: Data(), response: HTTPURLResponse(
+          url: request.url!, statusCode: 204, httpVersion: nil, headerFields: nil)!)
+    default:
+      throw CancellationError()
+    }
+  }
+
+  func resetPolls() { pollCalls = 0 }
+}
+
+private actor SSEByteProbe {
+  private var chunks: [Data] = []
+  func append(_ data: Data) { chunks.append(data) }
+  func data() -> Data { chunks.reduce(into: Data()) { $0.append($1) } }
+}
+
+private actor SSEKeepAliveTransport: HTTPTransport {
+  private(set) var streamCalls = 0
+
+  func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes: @Sendable (Data) async throws -> Void
+  ) async throws {
+    streamCalls += 1
+    if streamCalls == 1 {
+      try await onResponse(HTTPURLResponse(
+        url: request.url!, statusCode: 200, httpVersion: nil,
+        headerFields: ["Content-Type": "text/event-stream"])!)
+      // A data frame held for the next cursor must be discarded when the control frame is only
+      // a keep-alive. This is the reader-level verification of the SSE event contract.
+      try await onBytes(gateData("pending"))
+      try await onBytes(Data("event: control\ndata: {}\n\n".utf8))
+      return
+    }
+    try await onResponse(HTTPURLResponse(
+      url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
+  }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    Issue.record("Long-poll fallback was unexpectedly used")
+    return HTTPResponse(
+      data: Data(), response: HTTPURLResponse(
+        url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!)
+  }
+}
+
+private struct SSEGateRig {
+  let server = SSEGateServer()
+  let store = SSEGateStore()
+  let session: URLSession
+  let transport: URLSessionTransport
+  let client: ElectricCircuitsClient
+  let responseDecodingLimits: ResponseDecodingLimits
+
+  init(initialLimit: Int = ResponseDecodingLimits.default.maximumDecodedResponseBytes) {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [SSEGateProtocol.self]
+    // The SDK's 45-second frame watchdog must fire before Foundation's own idle timeout.
+    configuration.timeoutIntervalForRequest = 180
+    configuration.timeoutIntervalForResource = 300
+    session = URLSession(configuration: configuration)
+    transport = URLSessionTransport(session: session)
+    responseDecodingLimits = .init(maximumDecodedResponseBytes: initialLimit)
+    client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://sse-gate.test")!, transport: transport,
+      responseDecodingLimits: responseDecodingLimits,
+      configuration: .init(liveReadMode: .sse))
+    SSEGateProtocol.registry.install(server)
+  }
+
+  func coordinator() -> ShapeSubscriptionCoordinator {
+    ShapeSubscriptionCoordinator(
+      client: client, transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "sse-gate"), materializer: store,
+      retryPolicy: .init(maxRetries: 2, baseDelay: .zero, maximumDelay: .zero, jitterRatio: 0),
+      responseDecodingLimits: responseDecodingLimits)
+  }
+
+  func requireSSERead(_ index: Int, offset: String, timeout: Duration = .seconds(10)) async throws {
+    try await gateWait("stream request \(index)", timeout: timeout) {
+      server.snapshot().count > index
+    }
+    let request = server.snapshot()[index].request
+    let url = try #require(request.url)
+    let components = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false))
+    try #require(components.queryItems?.first(where: { $0.name == "live" })?.value == "sse")
+    #expect(components.queryItems?.first(where: { $0.name == "offset" })?.value == offset)
+    #expect(request.value(forHTTPHeaderField: "Accept") == "text/event-stream")
+  }
+}
+
+private func gateWait(
+  _ description: String, timeout: Duration = .seconds(10),
+  until condition: () async throws -> Bool
+) async throws {
+  let clock = ContinuousClock()
+  let deadline = clock.now.advanced(by: timeout)
+  while !(try await condition()) {
+    guard clock.now < deadline else { throw SSEGateFailure.timedOut(description) }
+    try await Task.sleep(for: .milliseconds(10))
+  }
+}
+
+private func gateData(_ key: String) -> Data {
+  Data(
+    "event: data\ndata: [{\"type\":\"public.items\",\"key\":\"\(key)\",\"value\":{\"id\":\"\(key)\"},\"headers\":{\"operation\":\"upsert\"}}]\n\n".utf8)
+}
+
+private func gateControl(_ offset: String) -> Data {
+  Data("event: control\ndata: {\"streamNextOffset\":\"\(offset)\"}\n\n".utf8)
+}
+
+/// Generates a complete SSE data event of the exact wire length without retaining a second
+/// event-sized fixture. The row's string proves that the decoder received the whole payload.
+@discardableResult
+private func sendSizedGateEvent(_ payloadSize: Int, server: SSEGateServer, read: Int) -> Int {
+  let jsonPrefix = Data(#"[{"type":"public.items","key":"large","value":{"padding":""#.utf8)
+  let jsonSuffix = Data(#""},"headers":{"operation":"upsert"}}]"#.utf8)
+  let prefix = Data("event: data\ndata: ".utf8) + jsonPrefix
+  let suffix = jsonSuffix + Data("\n\n".utf8)
+  let paddingCount = payloadSize - jsonPrefix.count - jsonSuffix.count
+  guard server.send(prefix, to: read) else { return paddingCount }
+  let chunk = Data(repeating: 0x78, count: 64 * 1024)
+  var remaining = paddingCount
+  while remaining > 0 {
+    let count = min(remaining, chunk.count)
+    guard server.send(Data(chunk.prefix(count)), to: read) else { return paddingCount }
+    remaining -= count
+  }
+  server.send(suffix, to: read)
+  return paddingCount
+}
+
+@Suite("SSE production-readiness gates", .serialized)
+struct SSEProductionGateTests {
+  @Test("URLSessionTransport flushes a small SSE frame at its line boundary")
+  func urlSessionTransportFlushesSmallSSEFrame() async throws {
+    let server = SSEGateServer()
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [SSEGateProtocol.self]
+    let session = URLSession(configuration: configuration)
+    let transport = URLSessionTransport(session: session)
+    let probe = SSEByteProbe()
+    var request = URLRequest(url: sseGateURL)
+    request.httpMethod = "GET"
+    request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+    SSEGateProtocol.registry.install(server)
+    defer { session.invalidateAndCancel() }
+
+    let task = Task {
+      try await transport.stream(
+        request,
+        onResponse: { _ in },
+        onBytes: { bytes in await probe.append(bytes) })
+    }
+    try await gateWait("small SSE transport request") { server.snapshot().count == 1 }
+    let frame = gateControl("20")
+    #expect(frame.count < 16 * 1024)
+    #expect(server.send(frame, to: 0))
+    try await gateWait("small SSE frame delivery") { (await probe.data()) == frame }
+    #expect(await probe.data() == frame)
+    task.cancel()
+    _ = await task.result
+  }
+
+  @Test("URLSessionTransport delivers CR-only SSE frames incrementally")
+  func urlSessionTransportDeliversCROnlySSEFrame() async throws {
+    let rig = SSEGateRig()
+    defer { rig.session.invalidateAndCancel() }
+    let reader = ShapeStreamReader(
+      streamURL: sseGateURL, transport: rig.transport, materializer: rig.store,
+      configuration: await rig.client.configuration)
+    let task = Task { try await reader.run() }
+    try await rig.requireSSERead(0, offset: "10")
+
+    func crOnly(_ data: Data) -> Data {
+      Data(String(decoding: data, as: UTF8.self).replacingOccurrences(of: "\n", with: "\r").utf8)
+    }
+    #expect(rig.server.send(crOnly(gateData("cr-only")), to: 0))
+    #expect(rig.server.send(crOnly(gateControl("20")), to: 0))
+    try await gateWait("CR-only SSE frame commit") { await rig.store.offsets() == ["20"] }
+    #expect(await rig.store.keys() == ["cr-only"])
+    task.cancel()
+    _ = await task.result
+  }
+
+  @Test("SSE silence begins after response headers")
+  func delayedHeadersDoNotTriggerSSEStall() async throws {
+    let transport = SSEDelayedHeaderTransport()
+    let reader = ShapeStreamReader(
+      streamURL: sseGateURL, transport: transport, materializer: InMemoryShapeMaterializer(),
+      configuration: .init(liveReadMode: .sse), sseSilenceTimeout: .milliseconds(20))
+    await #expect(throws: StreamError.terminal(
+      path: "/stream", status: 404, reason: .notFound)) {
+      try await reader.run()
+    }
+    #expect(await transport.streamCalls == 1)
+  }
+
+  @Test(
+    arguments: [16 * 1024 * 1024, 16 * 1024 * 1024 + 1, 64 * 1024 * 1024, 64 * 1024 * 1024 + 1])
+  func largeEventsParseWholeAndCommit(size: Int) async throws {
+    let rig = SSEGateRig(initialLimit: size <= 16 * 1024 * 1024 + 1 ? 16 * 1024 * 1024 : 64 * 1024 * 1024)
+    defer { rig.session.invalidateAndCancel() }
+    let coordinator = rig.coordinator()
+    do {
+      _ = try await coordinator.start()
+      try await rig.requireSSERead(0, offset: "10")
+      let count = sendSizedGateEvent(size, server: rig.server, read: 0)
+      rig.server.send(gateControl("20"), to: 0)
+      try await gateWait("large event commit", timeout: .seconds(120)) {
+        try await rig.store.currentCursor()?.offset == "20"
+      }
+      if case .string(let padding)? = await rig.store.row("large")?["padding"] {
+        #expect(padding.utf8.count == count)
+        #expect(padding.utf8.allSatisfy { $0 == 0x78 })
+      } else {
+        Issue.record("The complete large row was not decoded")
+      }
+      #expect(await rig.store.offsets() == ["20"])
+      #expect(rig.server.snapshot().count == 1)
+      try await coordinator.stop()
+    } catch {
+      try? await coordinator.stop()
+      throw error
+    }
+  }
+
+  @Test func eventPast512MiBFailsWithTypedError() async throws {
+    let rig = SSEGateRig()
+    defer { rig.session.invalidateAndCancel() }
+    let reader = ShapeStreamReader(
+      streamURL: sseGateURL, transport: rig.transport, materializer: rig.store,
+      configuration: await rig.client.configuration)
+    let outcome = SSEGateOutcome()
+    let task = Task {
+      do {
+        try await reader.run()
+        await outcome.finish()
+      } catch {
+        await outcome.finish()
+        throw error
+      }
+    }
+    do {
+      try await rig.requireSSERead(0, offset: "10")
+      let ceiling = 512 * 1024 * 1024
+      sendSizedGateEvent(ceiling + 1, server: rig.server, read: 0)
+      try await gateWait("oversized event refusal", timeout: .seconds(120)) { await outcome.finished }
+      do {
+        _ = try await task.value
+        Issue.record("An event above the 512 MiB ceiling unexpectedly completed")
+      } catch let error as StreamError {
+        if case .responseTooLarge(let limit, _) = error {
+          #expect(limit == ceiling)
+        } else {
+          Issue.record("Unexpected stream error: \(error)")
+        }
+      }
+      #expect(await rig.store.offsets().isEmpty)
+      #expect(try await rig.store.currentCursor()?.offset == "10")
+    } catch {
+      task.cancel()
+      _ = await task.result
+      throw error
+    }
+    task.cancel()
+    _ = await task.result
+  }
+
+  @Test func severalDataEventsCommitTogetherAtOneControlFrame() async throws {
+    let rig = SSEGateRig()
+    defer { rig.session.invalidateAndCancel() }
+    let coordinator = rig.coordinator()
+    do {
+      _ = try await coordinator.start()
+      try await rig.requireSSERead(0, offset: "10")
+      rig.server.send(gateData("first"), to: 0)
+      rig.server.send(gateData("second"), to: 0)
+      rig.server.send(gateControl("20"), to: 0)
+      try await gateWait("combined data commit") { await rig.store.offsets() == ["20"] }
+      #expect(await rig.store.appliedKeys() == [["first", "second"]])
+      try await coordinator.stop()
+    } catch {
+      try? await coordinator.stop()
+      throw error
+    }
+  }
+
+  @Test func cleanResponseEndsReopenFromCommittedOffsetWithoutRetryState() async throws {
+    let rig = SSEGateRig()
+    defer { rig.session.invalidateAndCancel() }
+    let coordinator = rig.coordinator()
+    do {
+      _ = try await coordinator.start()
+      try await rig.requireSSERead(0, offset: "10")
+      rig.server.send(gateData("first"), to: 0)
+      rig.server.send(gateControl("20"), to: 0)
+      try await gateWait("clean-end baseline") { await rig.store.offsets() == ["20"] }
+      for index in 0..<4 {
+        rig.server.finish(index)
+        try await rig.requireSSERead(index + 1, offset: "20")
+        let state = await coordinator.state
+        if case .failed = state { Issue.record("clean response end failed the subscription") }
+        if case .waitingToRetry = state { Issue.record("clean response end entered retry state") }
+      }
+      try await coordinator.stop()
+    } catch {
+      try? await coordinator.stop()
+      throw error
+    }
+  }
+
+  @Test func parserSplitsEveryByteAndDropsKeepAliveAndTrailingPartialEvent() throws {
+    let first = gateData("first")
+    let control = gateControl("20")
+    let keepAlive = Data(": keep-alive\n\n".utf8)
+    let partial = Data("event: data\ndata: [{\"incomplete\":true}".utf8)
+    let source = first + keepAlive + control + partial
+    let expected = [
+      SSEParser.Event(name: "data", data: Data("[{\"type\":\"public.items\",\"key\":\"first\",\"value\":{\"id\":\"first\"},\"headers\":{\"operation\":\"upsert\"}}]".utf8)),
+      SSEParser.Event(name: "control", data: Data("{\"streamNextOffset\":\"20\"}".utf8)),
+    ]
+
+    func parse(_ chunks: [Data]) throws -> [SSEParser.Event] {
+      var parser = SSEParser(maximumEventBytes: 1_024)
+      return try chunks.flatMap { try parser.append($0) }
+    }
+
+    for split in 0...source.count {
+      #expect(try parse([Data(source.prefix(split)), Data(source.dropFirst(split))]) == expected)
+    }
+
+    let third = source.count / 3
+    let twoThirds = third * 2
+    #expect(try parse([
+      Data(source[..<third]), Data(source[third..<twoThirds]), Data(source[twoThirds...]),
+    ]) == expected)
+
+    let crlf = Data(
+      String(decoding: source, as: UTF8.self).replacingOccurrences(of: "\n", with: "\r\n").utf8)
+    #expect(try parse([crlf]) == expected)
+
+    for split in 0...crlf.count {
+      #expect(try parse([Data(crlf.prefix(split)), Data(crlf.dropFirst(split))]) == expected)
+    }
+
+    let bom = Data([0xEF, 0xBB, 0xBF])
+      + Data("data: ".utf8) + expected[0].data + Data("\n\n".utf8)
+    let bomExpected = [SSEParser.Event(name: "message", data: expected[0].data)]
+    #expect(try parse([bom]) == bomExpected)
+    for split in 0...bom.count {
+      #expect(try parse([Data(bom.prefix(split)), Data(bom.dropFirst(split))]) == bomExpected)
+    }
+
+    let fieldPrefix = Data("event: data\nda".utf8)
+    let fieldSuffix = Data("ta: [{\"type\":\"public.items\",\"key\":\"first\",\"value\":{\"id\":\"first\"},\"headers\":{\"operation\":\"upsert\"}}]\n\n".utf8)
+      + keepAlive + control + partial
+    #expect(try parse([fieldPrefix, fieldSuffix]) == expected)
+
+    #expect(try parse([Data("data\ndata: x\n\n".utf8)]) == [
+      SSEParser.Event(name: "message", data: Data("\nx".utf8)),
+    ])
+  }
+
+  @Test func parserRejectsDataAfterCommentWhenEventWouldCrossCeiling() throws {
+    let half = 256 * 1024 * 1024
+    var parser = SSEParser(maximumEventBytes: half)
+
+    func appendDataLine(prefix: String, payloadBytes: Int, terminate: Bool = true) throws {
+      _ = try parser.append(Data(prefix.utf8))
+      let chunk = Data(repeating: 0x78, count: 64 * 1024)
+      var remaining = payloadBytes
+      while remaining > 0 {
+        let count = min(remaining, chunk.count)
+        _ = try parser.append(Data(chunk.prefix(count)))
+        remaining -= count
+      }
+      if terminate { _ = try parser.append(Data("\n".utf8)) }
+    }
+
+    try appendDataLine(prefix: "data: ", payloadBytes: half)
+    _ = try parser.append(Data(": keep-alive\n".utf8))
+    do {
+      try appendDataLine(prefix: "data: ", payloadBytes: half + 1, terminate: false)
+      Issue.record("A data event crossing the 512 MiB ceiling was accepted after a comment")
+    } catch let error as StreamError {
+      guard case .responseTooLarge(let limit, _) = error else {
+        Issue.record("Unexpected stream error: \(error)")
+        return
+      }
+      #expect(limit == 512 * 1024 * 1024)
+    }
+  }
+
+  @Test func cutHeldResponseThenServerRestartResumesWithoutDuplicateOrMissingRows() async throws {
+    let rig = SSEGateRig()
+    defer { rig.session.invalidateAndCancel() }
+    let coordinator = rig.coordinator()
+    do {
+      _ = try await coordinator.start()
+      try await rig.requireSSERead(0, offset: "10")
+      rig.server.send(gateData("first"), to: 0)
+      rig.server.send(gateControl("20"), to: 0)
+      try await gateWait("first committed batch") { await rig.store.offsets() == ["20"] }
+      rig.server.send(gateData("second"), to: 0)
+      rig.server.send(Data("event: control\ndata: {\"streamNextOffset\":\"30\"}".utf8), to: 0)
+      rig.server.restart()
+      try await rig.requireSSERead(1, offset: "20")
+      #expect(rig.server.snapshot().map(\.generation) == [0, 1])
+      #expect(await rig.store.keys() == ["first"])
+      #expect(await rig.store.offsets() == ["20"])
+      rig.server.send(gateData("second"), to: 1)
+      rig.server.send(gateControl("30"), to: 1)
+      try await gateWait("replayed batch") { await rig.store.offsets() == ["20", "30"] }
+      #expect(await rig.store.keys() == ["first", "second"])
+      #expect(await rig.store.appliedKeys() == [["first"], ["second"]])
+      #expect(rig.server.peakLiveReads() == 1)
+      try await coordinator.stop()
+    } catch {
+      try? await coordinator.stop()
+      throw error
+    }
+  }
+
+  @Test func silentHeldResponseClosesAfter45SecondsAndResumesCommittedOffset() async throws {
+    let rig = SSEGateRig()
+    defer { rig.session.invalidateAndCancel() }
+    let coordinator = rig.coordinator()
+    do {
+      _ = try await coordinator.start()
+      try await rig.requireSSERead(0, offset: "10")
+      rig.server.send(gateData("first"), to: 0)
+      rig.server.send(gateControl("20"), to: 0)
+      try await gateWait("pre-stall commit") { await rig.store.offsets() == ["20"] }
+      for index in 1...3 {
+        try await rig.requireSSERead(index, offset: "20", timeout: .seconds(55))
+        #expect(rig.server.elapsedSinceActivity(index - 1) ?? .zero >= .seconds(44))
+      }
+      rig.server.send(gateData("second"), to: 3)
+      rig.server.send(gateControl("30"), to: 3)
+      try await gateWait("post-stall commit") { await rig.store.offsets() == ["20", "30"] }
+      #expect(await rig.store.appliedKeys() == [["first"], ["second"]])
+      try await coordinator.stop()
+    } catch {
+      try? await coordinator.stop()
+      throw error
+    }
+  }
+}
+
+
+@Test("SSE fallback remains long-poll")
+func sseFallbackRemainsLongPoll() async throws {
+  let transport = SSEFallbackTransport()
+  let reader = ShapeStreamReader(
+    streamURL: sseGateURL, transport: transport, materializer: InMemoryShapeMaterializer(),
+    configuration: .init(liveReadMode: .sse))
+  await #expect(throws: StreamError.terminal(path: "/stream", status: 404, reason: .notFound)) {
+    try await reader.run()
+  }
+  let requests = await transport.requests
+  #expect(requests.count == 3)
+  #expect(requests[0].url?.query?.contains("live=sse") == true)
+  #expect(requests[1].url?.query?.contains("live=long-poll") == true)
+  #expect(requests[2].url?.query?.contains("live=long-poll") == true)
+}
+
+@Test("SSE fallback lasts through retries and resets on new setup")
+func sseFallbackLastsThroughRetriesAndResetsOnSetup() async throws {
+  let transport = SSECoordinatorFallbackTransport()
+  let client = ElectricCircuitsClient(
+    baseURL: URL(string: "https://sse-gate.test")!, transport: transport,
+    configuration: .init(liveReadMode: .sse))
+  let makeCoordinator: () -> ShapeSubscriptionCoordinator = {
+    ShapeSubscriptionCoordinator(
+      client: client, transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "sse-gate"),
+      materializer: InMemoryShapeMaterializer(),
+      retryPolicy: .init(maxRetries: 2, baseDelay: .zero, maximumDelay: .zero, jitterRatio: 0))
+  }
+
+  let first = makeCoordinator()
+  _ = try await first.start()
+  try await gateWait("fallback retries") {
+    if case .reseedRequired = await first.state { return true }
+    return false
+  }
+  let firstRequests = await transport.requests
+  let firstStreams = firstRequests.filter { $0.url?.query?.contains("live=sse") == true }
+  let firstPolls = firstRequests.filter { $0.url?.query?.contains("live=long-poll") == true }
+  #expect(firstStreams.count == 1)
+  #expect(firstPolls.count == 3)
+  #expect(await transport.streamCalls == 1)
+  try await first.stop()
+
+  await transport.resetPolls()
+  let second = makeCoordinator()
+  _ = try await second.start()
+  try await gateWait("fallback setup reset") {
+    if case .reseedRequired = await second.state { return true }
+    return false
+  }
+  #expect(await transport.streamCalls == 2)
+  let allRequests = await transport.requests
+  #expect(allRequests.filter { $0.url?.query?.contains("live=sse") == true }.count == 2)
+  try await second.stop()
+}
+
+@Test("SSE transport failure before first control stays on SSE")
+func sseTransportFailureBeforeControlStaysOnSSE() async throws {
+  let transport = SSESetupFailureTransport()
+  let reader = ShapeStreamReader(
+    streamURL: sseGateURL, transport: transport, materializer: InMemoryShapeMaterializer(),
+    configuration: .init(liveReadMode: .sse))
+  await #expect(throws: URLError.self) {
+    try await reader.run()
+  }
+  let requests = await transport.requests
+  #expect(requests.count == 1)
+  #expect(requests[0].url?.query?.contains("live=sse") == true)
+}
+
+@Test("SSE keep-alive control does not commit pending data")
+func sseKeepAliveControlIsNoOp() async throws {
+  let transport = SSEKeepAliveTransport()
+  let store = InMemoryShapeMaterializer()
+  let reader = ShapeStreamReader(
+    streamURL: sseGateURL, transport: transport, materializer: store,
+    configuration: .init(liveReadMode: .sse))
+  await #expect(throws: StreamError.terminal(path: "/stream", status: 404, reason: .notFound)) {
+    try await reader.run()
+  }
+  #expect(try await store.currentCursor() == nil)
+  #expect(await transport.streamCalls == 2)
+}
+
+@Test("Long-poll remains the default live read")
+func longPollRemainsDefaultLiveRead() async throws {
+  let transport = SSEFallbackTransport()
+  let reader = ShapeStreamReader(
+    streamURL: sseGateURL, transport: transport, materializer: InMemoryShapeMaterializer())
+  await #expect(throws: StreamError.terminal(path: "/stream", status: 404, reason: .notFound)) {
+    try await reader.run()
+  }
+  let requests = await transport.requests
+  #expect(requests.count == 2)
+  #expect(requests.allSatisfy { $0.url?.query?.contains("live=long-poll") == true })
+  #expect(requests.allSatisfy { $0.value(forHTTPHeaderField: "Accept") == "application/json" })
+}

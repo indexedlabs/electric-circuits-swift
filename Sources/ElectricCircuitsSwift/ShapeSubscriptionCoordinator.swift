@@ -645,6 +645,12 @@ public actor ShapeSubscriptionCoordinator {
   }
 
   private func consume(handle streamHandle: ShapeHandle, generation: UInt64) async {
+    // Keep this reader across retries so a stream's SSE fallback lasts until source setup.
+    let configuration = client.configuration
+    let reader = ShapeStreamReader(
+      streamURL: streamHandle.stream.url, transport: transport,
+      materializer: CoordinatedMaterializer(base: materializer), telemetry: telemetry,
+      responseDecodingLimits: responseDecodingLimits, configuration: configuration)
     var retries = 0
     while isCurrent(generation) {
       // Unknown until this attempt's own read succeeds: a failed read must not leave the previous
@@ -654,10 +660,6 @@ public actor ShapeSubscriptionCoordinator {
         let attemptCursor = try await committedCursor()
         cursorAtAttempt = attemptCursor
         transition(.streaming(attemptCursor))
-        let reader = ShapeStreamReader(
-          streamURL: streamHandle.stream.url, transport: transport,
-          materializer: CoordinatedMaterializer(base: materializer), telemetry: telemetry,
-          responseDecodingLimits: responseDecodingLimits)
         try await reader.run()
         return
       } catch {

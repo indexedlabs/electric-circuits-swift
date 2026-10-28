@@ -3,6 +3,15 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
+## 0.8.0
+
+- Add opt-in SSE live reads through `ElectricCircuitsClient.Configuration`. The reader holds one
+  response per stream, commits data frames with each control offset, resumes after clean response
+  ends, and falls back to long-poll only when the server refuses SSE with a non-event-stream
+  response or a nonterminal 4xx, or when the configured `HTTPTransport` cannot stream. Transport
+  failures and retryable responses stay on SSE and use the shared retry policy. Long-poll remains
+  the default.
+
 ## 0.7.1
 
 - Fix stream retry state to count consecutive poll failures. A committed cursor advance resets

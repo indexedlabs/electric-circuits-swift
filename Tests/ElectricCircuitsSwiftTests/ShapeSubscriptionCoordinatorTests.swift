@@ -32,6 +32,35 @@ private actor CoordinatorTransport: HTTPTransport {
   }
 }
 
+private actor SSEBlipBurstTransport: HTTPTransport {
+  private var failures = 2
+  private(set) var streamRequests: [URLRequest] = []
+  private(set) var requests: [URLRequest] = []
+
+  func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes _: @Sendable (Data) async throws -> Void
+  ) async throws {
+    streamRequests.append(request)
+    if failures > 0 {
+      failures -= 1
+      throw URLError(.networkConnectionLost)
+    }
+    try await onResponse(HTTPURLResponse(
+      url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
+  }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    switch request.httpMethod {
+    case "POST": return shapeResponse()
+    case "DELETE": return response("", status: 204)
+    default: return response("", status: 404)
+    }
+  }
+}
+
 /// Holds the terminal stream response until the test explicitly releases it. This models a
 /// terminal result that has not crossed the transport boundary yet; task yields cannot establish
 /// that boundary.
@@ -857,6 +886,32 @@ struct ShapeSubscriptionCoordinatorTests {
     #expect(requests[1].url?.query?.contains("offset=-1") == true)
     #expect(requests[2].url?.query?.contains("offset=-1") == true)
     #expect(requests[3].url?.query?.contains("offset=7") == true)
+    try await coordinator.stop()
+  }
+
+  @Test func sseBlipBurstBacksOffAndStaysOnSSE() async throws {
+    let transport = SSEBlipBurstTransport()
+    let clock = RecordingClock()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport,
+        configuration: .init(liveReadMode: .sse)),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "claim"),
+      materializer: InMemoryShapeMaterializer(),
+      retryPolicy: .init(
+        maxRetries: 2, baseDelay: .seconds(1), maximumDelay: .seconds(2), jitterRatio: 0),
+      clock: clock)
+
+    _ = try await coordinator.start()
+    for _ in 0..<2_000 {
+      if case .reseedRequired = await coordinator.state { break }
+      await Task.yield()
+    }
+    #expect(await clock.delays == [.seconds(1), .seconds(2)])
+    let streamRequests = await transport.streamRequests
+    #expect(streamRequests.count == 3)
+    #expect(streamRequests.allSatisfy { $0.url?.query?.contains("live=sse") == true })
     try await coordinator.stop()
   }
 
