@@ -74,12 +74,13 @@ private final class SSEGateServer: @unchecked Sendable {
   @discardableResult
   func send(_ data: Data, to index: Int) -> Bool {
     let now = ContinuousClock().now
-    guard let connection = lock.withLock({
+    let connection: SSEGateProtocol? = lock.withLock {
       guard let connection = connections[index] else { return nil }
       sends[index, default: 0] += 1
       lastActivity[index] = now
       return connection
-    }) else { return false }
+    }
+    guard let connection else { return false }
     connection.client?.urlProtocol(connection, didLoad: data)
     return true
   }
