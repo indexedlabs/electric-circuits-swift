@@ -22,6 +22,7 @@ private final class SSEGateServer: @unchecked Sendable {
   private var connections: [Int: SSEGateProtocol] = [:]
   private var stopped: Set<Int> = []
   private var sends: [Int: Int] = [:]
+  private var lastActivity: [Int: ContinuousClock.Instant] = [:]
   private var generation = 0
   private var peak = 0
 
@@ -53,7 +54,9 @@ private final class SSEGateServer: @unchecked Sendable {
         cacheStoragePolicy: .notAllowed)
       lock.withLock {
         connections[reads.count] = connection
+        let openedAt = ContinuousClock().now
         reads.append(Read(request: connection.request, generation: generation))
+        lastActivity[reads.count - 1] = openedAt
         peak = max(peak, connections.count)
       }
     }
@@ -70,8 +73,13 @@ private final class SSEGateServer: @unchecked Sendable {
 
   @discardableResult
   func send(_ data: Data, to index: Int) -> Bool {
-    guard let connection = lock.withLock({ connections[index] }) else { return false }
-    lock.withLock { sends[index, default: 0] += 1 }
+    let now = ContinuousClock().now
+    guard let connection = lock.withLock({
+      guard let connection = connections[index] else { return nil }
+      sends[index, default: 0] += 1
+      lastActivity[index] = now
+      return connection
+    }) else { return false }
     connection.client?.urlProtocol(connection, didLoad: data)
     return true
   }
@@ -98,6 +106,9 @@ private final class SSEGateServer: @unchecked Sendable {
   func peakLiveReads() -> Int { lock.withLock { peak } }
   func wasStopped(_ index: Int) -> Bool { lock.withLock { stopped.contains(index) } }
   func sendCount(_ index: Int) -> Int { lock.withLock { sends[index, default: 0] } }
+  func elapsedSinceActivity(_ index: Int) -> Duration? {
+    lock.withLock { lastActivity[index].map { $0.duration(to: ContinuousClock().now) } }
+  }
 }
 
 private final class SSEGateRegistry: @unchecked Sendable {
@@ -445,7 +456,6 @@ struct SSEProductionGateTests {
       try await rig.requireSSERead(0, offset: "10")
       rig.server.send(gateData("first"), to: 0)
       rig.server.send(gateData("second"), to: 0)
-      try await gateWait("data frames delivered") { rig.server.sendCount(0) == 2 }
       for _ in 0..<20 { await Task.yield() }
       #expect(await rig.store.offsets().isEmpty)
       rig.server.send(gateControl("20"), to: 0)
@@ -511,6 +521,18 @@ struct SSEProductionGateTests {
     let crlf = Data(
       String(decoding: source, as: UTF8.self).replacingOccurrences(of: "\n", with: "\r\n").utf8)
     #expect(try parse([crlf]) == expected)
+
+    for split in 0...crlf.count {
+      #expect(try parse([Data(crlf.prefix(split)), Data(crlf.dropFirst(split))]) == expected)
+    }
+
+    let bom = Data([0xEF, 0xBB, 0xBF])
+      + Data("data: ".utf8) + expected[0].data + Data("\n\n".utf8)
+    let bomExpected = [SSEParser.Event(name: "message", data: expected[0].data)]
+    #expect(try parse([bom]) == bomExpected)
+    for split in 0...bom.count {
+      #expect(try parse([Data(bom.prefix(split)), Data(bom.dropFirst(split))]) == bomExpected)
+    }
 
     let fieldPrefix = Data("event: data\nda".utf8)
     let fieldSuffix = Data("ta: [{\"type\":\"public.items\",\"key\":\"first\",\"value\":{\"id\":\"first\"},\"headers\":{\"operation\":\"upsert\"}}]\n\n".utf8)
@@ -578,6 +600,7 @@ struct SSEProductionGateTests {
       try await gateWait("pre-stall commit") { await rig.store.offsets() == ["20"] }
       for index in 1...3 {
         try await rig.requireSSERead(index, offset: "20", timeout: .seconds(55))
+        #expect(rig.server.elapsedSinceActivity(index - 1) ?? .zero >= .seconds(44))
       }
       rig.server.send(gateData("second"), to: 3)
       rig.server.send(gateControl("30"), to: 3)
@@ -592,8 +615,8 @@ struct SSEProductionGateTests {
 }
 
 
-@Test("SSE fallback and keep-alive")
-func sseFallbackAndKeepAliveVerification() async throws {
+@Test("SSE fallback remains long-poll")
+func sseFallbackRemainsLongPoll() async throws {
   let transport = SSEFallbackTransport()
   let reader = ShapeStreamReader(
     streamURL: sseGateURL, transport: transport, materializer: InMemoryShapeMaterializer(),

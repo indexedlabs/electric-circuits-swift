@@ -60,7 +60,8 @@ struct SSEParser {
       dataLine = line.starts(with: dataField)
     }
     if dataLine {
-      let payloadStart = line.count > dataField.count && line[dataField.count] == 0x20
+      let fieldEnd = line.index(line.startIndex, offsetBy: dataField.count)
+      let payloadStart = line.count > dataField.count && line[fieldEnd] == 0x20
         ? dataField.count + 1 : dataField.count
       let payloadBytes = max(0, line.count - payloadStart)
       let projected = data.count + (hasData ? 1 : 0) + payloadBytes
@@ -96,7 +97,8 @@ struct SSEParser {
     // Copy data bytes directly. JSONDecoder validates the resulting UTF-8 after the event is
     // complete; avoiding a temporary String keeps an at-ceiling event from being held three times.
     if line.starts(with: dataField) {
-      let valueStart = line.count > dataField.count && line[dataField.count] == 0x20
+      let fieldEnd = line.index(line.startIndex, offsetBy: dataField.count)
+      let valueStart = line.count > dataField.count && line[fieldEnd] == 0x20
         ? dataField.count + 1 : dataField.count
       let value = line.dropFirst(valueStart)
       let additionalBytes = value.count + (hasData ? 1 : 0)
