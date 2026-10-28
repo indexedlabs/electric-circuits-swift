@@ -537,6 +537,7 @@ public struct ShapeStreamReader: Sendable {
           do { batch = try JSONDecoder().decode(ChangeBatch.self, from: event.data) } catch {
             throw StreamError.decoding("Invalid SSE data event")
           }
+          lastActivity = clock.now
           guard
             batch.envelopes.count <= limits.maximumChangeEventsPerStreamBatch - pending.envelopes.count
           else {
@@ -550,12 +551,14 @@ public struct ShapeStreamReader: Sendable {
           do { control = try JSONDecoder().decode(Control.self, from: event.data) } catch {
             throw StreamError.decoding("Invalid SSE control event")
           }
+          lastActivity = clock.now
           sawControl = true
           if let offset = control.streamNextOffset, !offset.isEmpty, offset != cursor.offset {
             let lsn = pending.envelopes.reversed().compactMap { $0.headers.lsn }.first ?? cursor.lsn
             cursor = try await reader.commit(
               PollResult(batch: pending, cursor: StreamCursor(offset: offset, lsn: lsn)),
               expecting: expectedCursor)
+            lastActivity = clock.now
             expectedCursor = cursor
             pending = ChangeBatch()
           }

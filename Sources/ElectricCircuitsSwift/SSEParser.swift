@@ -64,6 +64,26 @@ struct SSEParser {
       hasData = false
       return event
     }
+    // Copy data bytes directly. JSONDecoder validates the resulting UTF-8 after the event is
+    // complete; avoiding a temporary String keeps an at-ceiling event from being held three times.
+    if line.starts(with: dataField) {
+      let valueStart = line.count > dataField.count && line[dataField.count] == 0x20
+        ? dataField.count + 1 : dataField.count
+      let value = line.dropFirst(valueStart)
+      let additionalBytes = value.count + (hasData ? 1 : 0)
+      let nextCount = data.count + additionalBytes
+      while nextCount > maximumEventBytes && maximumEventBytes < maximumEventBytesCeiling {
+        maximumEventBytes = min(maximumEventBytes * 2, maximumEventBytesCeiling)
+      }
+      guard nextCount <= maximumEventBytes else {
+        throw StreamError.responseTooLarge(
+          limit: maximumEventBytesCeiling, observed: maximumEventBytesCeiling + 1)
+      }
+      if hasData { data.append(0x0A) }
+      data.append(contentsOf: value)
+      hasData = true
+      return nil
+    }
     guard let text = String(data: line, encoding: .utf8) else {
       throw StreamError.decoding("Invalid UTF-8 in SSE event")
     }
@@ -74,19 +94,7 @@ struct SSEParser {
     if value.first == " " { value = value.dropFirst() }
     switch field {
     case "event": name = String(value)
-    case "data":
-      let additionalBytes = value.utf8.count + (hasData ? 1 : 0)
-      let nextCount = data.count + additionalBytes
-      while nextCount > maximumEventBytes && maximumEventBytes < maximumEventBytesCeiling {
-        maximumEventBytes = min(maximumEventBytes * 2, maximumEventBytesCeiling)
-      }
-      guard nextCount <= maximumEventBytes else {
-        throw StreamError.responseTooLarge(
-          limit: maximumEventBytesCeiling, observed: maximumEventBytesCeiling + 1)
-      }
-      if hasData { data.append(0x0A) }
-      data.append(contentsOf: value.utf8)
-      hasData = true
+    case "data": break
     default: break
     }
     return nil

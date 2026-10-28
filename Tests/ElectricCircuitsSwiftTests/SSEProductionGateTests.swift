@@ -21,6 +21,7 @@ private final class SSEGateServer: @unchecked Sendable {
   private var reads: [Read] = []
   private var connections: [Int: SSEGateProtocol] = [:]
   private var stopped: Set<Int> = []
+  private var sends: [Int: Int] = [:]
   private var generation = 0
   private var peak = 0
 
@@ -70,6 +71,7 @@ private final class SSEGateServer: @unchecked Sendable {
   @discardableResult
   func send(_ data: Data, to index: Int) -> Bool {
     guard let connection = lock.withLock({ connections[index] }) else { return false }
+    lock.withLock { sends[index, default: 0] += 1 }
     connection.client?.urlProtocol(connection, didLoad: data)
     return true
   }
@@ -95,6 +97,7 @@ private final class SSEGateServer: @unchecked Sendable {
   func snapshot() -> [Read] { lock.withLock { reads } }
   func peakLiveReads() -> Int { lock.withLock { peak } }
   func wasStopped(_ index: Int) -> Bool { lock.withLock { stopped.contains(index) } }
+  func sendCount(_ index: Int) -> Int { lock.withLock { sends[index, default: 0] } }
 }
 
 private final class SSEGateRegistry: @unchecked Sendable {
@@ -184,6 +187,32 @@ private actor SSEFallbackTransport: HTTPTransport {
         url: request.url!, statusCode: pollCount == 1 ? 204 : 404, httpVersion: nil,
         headerFields: nil)!)
   }
+}
+
+private actor SSESetupFailureTransport: HTTPTransport {
+  private(set) var requests: [URLRequest] = []
+
+  func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes: @Sendable (Data) async throws -> Void
+  ) async throws {
+    requests.append(request)
+    throw URLError(.networkConnectionLost)
+  }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    return HTTPResponse(
+      data: Data(), response: HTTPURLResponse(
+        url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
+  }
+}
+
+private actor SSEByteProbe {
+  private var chunks: [Data] = []
+  func append(_ data: Data) { chunks.append(data) }
+  func data() -> Data { chunks.reduce(into: Data()) { $0.append($1) } }
 }
 
 private actor SSEKeepAliveTransport: HTTPTransport {
@@ -386,6 +415,7 @@ struct SSEProductionGateTests {
       try await rig.requireSSERead(0, offset: "10")
       rig.server.send(gateData("first"), to: 0)
       rig.server.send(gateData("second"), to: 0)
+      try await gateWait("data frames delivered") { rig.server.sendCount(0) == 2 }
       #expect(await rig.store.offsets().isEmpty)
       rig.server.send(gateControl("20"), to: 0)
       try await gateWait("combined data commit") { await rig.store.offsets() == ["20"] }
@@ -486,6 +516,7 @@ struct SSEProductionGateTests {
       try await gateWait("pre-stall commit") { await rig.store.offsets() == ["20"] }
       for index in 1...3 {
         try await rig.requireSSERead(index, offset: "20", timeout: .seconds(55))
+        try await gateWait("previous response stopped") { rig.server.wasStopped(index - 1) }
         #expect(rig.server.wasStopped(index - 1))
       }
       #expect(rig.server.peakLiveReads() == 1)
@@ -516,6 +547,51 @@ func sseFallbackAndKeepAliveVerification() async throws {
   #expect(requests[0].url?.query?.contains("live=sse") == true)
   #expect(requests[1].url?.query?.contains("live=long-poll") == true)
   #expect(requests[2].url?.query?.contains("live=long-poll") == true)
+}
+
+@Test("SSE transport failure before first control falls back to long-poll")
+func sseTransportFailureBeforeControlFallsBack() async throws {
+  let transport = SSESetupFailureTransport()
+  let reader = ShapeStreamReader(
+    streamURL: sseGateURL, transport: transport, materializer: InMemoryShapeMaterializer(),
+    configuration: .init(liveReadMode: .sse))
+  await #expect(throws: StreamError.terminal(path: "/stream", status: 404, reason: .notFound)) {
+    try await reader.run()
+  }
+  let requests = await transport.requests
+  #expect(requests.count == 2)
+  #expect(requests[0].url?.query?.contains("live=sse") == true)
+  #expect(requests[1].url?.query?.contains("live=long-poll") == true)
+}
+
+@Test("URLSessionTransport flushes a small SSE frame at its line boundary")
+func urlSessionTransportFlushesSmallSSEFrame() async throws {
+  let server = SSEGateServer()
+  let configuration = URLSessionConfiguration.ephemeral
+  configuration.protocolClasses = [SSEGateProtocol.self]
+  let session = URLSession(configuration: configuration)
+  let transport = URLSessionTransport(session: session)
+  let probe = SSEByteProbe()
+  var request = URLRequest(url: sseGateURL)
+  request.httpMethod = "GET"
+  request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+  SSEGateProtocol.registry.install(server)
+  defer { session.invalidateAndCancel() }
+
+  let task = Task {
+    try await transport.stream(
+      request,
+      onResponse: { _ in },
+      onBytes: { bytes in await probe.append(bytes) })
+  }
+  try await gateWait("small SSE transport request") { server.snapshot().count == 1 }
+  let frame = gateControl("20")
+  #expect(frame.count < 16 * 1024)
+  #expect(server.send(frame, to: 0))
+  try await gateWait("small SSE frame delivery") { (await probe.data()) == frame }
+  #expect(await probe.data() == frame)
+  task.cancel()
+  _ = await task.result
 }
 
 @Test("SSE keep-alive control does not commit pending data")
