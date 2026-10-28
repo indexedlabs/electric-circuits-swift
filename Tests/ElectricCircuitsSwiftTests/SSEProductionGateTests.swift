@@ -335,6 +335,36 @@ private func sendSizedGateEvent(_ payloadSize: Int, server: SSEGateServer, read:
 
 @Suite("SSE production-readiness gates", .serialized)
 struct SSEProductionGateTests {
+  @Test("URLSessionTransport flushes a small SSE frame at its line boundary")
+  func urlSessionTransportFlushesSmallSSEFrame() async throws {
+    let server = SSEGateServer()
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [SSEGateProtocol.self]
+    let session = URLSession(configuration: configuration)
+    let transport = URLSessionTransport(session: session)
+    let probe = SSEByteProbe()
+    var request = URLRequest(url: sseGateURL)
+    request.httpMethod = "GET"
+    request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+    SSEGateProtocol.registry.install(server)
+    defer { session.invalidateAndCancel() }
+
+    let task = Task {
+      try await transport.stream(
+        request,
+        onResponse: { _ in },
+        onBytes: { bytes in await probe.append(bytes) })
+    }
+    try await gateWait("small SSE transport request") { server.snapshot().count == 1 }
+    let frame = gateControl("20")
+    #expect(frame.count < 16 * 1024)
+    #expect(server.send(frame, to: 0))
+    try await gateWait("small SSE frame delivery") { (await probe.data()) == frame }
+    #expect(await probe.data() == frame)
+    task.cancel()
+    _ = await task.result
+  }
+
   @Test(
     arguments: [16 * 1024 * 1024, 16 * 1024 * 1024 + 1, 64 * 1024 * 1024, 64 * 1024 * 1024 + 1])
   func largeEventsParseWholeAndCommit(size: Int) async throws {
@@ -562,36 +592,6 @@ func sseTransportFailureBeforeControlFallsBack() async throws {
   #expect(requests.count == 2)
   #expect(requests[0].url?.query?.contains("live=sse") == true)
   #expect(requests[1].url?.query?.contains("live=long-poll") == true)
-}
-
-@Test("URLSessionTransport flushes a small SSE frame at its line boundary")
-func urlSessionTransportFlushesSmallSSEFrame() async throws {
-  let server = SSEGateServer()
-  let configuration = URLSessionConfiguration.ephemeral
-  configuration.protocolClasses = [SSEGateProtocol.self]
-  let session = URLSession(configuration: configuration)
-  let transport = URLSessionTransport(session: session)
-  let probe = SSEByteProbe()
-  var request = URLRequest(url: sseGateURL)
-  request.httpMethod = "GET"
-  request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-  SSEGateProtocol.registry.install(server)
-  defer { session.invalidateAndCancel() }
-
-  let task = Task {
-    try await transport.stream(
-      request,
-      onResponse: { _ in },
-      onBytes: { bytes in await probe.append(bytes) })
-  }
-  try await gateWait("small SSE transport request") { server.snapshot().count == 1 }
-  let frame = gateControl("20")
-  #expect(frame.count < 16 * 1024)
-  #expect(server.send(frame, to: 0))
-  try await gateWait("small SSE frame delivery") { (await probe.data()) == frame }
-  #expect(await probe.data() == frame)
-  task.cancel()
-  _ = await task.result
 }
 
 @Test("SSE keep-alive control does not commit pending data")
