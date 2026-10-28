@@ -509,6 +509,7 @@ public struct ShapeStreamReader: Sendable {
     }
 
     func receive(_ headers: HTTPURLResponse) throws {
+      lastActivity = clock.now
       let status = headers.statusCode
       if headers.value(forHTTPHeaderField: "stream-closed")?.lowercased() == "true" {
         throw StreamError.terminal(path: reader.streamURL.path, status: status, reason: .closed)
