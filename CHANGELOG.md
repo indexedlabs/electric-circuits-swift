@@ -7,7 +7,9 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 
 - Add opt-in SSE live reads through `ElectricCircuitsClient.Configuration`. The reader holds one
   response per stream, commits data frames with each control offset, resumes after clean response
-  ends, and falls back to long-poll when SSE setup is unavailable. Long-poll remains the default.
+  ends, and falls back to long-poll only when the server refuses SSE with a non-event-stream
+  response or a nonterminal 4xx. Transport failures and retryable responses stay on SSE and use
+  the shared retry policy. Long-poll remains the default.
 
 ## 0.7.1
 

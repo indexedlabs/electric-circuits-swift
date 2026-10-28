@@ -125,6 +125,20 @@ struct SSEParser {
       throw StreamError.decoding("Invalid UTF-8 in SSE event")
     }
     if text.hasPrefix(":") { return nil }
+    if text == "data" {
+      let additionalBytes = hasData ? 1 : 0
+      let nextCount = data.count + additionalBytes
+      while nextCount > maximumEventBytes && maximumEventBytes < maximumEventBytesCeiling {
+        maximumEventBytes = min(maximumEventBytes * 2, maximumEventBytesCeiling)
+      }
+      guard nextCount <= maximumEventBytes else {
+        throw StreamError.responseTooLarge(
+          limit: maximumEventBytesCeiling, observed: maximumEventBytesCeiling + 1)
+      }
+      if hasData { data.append(0x0A) }
+      hasData = true
+      return nil
+    }
     let parts = text.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
     let field = parts[0]
     var value = parts.count == 2 ? parts[1] : Substring()
