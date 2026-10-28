@@ -493,7 +493,7 @@ public struct URLSessionTransport: HTTPTransport {
             try Task.checkCancellation()
             try await onBytes(chunk)
             chunk.removeAll(keepingCapacity: true)
-          } else if byte == 0x0A {
+          } else if byte == 0x0A || byte == 0x0D {
             // SSE dispatches an event at a blank line. Flush each line terminator so small data,
             // control, and keep-alive events reach the reader without waiting for more bytes.
             try Task.checkCancellation()

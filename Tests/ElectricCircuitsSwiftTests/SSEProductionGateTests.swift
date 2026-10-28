@@ -423,6 +423,27 @@ struct SSEProductionGateTests {
     _ = await task.result
   }
 
+  @Test("URLSessionTransport delivers CR-only SSE frames incrementally")
+  func urlSessionTransportDeliversCROnlySSEFrame() async throws {
+    let rig = SSEGateRig()
+    defer { rig.session.invalidateAndCancel() }
+    let reader = ShapeStreamReader(
+      streamURL: sseGateURL, transport: rig.transport, materializer: rig.store,
+      configuration: await rig.client.configuration)
+    let task = Task { try await reader.run() }
+    try await rig.requireSSERead(0, offset: "10")
+
+    func crOnly(_ data: Data) -> Data {
+      Data(String(decoding: data, as: UTF8.self).replacingOccurrences(of: "\n", with: "\r").utf8)
+    }
+    #expect(rig.server.send(crOnly(gateData("cr-only")), to: 0))
+    #expect(rig.server.send(crOnly(gateControl("20")), to: 0))
+    try await gateWait("CR-only SSE frame commit") { await rig.store.offsets() == ["20"] }
+    #expect(await rig.store.keys() == ["cr-only"])
+    task.cancel()
+    _ = await task.result
+  }
+
   @Test(
     arguments: [16 * 1024 * 1024, 16 * 1024 * 1024 + 1, 64 * 1024 * 1024, 64 * 1024 * 1024 + 1])
   func largeEventsParseWholeAndCommit(size: Int) async throws {
