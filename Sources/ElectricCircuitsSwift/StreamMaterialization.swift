@@ -323,7 +323,9 @@ public struct ShapeStreamReader: Sendable {
     responseDecodingLimits: ResponseDecodingLimits = .default,
     configuration: ElectricCircuitsClient.Configuration = .default
   ) {
-    self.liveReadState = LiveReadState(mode: configuration.liveReadMode)
+    self.liveReadState = LiveReadState(
+      mode: configuration.liveReadMode,
+      maximumEventBytes: responseDecodingLimits.maximumDecodedResponseBytes)
     self.streamURL = streamURL
     self.transport = transport
     self.materializer = materializer
@@ -362,9 +364,12 @@ public struct ShapeStreamReader: Sendable {
             continue
           }
           if let streamError = error as? StreamError, case .terminal = streamError { throw error }
-          guard !(await response.sawControl) else { throw error }
-          // This state belongs to the reader's source lifetime, including coordinator retries.
-          await liveReadState.fallBack()
+          if shouldFallBackFromSSE(error, sawControl: await response.sawControl) {
+            // This state belongs to the reader's source lifetime, including coordinator retries.
+            await liveReadState.fallBack()
+          } else {
+            throw error
+          }
         }
         await liveReadState.setMaximumEventBytes(await response.maximumEventBytes)
         (cursor, expectedCursor) = await response.checkpoint()
@@ -378,7 +383,7 @@ public struct ShapeStreamReader: Sendable {
   private actor LiveReadState {
     private(set) var mode: LiveReadMode
     private(set) var maximumEventBytes: Int
-    init(mode: LiveReadMode, maximumEventBytes: Int = ResponseDecodingLimits.default.maximumDecodedResponseBytes) {
+    init(mode: LiveReadMode, maximumEventBytes: Int) {
       self.mode = mode
       self.maximumEventBytes = maximumEventBytes
     }
@@ -424,11 +429,12 @@ public struct ShapeStreamReader: Sendable {
       name: "electric.stream.sse", kind: .client,
       parentTraceparent: request.value(forHTTPHeaderField: "traceparent"))
     telemetry.injectTraceContext(into: &request, span: span)
+    let streamRequest = request
     do {
       try await withThrowingTaskGroup(of: Void.self) { group in
         group.addTask {
           try await self.transport.stream(
-            request,
+            streamRequest,
             onResponse: { try await receiver.receive($0) },
             onBytes: { try await receiver.receive($0) })
         }
@@ -450,6 +456,22 @@ public struct ShapeStreamReader: Sendable {
     // The receiver is response-local: trailing partial events and uncommitted data are dropped.
   }
 
+  private func shouldFallBackFromSSE(_ error: Error, sawControl: Bool) -> Bool {
+    guard !sawControl else { return false }
+    if error is SSEFallback || error is StreamingUnsupported { return true }
+    if let streamError = error as? StreamError {
+      switch streamError {
+      case .responseTooLarge, .batchTooLarge, .decoding:
+        return false
+      case .terminal:
+        return false
+      default:
+        return true
+      }
+    }
+    return true
+  }
+
   private struct SSEFallback: Error {}
 
   private actor SSEReadSession {
@@ -459,7 +481,8 @@ public struct ShapeStreamReader: Sendable {
     var parser: SSEParser
     var pending = ChangeBatch()
     private(set) var maximumEventBytes: Int
-    private var frameGeneration: UInt64 = 0
+    private let clock = ContinuousClock()
+    private var lastActivity: ContinuousClock.Instant
     private(set) var sawControl = false
 
     init(
@@ -471,15 +494,17 @@ public struct ShapeStreamReader: Sendable {
       self.expectedCursor = expectedCursor
       self.maximumEventBytes = maximumEventBytes
       parser = SSEParser(maximumEventBytes: maximumEventBytes)
+      lastActivity = ContinuousClock().now
     }
 
     func checkpoint() -> (StreamCursor, StreamCursor?) { (cursor, expectedCursor) }
 
     func waitForSilence(timeout: Duration) async throws {
       while true {
-        let generation = frameGeneration
-        try await Task.sleep(for: timeout)
-        if frameGeneration == generation { throw SSEStalled() }
+        let deadline = lastActivity.advanced(by: timeout)
+        if clock.now >= deadline { throw SSEStalled() }
+        try await Task.sleep(until: deadline, clock: clock)
+        if clock.now >= lastActivity.advanced(by: timeout) { throw SSEStalled() }
       }
     }
 
@@ -500,6 +525,7 @@ public struct ShapeStreamReader: Sendable {
     }
 
     func receive(_ bytes: Data) async throws {
+      lastActivity = clock.now
       for byte in bytes {
         try Task.checkCancellation()
         guard let event = try parser.append(byte) else { continue }
@@ -537,7 +563,6 @@ public struct ShapeStreamReader: Sendable {
           }
         default: break
         }
-        frameGeneration &+= 1
         maximumEventBytes = parser.maximumEventBytes
       }
     }

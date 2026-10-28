@@ -11,7 +11,6 @@ struct SSEParser {
 
   private(set) var maximumEventBytes: Int
   private let maximumEventBytesCeiling = 512 * 1024 * 1024
-  private var eventBytes = 0
   private var line = Data()
   private var name = ""
   private var data = Data()
@@ -20,7 +19,7 @@ struct SSEParser {
   private var firstLine = true
 
   init(maximumEventBytes: Int) {
-    self.maximumEventBytes = maximumEventBytes
+    self.maximumEventBytes = max(1, min(maximumEventBytes, maximumEventBytesCeiling))
   }
 
   mutating func append(_ byte: UInt8) throws -> Event? {
@@ -28,12 +27,26 @@ struct SSEParser {
       skipLF = false
       if byte == 0x0A { return nil }
     }
-    eventBytes += 1
     if byte == 0x0D || byte == 0x0A {
       skipLF = byte == 0x0D
       return try finishLine()
     }
     line.append(byte)
+    // A data line is the largest temporary allocation in this parser. Check its decoded payload
+    // as it arrives, while allowing the `data: ` field prefix and an exact-ceiling payload.
+    if line.count >= 5, line.prefix(5).elementsEqual(Data("data:".utf8)) {
+      let payloadStart = line.count > 5 && line[5] == 0x20 ? 6 : 5
+      let payloadBytes = max(0, line.count - payloadStart)
+      let projected = data.count + (hasData ? 1 : 0) + payloadBytes
+      guard projected <= maximumEventBytesCeiling else {
+        throw StreamError.responseTooLarge(
+          limit: maximumEventBytesCeiling, observed: maximumEventBytesCeiling + 1)
+      }
+    } else if line.count > maximumEventBytesCeiling + 6 {
+      // Bound malformed or unknown fields too; they cannot become JSON data after this point.
+      throw StreamError.responseTooLarge(
+        limit: maximumEventBytesCeiling, observed: maximumEventBytesCeiling + 1)
+    }
     return nil
   }
 
@@ -44,20 +57,10 @@ struct SSEParser {
       if line.starts(with: [0xEF, 0xBB, 0xBF]) { line.removeFirst(3) }
     }
     if line.isEmpty {
-      if data.count > maximumEventBytes {
-        while data.count > maximumEventBytes && maximumEventBytes < maximumEventBytesCeiling {
-          maximumEventBytes = min(maximumEventBytes * 2, maximumEventBytesCeiling)
-        }
-        guard data.count <= maximumEventBytes else {
-          throw StreamError.responseTooLarge(
-            limit: maximumEventBytesCeiling, observed: maximumEventBytesCeiling + 1)
-        }
-      }
       let event = hasData ? Event(name: name.isEmpty ? "message" : name, data: data) : nil
       name = ""
       data = Data()
       hasData = false
-      eventBytes = 0
       return event
     }
     guard let text = String(data: line, encoding: .utf8) else {
@@ -71,6 +74,15 @@ struct SSEParser {
     switch field {
     case "event": name = String(value)
     case "data":
+      let additionalBytes = value.utf8.count + (hasData ? 1 : 0)
+      let nextCount = data.count + additionalBytes
+      while nextCount > maximumEventBytes && maximumEventBytes < maximumEventBytesCeiling {
+        maximumEventBytes = min(maximumEventBytes * 2, maximumEventBytesCeiling)
+      }
+      guard nextCount <= maximumEventBytes else {
+        throw StreamError.responseTooLarge(
+          limit: maximumEventBytesCeiling, observed: maximumEventBytesCeiling + 1)
+      }
       if hasData { data.append(0x0A) }
       data.append(contentsOf: value.utf8)
       hasData = true
