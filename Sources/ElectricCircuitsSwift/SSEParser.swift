@@ -18,6 +18,8 @@ struct SSEParser {
   private var hasData = false
   private var skipLF = false
   private var firstLine = true
+  private var lineFieldChecked = false
+  private var dataLine = false
 
   init(maximumEventBytes: Int) {
     self.maximumEventBytes = max(1, min(maximumEventBytes, maximumEventBytesCeiling))
@@ -51,6 +53,51 @@ struct SSEParser {
     return nil
   }
 
+  mutating func append(_ bytes: Data) throws -> [Event] {
+    var events: [Event] = []
+    var index = bytes.startIndex
+    while index < bytes.endIndex {
+      if skipLF {
+        skipLF = false
+        if bytes[index] == 0x0A {
+          index = bytes.index(after: index)
+          continue
+        }
+      }
+      let newline = bytes[index...].firstIndex { $0 == 0x0D || $0 == 0x0A }
+      let lineEnd = newline ?? bytes.endIndex
+      if index < lineEnd {
+        line.append(contentsOf: bytes[index..<lineEnd])
+        try checkLineLimit()
+      }
+      guard let newline else { break }
+      skipLF = bytes[newline] == 0x0D
+      if let event = try finishLine() { events.append(event) }
+      index = bytes.index(after: newline)
+    }
+    return events
+  }
+
+  private mutating func checkLineLimit() throws {
+    if !lineFieldChecked, line.count >= dataField.count {
+      lineFieldChecked = true
+      dataLine = line.starts(with: dataField)
+    }
+    if dataLine {
+      let payloadStart = line.count > dataField.count && line[dataField.count] == 0x20
+        ? dataField.count + 1 : dataField.count
+      let payloadBytes = max(0, line.count - payloadStart)
+      let projected = data.count + (hasData ? 1 : 0) + payloadBytes
+      guard projected <= maximumEventBytesCeiling else {
+        throw StreamError.responseTooLarge(
+          limit: maximumEventBytesCeiling, observed: maximumEventBytesCeiling + 1)
+      }
+    } else if line.count > maximumEventBytesCeiling + 6 {
+      throw StreamError.responseTooLarge(
+        limit: maximumEventBytesCeiling, observed: maximumEventBytesCeiling + 1)
+    }
+  }
+
   private mutating func finishLine() throws -> Event? {
     defer { line.removeAll(keepingCapacity: true) }
     if firstLine {
@@ -62,6 +109,8 @@ struct SSEParser {
       name = ""
       data = Data()
       hasData = false
+      lineFieldChecked = false
+      dataLine = false
       return event
     }
     // Copy data bytes directly. JSONDecoder validates the resulting UTF-8 after the event is
@@ -82,6 +131,8 @@ struct SSEParser {
       if hasData { data.append(0x0A) }
       data.append(contentsOf: value)
       hasData = true
+      lineFieldChecked = false
+      dataLine = false
       return nil
     }
     guard let text = String(data: line, encoding: .utf8) else {
@@ -97,6 +148,8 @@ struct SSEParser {
     case "data": break
     default: break
     }
+    lineFieldChecked = false
+    dataLine = false
     return nil
   }
 }

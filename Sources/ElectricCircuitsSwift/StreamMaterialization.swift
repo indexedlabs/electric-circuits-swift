@@ -532,9 +532,8 @@ public struct ShapeStreamReader: Sendable {
 
     func receive(_ bytes: Data) async throws {
       lastActivity = clock.now
-      for byte in bytes {
-        try Task.checkCancellation()
-        guard let event = try parser.append(byte) else { continue }
+      try Task.checkCancellation()
+      for event in try parser.append(bytes) {
         switch event.name {
         case "data":
           let limits = reader.responseDecodingLimits

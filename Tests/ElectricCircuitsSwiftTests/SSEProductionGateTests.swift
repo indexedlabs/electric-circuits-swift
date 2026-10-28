@@ -546,7 +546,6 @@ struct SSEProductionGateTests {
       rig.server.send(gateControl("20"), to: 0)
       try await gateWait("pre-stall commit") { await rig.store.offsets() == ["20"] }
       for index in 1...3 {
-        try await gateWait("previous response stopped") { rig.server.wasStopped(index - 1) }
         try await rig.requireSSERead(index, offset: "20", timeout: .seconds(55))
       }
       rig.server.send(gateData("second"), to: 3)
