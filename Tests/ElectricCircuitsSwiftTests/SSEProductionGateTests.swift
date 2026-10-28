@@ -446,6 +446,7 @@ struct SSEProductionGateTests {
       rig.server.send(gateData("first"), to: 0)
       rig.server.send(gateData("second"), to: 0)
       try await gateWait("data frames delivered") { rig.server.sendCount(0) == 2 }
+      for _ in 0..<20 { await Task.yield() }
       #expect(await rig.store.offsets().isEmpty)
       rig.server.send(gateControl("20"), to: 0)
       try await gateWait("combined data commit") { await rig.store.offsets() == ["20"] }
@@ -545,9 +546,8 @@ struct SSEProductionGateTests {
       rig.server.send(gateControl("20"), to: 0)
       try await gateWait("pre-stall commit") { await rig.store.offsets() == ["20"] }
       for index in 1...3 {
-        try await rig.requireSSERead(index, offset: "20", timeout: .seconds(55))
         try await gateWait("previous response stopped") { rig.server.wasStopped(index - 1) }
-        #expect(rig.server.wasStopped(index - 1))
+        try await rig.requireSSERead(index, offset: "20", timeout: .seconds(55))
       }
       #expect(rig.server.peakLiveReads() == 1)
       rig.server.send(gateData("second"), to: 3)
