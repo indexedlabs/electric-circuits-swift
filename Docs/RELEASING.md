@@ -12,10 +12,10 @@ Use the [SemVer policy](../Policies/SEMVER.md) to classify later changes. In par
 documented source-compatibility promise within a supported release line and do not imply binary
 module stability.
 
-The 0.8.0 minor release adds transport and authority cases to `CollectionLoadFailure`. Sources own
-redaction of their classified type and message, and consumers with exhaustive switches must handle
-the new cases. It also includes the stream retry fix documented in the 0.7.1 changelog entry. It
-introduces no store protocol, persisted schema, or HTTP changes.
+The 0.8.0 minor release adds transport and authority cases to `CollectionLoadFailure`, which now
+conforms to `Error`. Sources own redaction of their classified type and message, and consumers with
+exhaustive switches must handle the new cases. It also includes the stream retry fix documented in
+the 0.7.1 changelog entry. It introduces no store protocol, persisted schema, or HTTP changes.
 
 ## Consumer installation
 

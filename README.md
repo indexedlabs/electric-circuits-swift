@@ -47,7 +47,7 @@ in the current generation; after successful replacement, the old materialization
 its claims cannot retain stale rows. Other principals and authorization scopes are excluded.
 Idle listings run every five seconds; opening the gate, local snapshot/feed writes, completed
 runs and retry expiry wake the pass immediately. Cancel and await the task when
-retiring its scope or generation. The store protocol is unchanged in 0.7.1.
+retiring its scope or generation. The store protocol is unchanged in 0.8.0.
 
 For app-wide scheduling across collections, await `drainStaleRevalidation()` before opening the
 next collection's gate or starting an explicit repair read. Drain closes admission and lets

@@ -7,8 +7,7 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 
 - Add `CollectionLoadFailure.transport(errorType:message:)` and
   `CollectionLoadFailure.authority(errorType:message:)`, preserving the source's safe error
-  classification through collection lease state. `CollectionLoadFailure` remains `Error`
-  conforming.
+  classification through collection lease state. `CollectionLoadFailure` now conforms to `Error`.
 - Sources own redaction: classified messages must be safe and must not contain credentials,
   capability URLs, request bodies, or row content.
 - This public enum change can break exhaustive switches. Consumers must add handling for the two
