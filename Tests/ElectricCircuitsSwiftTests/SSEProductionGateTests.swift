@@ -583,6 +583,10 @@ struct SSEProductionGateTests {
     let fieldSuffix = Data("ta: [{\"type\":\"public.items\",\"key\":\"first\",\"value\":{\"id\":\"first\"},\"headers\":{\"operation\":\"upsert\"}}]\n\n".utf8)
       + keepAlive + control + partial
     #expect(try parse([fieldPrefix, fieldSuffix]) == expected)
+
+    #expect(try parse([Data("data\ndata: x\n\n".utf8)]) == [
+      SSEParser.Event(name: "message", data: Data("\nx".utf8)),
+    ])
   }
 
   @Test func parserRejectsDataAfterCommentWhenEventWouldCrossCeiling() throws {
@@ -729,19 +733,18 @@ func sseFallbackLastsThroughRetriesAndResetsOnSetup() async throws {
   try await second.stop()
 }
 
-@Test("SSE transport failure before first control falls back to long-poll")
-func sseTransportFailureBeforeControlFallsBack() async throws {
+@Test("SSE transport failure before first control stays on SSE")
+func sseTransportFailureBeforeControlStaysOnSSE() async throws {
   let transport = SSESetupFailureTransport()
   let reader = ShapeStreamReader(
     streamURL: sseGateURL, transport: transport, materializer: InMemoryShapeMaterializer(),
     configuration: .init(liveReadMode: .sse))
-  await #expect(throws: StreamError.terminal(path: "/stream", status: 404, reason: .notFound)) {
+  await #expect(throws: URLError.self) {
     try await reader.run()
   }
   let requests = await transport.requests
-  #expect(requests.count == 2)
+  #expect(requests.count == 1)
   #expect(requests[0].url?.query?.contains("live=sse") == true)
-  #expect(requests[1].url?.query?.contains("live=long-poll") == true)
 }
 
 @Test("SSE keep-alive control does not commit pending data")
