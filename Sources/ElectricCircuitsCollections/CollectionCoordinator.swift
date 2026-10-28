@@ -757,8 +757,11 @@ public actor CollectionCoordinator<
       _ = await cleanup(stop, identity: identity, attempt: attempt)
       return
     } catch {
-      _ = await cleanup(stop, identity: identity, attempt: attempt)
-      fail(identity: identity, attempt: attempt, with: .storeUnavailable)
+      if await cleanup(
+        stop, identity: identity, attempt: attempt, primaryFailure: .storeUnavailable
+      ) {
+        fail(identity: identity, attempt: attempt, with: .storeUnavailable)
+      }
       return
     }
 

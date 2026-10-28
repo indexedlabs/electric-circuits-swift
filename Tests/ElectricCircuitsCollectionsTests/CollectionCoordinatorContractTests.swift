@@ -216,6 +216,54 @@ private actor LiveApplyFailingStore: CollectionStore {
   struct ApplyFailure: Error {}
 }
 
+private actor SnapshotFailingStore: CollectionStore {
+  typealias Model = CoordinatorIssue
+  typealias Key = Int
+
+  let base: InMemoryCollectionStore<CoordinatorIssue, Int>
+
+  init(base: InMemoryCollectionStore<CoordinatorIssue, Int>) {
+    self.base = base
+  }
+
+  func materialization(for demand: CollectionDemandIdentity) async throws
+    -> CollectionMaterializationRecord?
+  {
+    try await base.materialization(for: demand)
+  }
+
+  func staleMaterializations() async throws -> [CollectionStaleMaterialization] {
+    try await base.staleMaterializations()
+  }
+
+  func clearStale(
+    _ materializationID: CollectionMaterializationID, ifMarkedAt position: CollectionSourceVersion
+  ) async throws {
+    try await base.clearStale(materializationID, ifMarkedAt: position)
+  }
+
+  func replaceSnapshot(
+    _: CollectionSnapshot<CoordinatorIssue>,
+    materializationID _: CollectionMaterializationID,
+    demand _: CollectionDemandIdentity
+  ) async throws {
+    throw SnapshotFailure()
+  }
+
+  func apply(
+    _ batch: CollectionChangeBatch<CoordinatorIssue, Int>,
+    to materializationID: CollectionMaterializationID
+  ) async throws {
+    try await base.apply(batch, to: materializationID)
+  }
+
+  func removeMaterialization(_ materializationID: CollectionMaterializationID) async throws {
+    try await base.removeMaterialization(materializationID)
+  }
+
+  struct SnapshotFailure: Error {}
+}
+
 private actor EvictionGateStore: CollectionStore {
   typealias Model = CoordinatorIssue
   typealias Key = Int
@@ -699,6 +747,68 @@ struct CollectionCoordinatorContractTests {
     try await failed.release()
     try await retries[0].release()
     try await retries[1].release()
+  }
+
+  @Test func snapshotStoreFailurePrecedesClassifiedCleanupFailureAndReleaseRetriesStop()
+    async throws
+  {
+    let cleanupFailure = CollectionLoadFailure.authority(
+      errorType: "NativeCircuitsAuthorityError.changed", message: "authority_changed")
+    let source = ScriptedIssueSource(
+      outcomes: [.success([])], stopFailures: 1, stopFailure: cleanupFailure)
+    let store = SnapshotFailingStore(
+      base: InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id))
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let lease = await coordinator.acquire(.init(unsafePredicateIdentity: "open"))
+    let failures = Task { () -> [CollectionLoadFailure] in
+      var values: [CollectionLoadFailure] = []
+      for await state in lease.stateUpdates {
+        if case .failed(let failure) = state { values.append(failure) }
+      }
+      return values
+    }
+
+    #expect(await wait(for: .failed(.storeUnavailable), lease: lease))
+    try await lease.release()
+    #expect(await failures.value == [.storeUnavailable])
+    #expect(await source.releaseAttempts() == 2)
+    #expect(await lease.state() == .unavailable)
+  }
+
+  @Test func liveStoreApplyFailureWithClassifiedCleanupFailurePublishesOneStoreFailure()
+    async throws
+  {
+    let cleanupFailure = CollectionLoadFailure.transport(
+      errorType: "URLError", message: "NSURLErrorDomain -1009")
+    let source = ScriptedIssueSource(
+      outcomes: [.success([.init(id: 1, title: "before")])],
+      stopFailures: 1,
+      stopFailure: cleanupFailure)
+    let base = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let store = LiveApplyFailingStore(base: base)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let lease = await coordinator.acquire(.init(unsafePredicateIdentity: "open"))
+    #expect(await wait(for: .live, lease: lease))
+    let failures = Task { () -> [CollectionLoadFailure] in
+      var values: [CollectionLoadFailure] = []
+      for await state in lease.stateUpdates {
+        if case .failed(let failure) = state { values.append(failure) }
+      }
+      return values
+    }
+
+    await source.send(
+      .init(
+        changes: [.upsert(.init(id: 1, title: "after"), sourceVersion: .init(rawValue: "v1", order: 1))],
+        expectedCursor: .init(offset: "0"), cursor: .init(offset: "1"),
+        sourceVersion: .init(rawValue: "v1", order: 1)))
+    #expect(await wait(for: .failed(.storeUnavailable), lease: lease))
+    try await lease.release()
+    #expect(await failures.value == [.storeUnavailable])
+    #expect(await source.releaseAttempts() == 2)
+    #expect(await lease.state() == .unavailable)
   }
 
   @Test func refreshWaitsForCancellationResistantPriorRunBeforeReplacement() async throws {
