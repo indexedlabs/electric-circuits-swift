@@ -492,16 +492,47 @@ struct SSEProductionGateTests {
       SSEParser.Event(name: "data", data: Data("[{\"type\":\"public.items\",\"key\":\"first\",\"value\":{\"id\":\"first\"},\"headers\":{\"operation\":\"upsert\"}}]".utf8)),
       SSEParser.Event(name: "control", data: Data("{\"streamNextOffset\":\"20\"}".utf8)),
     ]
-    for split in 0...source.count {
+
+    func parse(_ chunks: [Data]) throws -> [SSEParser.Event] {
       var parser = SSEParser(maximumEventBytes: 1_024)
-      var events: [SSEParser.Event] = []
-      for byte in source.prefix(split) {
-        if let event = try parser.append(byte) { events.append(event) }
+      return try chunks.flatMap { try parser.append($0) }
+    }
+
+    for split in 0...source.count {
+      #expect(try parse([Data(source.prefix(split)), Data(source.dropFirst(split))]) == expected)
+    }
+
+    let third = source.count / 3
+    let twoThirds = third * 2
+    #expect(try parse([
+      Data(source[..<third]), Data(source[third..<twoThirds]), Data(source[twoThirds...]),
+    ]) == expected)
+
+    let crlf = Data(
+      String(decoding: source, as: UTF8.self).replacingOccurrences(of: "\n", with: "\r\n").utf8)
+    #expect(try parse([crlf]) == expected)
+
+    let fieldPrefix = Data("event: data\nda".utf8)
+    let fieldSuffix = Data("ta: [{\"type\":\"public.items\",\"key\":\"first\",\"value\":{\"id\":\"first\"},\"headers\":{\"operation\":\"upsert\"}}]\n\n".utf8)
+      + keepAlive + control + partial
+    #expect(try parse([fieldPrefix, fieldSuffix]) == expected)
+  }
+
+  @Test func parserRejectsDataAfterCommentWhenEventWouldCrossCeiling() throws {
+    let half = 256 * 1024 * 1024
+    var parser = SSEParser(maximumEventBytes: half)
+    try parser.append(Data("data: ".utf8) + Data(repeating: 0x78, count: half) + Data("\n".utf8))
+    try parser.append(Data(": keep-alive\n".utf8))
+    do {
+      _ = try parser.append(
+        Data("data: ".utf8) + Data(repeating: 0x78, count: half + 1))
+      Issue.record("A data event crossing the 512 MiB ceiling was accepted after a comment")
+    } catch let error as StreamError {
+      guard case .responseTooLarge(let limit, _) = error else {
+        Issue.record("Unexpected stream error: \(error)")
+        return
       }
-      for byte in source.dropFirst(split) {
-        if let event = try parser.append(byte) { events.append(event) }
-      }
-      #expect(events == expected)
+      #expect(limit == 512 * 1024 * 1024)
     }
   }
 
