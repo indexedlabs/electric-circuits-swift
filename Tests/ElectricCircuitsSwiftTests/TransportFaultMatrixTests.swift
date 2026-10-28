@@ -611,10 +611,12 @@ struct TransportFaultMatrixTests {
     }
     let requests = await transport.streamRequests
     #expect(requests.count == 4)
-    #expect(URLComponents(url: requests[0].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "-1")
-    #expect(URLComponents(url: requests[1].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "1")
-    #expect(URLComponents(url: requests[2].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "1")
-    #expect(URLComponents(url: requests[3].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "2")
+    if requests.count == 4 {
+      #expect(URLComponents(url: requests[0].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "-1")
+      #expect(URLComponents(url: requests[1].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "1")
+      #expect(URLComponents(url: requests[2].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "1")
+      #expect(URLComponents(url: requests[3].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "2")
+    }
     #expect(await materializer.cursor() == StreamCursor(offset: "2"))
     #expect(await materializer.rows().keys.sorted() == ["1", "2"])
     try await coordinator.stop()
