@@ -162,6 +162,7 @@ private actor SSEGateOutcome {
 
 private actor SSEFallbackTransport: HTTPTransport {
   private(set) var requests: [URLRequest] = []
+  private var pollCount = 0
 
   func stream(
     _ request: URLRequest,
@@ -176,10 +177,43 @@ private actor SSEFallbackTransport: HTTPTransport {
 
   func send(_ request: URLRequest) async throws -> HTTPResponse {
     requests.append(request)
+    pollCount += 1
     return HTTPResponse(
       data: Data(),
       response: HTTPURLResponse(
-        url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
+        url: request.url!, statusCode: pollCount == 1 ? 204 : 404, httpVersion: nil,
+        headerFields: nil)!)
+  }
+}
+
+private actor SSEKeepAliveTransport: HTTPTransport {
+  private(set) var streamCalls = 0
+
+  func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes: @Sendable (Data) async throws -> Void
+  ) async throws {
+    streamCalls += 1
+    if streamCalls == 1 {
+      try await onResponse(HTTPURLResponse(
+        url: request.url!, statusCode: 200, httpVersion: nil,
+        headerFields: ["Content-Type": "text/event-stream"])!)
+      // A data frame held for the next cursor must be discarded when the control frame is only
+      // a keep-alive. This is the reader-level verification of the SSE event contract.
+      try await onBytes(gateData("pending"))
+      try await onBytes(Data("event: control\ndata: {}\n\n".utf8))
+      return
+    }
+    try await onResponse(HTTPURLResponse(
+      url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
+  }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    Issue.record("Long-poll fallback was unexpectedly used")
+    return HTTPResponse(
+      data: Data(), response: HTTPURLResponse(
+        url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!)
   }
 }
 
@@ -478,7 +512,36 @@ func sseFallbackAndKeepAliveVerification() async throws {
     try await reader.run()
   }
   let requests = await transport.requests
-  #expect(requests.count == 2)
+  #expect(requests.count == 3)
   #expect(requests[0].url?.query?.contains("live=sse") == true)
   #expect(requests[1].url?.query?.contains("live=long-poll") == true)
+  #expect(requests[2].url?.query?.contains("live=long-poll") == true)
+}
+
+@Test("SSE keep-alive control does not commit pending data")
+func sseKeepAliveControlIsNoOp() async throws {
+  let transport = SSEKeepAliveTransport()
+  let store = InMemoryShapeMaterializer()
+  let reader = ShapeStreamReader(
+    streamURL: sseGateURL, transport: transport, materializer: store,
+    configuration: .init(liveReadMode: .sse))
+  await #expect(throws: StreamError.terminal(path: "/stream", status: 404, reason: .notFound)) {
+    try await reader.run()
+  }
+  #expect(try await store.currentCursor() == nil)
+  #expect(await transport.streamCalls == 2)
+}
+
+@Test("Long-poll remains the default live read")
+func longPollRemainsDefaultLiveRead() async throws {
+  let transport = SSEFallbackTransport()
+  let reader = ShapeStreamReader(
+    streamURL: sseGateURL, transport: transport, materializer: InMemoryShapeMaterializer())
+  await #expect(throws: StreamError.terminal(path: "/stream", status: 404, reason: .notFound)) {
+    try await reader.run()
+  }
+  let requests = await transport.requests
+  #expect(requests.count == 2)
+  #expect(requests.allSatisfy { $0.url?.query?.contains("live=long-poll") == true })
+  #expect(requests.allSatisfy { $0.value(forHTTPHeaderField: "Accept") == "application/json" })
 }

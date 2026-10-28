@@ -11,6 +11,7 @@ struct SSEParser {
 
   private(set) var maximumEventBytes: Int
   private let maximumEventBytesCeiling = 512 * 1024 * 1024
+  private let dataField = Data("data:".utf8)
   private var line = Data()
   private var name = ""
   private var data = Data()
@@ -34,7 +35,7 @@ struct SSEParser {
     line.append(byte)
     // A data line is the largest temporary allocation in this parser. Check its decoded payload
     // as it arrives, while allowing the `data: ` field prefix and an exact-ceiling payload.
-    if line.count >= 5, line.prefix(5).elementsEqual(Data("data:".utf8)) {
+    if line.count >= dataField.count, line.prefix(dataField.count).elementsEqual(dataField) {
       let payloadStart = line.count > 5 && line[5] == 0x20 ? 6 : 5
       let payloadBytes = max(0, line.count - payloadStart)
       let projected = data.count + (hasData ? 1 : 0) + payloadBytes
