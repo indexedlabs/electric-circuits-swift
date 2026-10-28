@@ -403,7 +403,7 @@ public protocol HTTPTransport: Sendable {
   func send(_ request: URLRequest, maximumResponseBytes: Int) async throws -> HTTPResponse
 }
 
-private struct StreamingUnsupported: Error {}
+struct StreamingUnsupported: Error {}
 
 extension HTTPTransport {
   public func stream(
