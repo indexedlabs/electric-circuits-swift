@@ -488,19 +488,21 @@ public struct URLSessionTransport: HTTPTransport {
         var chunk = Data()
         chunk.reserveCapacity(16 * 1024)
         for try await byte in bytes {
-          try Task.checkCancellation()
           chunk.append(byte)
           if chunk.count == 16 * 1024 {
+            try Task.checkCancellation()
             try await onBytes(chunk)
             chunk.removeAll(keepingCapacity: true)
           } else if byte == 0x0A {
             // SSE dispatches an event at a blank line. Flush each line terminator so small data,
             // control, and keep-alive events reach the reader without waiting for more bytes.
+            try Task.checkCancellation()
             try await onBytes(chunk)
             chunk.removeAll(keepingCapacity: true)
           }
         }
         if !chunk.isEmpty {
+          try Task.checkCancellation()
           try await onBytes(chunk)
         }
       } onCancel: {
