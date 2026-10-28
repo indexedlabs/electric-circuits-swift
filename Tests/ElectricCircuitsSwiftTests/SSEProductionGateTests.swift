@@ -221,6 +221,28 @@ private actor SSESetupFailureTransport: HTTPTransport {
   }
 }
 
+private actor SSEDelayedHeaderTransport: HTTPTransport {
+  private(set) var streamCalls = 0
+
+  func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes _: @Sendable (Data) async throws -> Void
+  ) async throws {
+    streamCalls += 1
+    if streamCalls == 1 { try await Task.sleep(for: .milliseconds(50)) }
+    try await onResponse(HTTPURLResponse(
+      url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
+  }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    Issue.record("Long-poll fallback was unexpectedly used")
+    return HTTPResponse(
+      data: Data(), response: HTTPURLResponse(
+        url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!)
+  }
+}
+
 private actor SSECoordinatorFallbackTransport: HTTPTransport {
   private(set) var requests: [URLRequest] = []
   private(set) var streamCalls = 0
@@ -442,6 +464,19 @@ struct SSEProductionGateTests {
     #expect(await rig.store.keys() == ["cr-only"])
     task.cancel()
     _ = await task.result
+  }
+
+  @Test("SSE silence begins after response headers")
+  func delayedHeadersDoNotTriggerSSEStall() async throws {
+    let transport = SSEDelayedHeaderTransport()
+    let reader = ShapeStreamReader(
+      streamURL: sseGateURL, transport: transport, materializer: InMemoryShapeMaterializer(),
+      configuration: .init(liveReadMode: .sse), sseSilenceTimeout: .milliseconds(20))
+    await #expect(throws: StreamError.terminal(
+      path: "/stream", status: 404, reason: .notFound)) {
+      try await reader.run()
+    }
+    #expect(await transport.streamCalls == 1)
   }
 
   @Test(

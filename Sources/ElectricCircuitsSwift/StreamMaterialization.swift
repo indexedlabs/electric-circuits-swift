@@ -323,6 +323,22 @@ public struct ShapeStreamReader: Sendable {
     responseDecodingLimits: ResponseDecodingLimits = .default,
     configuration: ElectricCircuitsClient.Configuration = .default
   ) {
+    self.init(
+      streamURL: streamURL, transport: transport, materializer: materializer,
+      startingAt: cursor, telemetry: telemetry, responseDecodingLimits: responseDecodingLimits,
+      configuration: configuration, sseSilenceTimeout: Self.sseSilenceTimeout)
+  }
+
+  init(
+    streamURL: URL,
+    transport: any HTTPTransport,
+    materializer: any ShapeMaterializer,
+    startingAt cursor: StreamCursor? = nil,
+    telemetry: TelemetryReporter = .noop,
+    responseDecodingLimits: ResponseDecodingLimits = .default,
+    configuration: ElectricCircuitsClient.Configuration = .default,
+    sseSilenceTimeout: Duration
+  ) {
     self.liveReadState = LiveReadState(
       mode: configuration.liveReadMode,
       maximumEventBytes: responseDecodingLimits.maximumDecodedResponseBytes)
@@ -439,7 +455,7 @@ public struct ShapeStreamReader: Sendable {
             onBytes: { try await receiver.receive($0) })
         }
         group.addTask {
-          try await receiver.waitForSilence(timeout: Self.sseSilenceTimeout)
+          try await receiver.waitForSilence(timeout: sseSilenceTimeout)
         }
         defer { group.cancelAll() }
         _ = try await group.next()
@@ -482,6 +498,8 @@ public struct ShapeStreamReader: Sendable {
     private(set) var maximumEventBytes: Int
     private let clock = ContinuousClock()
     private var lastActivity: ContinuousClock.Instant
+    private var receivedHeaders = false
+    private var headerWaiters: [CheckedContinuation<Void, Never>] = []
     private var committing = false
     private(set) var sawControl = false
 
@@ -500,6 +518,20 @@ public struct ShapeStreamReader: Sendable {
     func checkpoint() -> (StreamCursor, StreamCursor?) { (cursor, expectedCursor) }
 
     func waitForSilence(timeout: Duration) async throws {
+      if !receivedHeaders {
+        await withTaskCancellationHandler(
+          operation: {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+              if receivedHeaders {
+                continuation.resume()
+              } else {
+                headerWaiters.append(continuation)
+              }
+            }
+          },
+          onCancel: { Task { await self.resumeHeaderWaiters() } })
+        try Task.checkCancellation()
+      }
       while true {
         if committing {
           try await Task.sleep(for: .milliseconds(10))
@@ -513,6 +545,8 @@ public struct ShapeStreamReader: Sendable {
     }
 
     func receive(_ headers: HTTPURLResponse) throws {
+      receivedHeaders = true
+      resumeHeaderWaiters()
       lastActivity = clock.now
       let status = headers.statusCode
       if headers.value(forHTTPHeaderField: "stream-closed")?.lowercased() == "true" {
@@ -527,6 +561,11 @@ public struct ShapeStreamReader: Sendable {
         .split(separator: ";", maxSplits: 1).first?
         .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
       guard mediaType == "text/event-stream" else { throw SSEFallback() }
+    }
+
+    private func resumeHeaderWaiters() {
+      for waiter in headerWaiters { waiter.resume() }
+      headerWaiters.removeAll()
     }
 
     func receive(_ bytes: Data) async throws {
