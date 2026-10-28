@@ -12,10 +12,12 @@ private actor ScriptedIssueSource: CollectionSourceAdapter {
   enum Outcome: Sendable {
     case success([CoordinatorIssue])
     case failure
+    case classifiedFailure(CollectionLoadFailure)
   }
 
   private var outcomes: [Outcome]
   private var stopFailures: Int
+  private let stopFailure: CollectionLoadFailure?
   private var stopCalls = 0
   private var heldRuns: Int
   private var runGate: CheckedContinuation<Void, Never>?
@@ -39,10 +41,12 @@ private actor ScriptedIssueSource: CollectionSourceAdapter {
 
   init(
     outcomes: [Outcome], stopFailures: Int = 0, heldRuns: Int = 0,
-    heldMaterializations: Int = 0, heldStops: Int = 0
+    heldMaterializations: Int = 0, heldStops: Int = 0,
+    stopFailure: CollectionLoadFailure? = nil
   ) {
     self.outcomes = outcomes
     self.stopFailures = stopFailures
+    self.stopFailure = stopFailure
     self.heldRuns = heldRuns
     self.heldMaterializations = heldMaterializations
     self.heldStops = heldStops
@@ -58,6 +62,7 @@ private actor ScriptedIssueSource: CollectionSourceAdapter {
     startWaiters.removeAll { $0.count <= starts.count }
     for waiter in satisfiedWaiters { waiter.continuation.resume() }
     let outcome = outcomes.isEmpty ? .success([]) : outcomes.removeFirst()
+    if case .classifiedFailure(let failure) = outcome { throw failure }
     guard case .success(let rows) = outcome else { throw SourceFailure() }
     let updates = AsyncThrowingStream<CollectionChangeBatch<CoordinatorIssue, Int>, any Error>
       .makeStream()
@@ -98,6 +103,7 @@ private actor ScriptedIssueSource: CollectionSourceAdapter {
     }
     if stopFailures > 0 {
       stopFailures -= 1
+      if let stopFailure { throw stopFailure }
       throw SourceFailure()
     }
     guard let continuation = continuations.removeValue(forKey: materializationID) else { return }
@@ -154,6 +160,10 @@ private actor ScriptedIssueSource: CollectionSourceAdapter {
     continuations.values.first?.yield(batch)
   }
 
+  func failRun(_ failure: CollectionLoadFailure) {
+    continuations.values.first?.finish(throwing: failure)
+  }
+
   func releaseAttempts() -> Int { stopCalls }
 
   struct SourceFailure: Error {}
@@ -204,6 +214,54 @@ private actor LiveApplyFailingStore: CollectionStore {
   }
 
   struct ApplyFailure: Error {}
+}
+
+private actor SnapshotFailingStore: CollectionStore {
+  typealias Model = CoordinatorIssue
+  typealias Key = Int
+
+  let base: InMemoryCollectionStore<CoordinatorIssue, Int>
+
+  init(base: InMemoryCollectionStore<CoordinatorIssue, Int>) {
+    self.base = base
+  }
+
+  func materialization(for demand: CollectionDemandIdentity) async throws
+    -> CollectionMaterializationRecord?
+  {
+    try await base.materialization(for: demand)
+  }
+
+  func staleMaterializations() async throws -> [CollectionStaleMaterialization] {
+    try await base.staleMaterializations()
+  }
+
+  func clearStale(
+    _ materializationID: CollectionMaterializationID, ifMarkedAt position: CollectionSourceVersion
+  ) async throws {
+    try await base.clearStale(materializationID, ifMarkedAt: position)
+  }
+
+  func replaceSnapshot(
+    _: CollectionSnapshot<CoordinatorIssue>,
+    materializationID _: CollectionMaterializationID,
+    demand _: CollectionDemandIdentity
+  ) async throws {
+    throw SnapshotFailure()
+  }
+
+  func apply(
+    _ batch: CollectionChangeBatch<CoordinatorIssue, Int>,
+    to materializationID: CollectionMaterializationID
+  ) async throws {
+    try await base.apply(batch, to: materializationID)
+  }
+
+  func removeMaterialization(_ materializationID: CollectionMaterializationID) async throws {
+    try await base.removeMaterialization(materializationID)
+  }
+
+  struct SnapshotFailure: Error {}
 }
 
 private actor EvictionGateStore: CollectionStore {
@@ -320,6 +378,102 @@ private func wait(
 
 @Suite("Collection coordinator contract")
 struct CollectionCoordinatorContractTests {
+  // These are already-classified, redacted source errors. The app owns the mapping from
+  // HTTP/URLSession and authority metadata errors; the SDK must preserve it across its tasks.
+  static let classifiedFailures: [CollectionLoadFailure] = [
+    .authority(errorType: "ClientError.http", message: "HTTP 403"),
+    .authority(errorType: "NativeCircuitsAuthorityError.changed", message: "authority_changed"),
+    .authority(
+      errorType: "NativeCircuitsAuthorityError.missingReceipt", message: "metadata mismatch"),
+    .transport(errorType: "URLError", message: "NSURLErrorDomain -1009"),
+  ]
+
+  @Test(.timeLimit(.minutes(5)), arguments: classifiedFailures)
+  func materializationPreservesClassifiedFailureAndRefreshRecovers(
+    _ failure: CollectionLoadFailure
+  ) async throws {
+    let row = CoordinatorIssue(id: 1, title: "Recovered")
+    let source = ScriptedIssueSource(outcomes: [.classifiedFailure(failure), .success([row])])
+    let store = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let lease = await coordinator.acquire(.init(unsafePredicateIdentity: "open"))
+    for await state in lease.stateUpdates {
+      if case .failed = state {
+        #expect(state == .failed(failure))
+        break
+      }
+    }
+    #expect(await lease.state() == .failed(failure))
+    #expect(await store.rows().isEmpty)
+    await lease.refresh()
+    #expect(await wait(for: .live, lease: lease))
+    #expect(await store.rows() == [row.id: row])
+    try await lease.release()
+  }
+
+  @Test(.timeLimit(.minutes(5)), arguments: classifiedFailures)
+  func liveRunPreservesClassifiedFailureAndCachedRows(
+    _ failure: CollectionLoadFailure
+  ) async throws {
+    let row = CoordinatorIssue(id: 1, title: "Cached")
+    let source = ScriptedIssueSource(outcomes: [.success([row])], stopFailures: 1)
+    let store = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let demand = CollectionDemand<CoordinatorIssue>(unsafePredicateIdentity: "open")
+    let identity = demand.identity(for: coordinatorIssues, scope: coordinatorScope)
+    let lease = await coordinator.acquire(demand)
+    #expect(await wait(for: .live, lease: lease))
+    let committed = try #require(await store.materialization(for: identity))
+    await source.failRun(failure)
+    for await state in lease.stateUpdates {
+      if case .failed = state {
+        #expect(state == .failed(failure))
+        break
+      }
+    }
+    #expect(await lease.state() == .failed(failure))
+    #expect(await store.rows() == [row.id: row])
+    #expect(try await store.materialization(for: identity) == committed)
+    try await lease.release()
+    #expect(await source.releaseAttempts() == 2)
+  }
+
+  @Test func refreshCleanupPreservesClassifiedFailureWithoutStartingAReplacement() async throws {
+    let failure = CollectionLoadFailure.transport(
+      errorType: "ClientError.http", message: "HTTP 503")
+    let source = ScriptedIssueSource(
+      outcomes: [.success([])], stopFailures: 1, stopFailure: failure)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source,
+      store: InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id))
+    let lease = await coordinator.acquire(.init(unsafePredicateIdentity: "open"))
+    #expect(await wait(for: .live, lease: lease))
+    await lease.refresh()
+    #expect(await lease.state() == .failed(failure))
+    #expect(await source.starts.count == 1)
+    try await lease.release()
+    #expect(await source.releaseAttempts() == 2)
+  }
+
+  @Test func finalReleasePreservesClassifiedFailureAndRetainsReleaseAuthority() async throws {
+    let failure = CollectionLoadFailure.transport(
+      errorType: "URLError", message: "NSURLErrorDomain -1009")
+    let source = ScriptedIssueSource(
+      outcomes: [.success([])], stopFailures: 1, stopFailure: failure)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source,
+      store: InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id))
+    let lease = await coordinator.acquire(.init(unsafePredicateIdentity: "open"))
+    #expect(await wait(for: .live, lease: lease))
+    await #expect(throws: failure) { try await lease.release() }
+    #expect(await lease.state() == .failed(failure))
+    try await lease.release()
+    #expect(await source.releaseAttempts() == 2)
+    #expect(await lease.state() == .unavailable)
+  }
+
   @Test func identicalConcurrentDemandsShareSourceUntilFinalLeaseReleases() async throws {
     let row = CoordinatorIssue(id: 1, title: "Shared")
     let source = ScriptedIssueSource(outcomes: [.success([row])])
@@ -593,6 +747,68 @@ struct CollectionCoordinatorContractTests {
     try await failed.release()
     try await retries[0].release()
     try await retries[1].release()
+  }
+
+  @Test func snapshotStoreFailurePrecedesClassifiedCleanupFailureAndReleaseRetriesStop()
+    async throws
+  {
+    let cleanupFailure = CollectionLoadFailure.authority(
+      errorType: "NativeCircuitsAuthorityError.changed", message: "authority_changed")
+    let source = ScriptedIssueSource(
+      outcomes: [.success([])], stopFailures: 1, stopFailure: cleanupFailure)
+    let store = SnapshotFailingStore(
+      base: InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id))
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let lease = await coordinator.acquire(.init(unsafePredicateIdentity: "open"))
+    let failures = Task { () -> [CollectionLoadFailure] in
+      var values: [CollectionLoadFailure] = []
+      for await state in lease.stateUpdates {
+        if case .failed(let failure) = state { values.append(failure) }
+      }
+      return values
+    }
+
+    #expect(await wait(for: .failed(.storeUnavailable), lease: lease))
+    try await lease.release()
+    #expect(await failures.value == [.storeUnavailable])
+    #expect(await source.releaseAttempts() == 2)
+    #expect(await lease.state() == .unavailable)
+  }
+
+  @Test func liveStoreApplyFailureWithClassifiedCleanupFailurePublishesOneStoreFailure()
+    async throws
+  {
+    let cleanupFailure = CollectionLoadFailure.transport(
+      errorType: "URLError", message: "NSURLErrorDomain -1009")
+    let source = ScriptedIssueSource(
+      outcomes: [.success([.init(id: 1, title: "before")])],
+      stopFailures: 1,
+      stopFailure: cleanupFailure)
+    let base = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
+    let store = LiveApplyFailingStore(base: base)
+    let coordinator = CollectionCoordinator(
+      definition: coordinatorIssues, scope: coordinatorScope, source: source, store: store)
+    let lease = await coordinator.acquire(.init(unsafePredicateIdentity: "open"))
+    #expect(await wait(for: .live, lease: lease))
+    let failures = Task { () -> [CollectionLoadFailure] in
+      var values: [CollectionLoadFailure] = []
+      for await state in lease.stateUpdates {
+        if case .failed(let failure) = state { values.append(failure) }
+      }
+      return values
+    }
+
+    await source.send(
+      .init(
+        changes: [.upsert(.init(id: 1, title: "after"), sourceVersion: .init(rawValue: "v1", order: 1))],
+        expectedCursor: .init(offset: "0"), cursor: .init(offset: "1"),
+        sourceVersion: .init(rawValue: "v1", order: 1)))
+    #expect(await wait(for: .failed(.storeUnavailable), lease: lease))
+    try await lease.release()
+    #expect(await failures.value == [.storeUnavailable])
+    #expect(await source.releaseAttempts() == 2)
+    #expect(await lease.state() == .unavailable)
   }
 
   @Test func refreshWaitsForCancellationResistantPriorRunBeforeReplacement() async throws {

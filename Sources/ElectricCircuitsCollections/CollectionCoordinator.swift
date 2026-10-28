@@ -1,9 +1,14 @@
 import ElectricCircuitsSwift
 import Foundation
 
-public enum CollectionLoadFailure: Equatable, Sendable {
+/// Sources may throw a classified failure to preserve its reason in lease state updates.
+/// The source owns classification and redaction; messages must not contain credentials,
+/// capability URLs, request bodies, or row content. Unclassified errors retain the fallback.
+public enum CollectionLoadFailure: Error, Equatable, Sendable {
   case sourceUnavailable
   case storeUnavailable
+  case transport(errorType: String, message: String)
+  case authority(errorType: String, message: String)
 }
 
 public enum CollectionLoadState: Equatable, Sendable {
@@ -720,7 +725,9 @@ public actor CollectionCoordinator<
     } catch is CancellationError {
       return
     } catch {
-      fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
+      fail(
+        identity: identity, attempt: attempt,
+        with: error as? CollectionLoadFailure ?? .sourceUnavailable)
       return
     }
 
@@ -729,7 +736,9 @@ public actor CollectionCoordinator<
       do {
         try await stop.call()
       } catch {
-        fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
+        fail(
+          identity: identity, attempt: attempt,
+          with: error as? CollectionLoadFailure ?? .sourceUnavailable)
       }
       return
     }
@@ -748,8 +757,11 @@ public actor CollectionCoordinator<
       _ = await cleanup(stop, identity: identity, attempt: attempt)
       return
     } catch {
-      _ = await cleanup(stop, identity: identity, attempt: attempt)
-      fail(identity: identity, attempt: attempt, with: .storeUnavailable)
+      if await cleanup(
+        stop, identity: identity, attempt: attempt, primaryFailure: .storeUnavailable
+      ) {
+        fail(identity: identity, attempt: attempt, with: .storeUnavailable)
+      }
       return
     }
 
@@ -776,12 +788,19 @@ public actor CollectionCoordinator<
       _ = await cleanup(stop, identity: identity, attempt: attempt)
       return
     } catch is CollectionStoreApplyFailure {
-      _ = await cleanup(stop, identity: identity, attempt: attempt)
-      fail(identity: identity, attempt: attempt, with: .storeUnavailable)
+      if await cleanup(
+        stop, identity: identity, attempt: attempt, primaryFailure: .storeUnavailable
+      ) {
+        fail(identity: identity, attempt: attempt, with: .storeUnavailable)
+      }
       return
     } catch {
-      _ = await cleanup(stop, identity: identity, attempt: attempt)
-      fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
+      let failure = error as? CollectionLoadFailure ?? .sourceUnavailable
+      if await cleanup(
+        stop, identity: identity, attempt: attempt, primaryFailure: failure
+      ) {
+        fail(identity: identity, attempt: attempt, with: failure)
+      }
       return
     }
 
@@ -809,7 +828,8 @@ public actor CollectionCoordinator<
   }
 
   private func cleanup(
-    _ stop: AtMostOnceStop, identity: CollectionDemandIdentity, attempt: UUID
+    _ stop: AtMostOnceStop, identity: CollectionDemandIdentity, attempt: UUID,
+    primaryFailure: CollectionLoadFailure? = nil
   ) async -> Bool {
     do {
       try await stop.call()
@@ -817,7 +837,9 @@ public actor CollectionCoordinator<
       return true
     } catch {
       // Keep the failed stop installed so a lease release can retry the same server authority.
-      fail(identity: identity, attempt: attempt, with: .sourceUnavailable)
+      fail(
+        identity: identity, attempt: attempt,
+        with: primaryFailure ?? (error as? CollectionLoadFailure ?? .sourceUnavailable))
       return false
     }
   }
@@ -958,7 +980,9 @@ public actor CollectionCoordinator<
       }
       try await source.cleanupAbandonedMaterialization(afterStop.materializationID)
     } catch {
-      fail(identity: identity, attempt: oldAttempt, with: .sourceUnavailable, retainTask: true)
+      fail(
+        identity: identity, attempt: oldAttempt,
+        with: error as? CollectionLoadFailure ?? .sourceUnavailable, retainTask: true)
       clearRefresh(identity: identity, token: token)
       return
     }
@@ -1017,7 +1041,7 @@ public actor CollectionCoordinator<
     do {
       try await afterRefresh.stop?.call()
     } catch {
-      failRelease(identity: identity, attempt: afterRefresh.attempt, token: token)
+      failRelease(identity: identity, attempt: afterRefresh.attempt, token: token, error: error)
       throw error
     }
     guard let afterStop = entries[identity], afterStop.releaseToken == token,
@@ -1034,7 +1058,7 @@ public actor CollectionCoordinator<
       else { return }
       try await source.cleanupAbandonedMaterialization(afterCleanup.materializationID)
     } catch {
-      failRelease(identity: identity, attempt: current.attempt, token: token)
+      failRelease(identity: identity, attempt: current.attempt, token: token, error: error)
       throw error
     }
     guard var entry = entries[identity], entry.releaseToken == token,
@@ -1058,15 +1082,18 @@ public actor CollectionCoordinator<
     startAttempt(for: identity, attempt: nextAttempt)
   }
 
-  private func failRelease(identity: CollectionDemandIdentity, attempt: UUID, token: UUID) {
+  private func failRelease(
+    identity: CollectionDemandIdentity, attempt: UUID, token: UUID, error: any Error
+  ) {
     guard var entry = entries[identity], entry.releaseToken == token, entry.attempt == attempt,
       !entry.leases.isEmpty
     else { return }
     entry.releaseToken = nil
     entry.releaseTask = nil
-    entry.state = .failed(.sourceUnavailable)
+    let failure = error as? CollectionLoadFailure ?? .sourceUnavailable
+    entry.state = .failed(failure)
     entries[identity] = entry
-    for continuation in entry.leases.values { continuation.yield(.failed(.sourceUnavailable)) }
+    for continuation in entry.leases.values { continuation.yield(.failed(failure)) }
   }
 
   /// Removes an inactive cached materialization. Acquires that arrive while the store operation is

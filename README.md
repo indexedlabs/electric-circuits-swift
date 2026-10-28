@@ -28,6 +28,13 @@ typed `CollectionPredicate` values compile logical field IDs into native Circuit
 fences, and live cursors. `InMemoryCollectionStore` is the reference provider; applications can
 implement the same contract with GRDB or another store.
 
+A source can throw `CollectionLoadFailure.transport(errorType:message:)` or
+`.authority(errorType:message:)` from materialization, its live run, or cleanup. The coordinator
+preserves that value in the lease's `.failed` state so callers can distinguish the reasons when
+retrying and logging. The source classifies the failure and supplies a redacted type and message;
+the coordinator does not inspect HTTP bodies or log these strings. Unclassified source errors
+still produce `.sourceUnavailable`, and store errors still produce `.storeUnavailable`.
+
 To revalidate stored stale marks, provide the definition's optional `rebuildDemand` closure and
 `subscriptionKind` label, and run `startStaleRevalidation(clock:telemetry:)` in an app-owned task.
 The gate starts closed: call `setStaleRevalidationGate(isOpen:)` after first paint, keeping it open
@@ -40,7 +47,7 @@ in the current generation; after successful replacement, the old materialization
 its claims cannot retain stale rows. Other principals and authorization scopes are excluded.
 Idle listings run every five seconds; opening the gate, local snapshot/feed writes, completed
 runs and retry expiry wake the pass immediately. Cancel and await the task when
-retiring its scope or generation. The store protocol is unchanged in 0.7.1.
+retiring its scope or generation. The store protocol is unchanged in 0.8.0.
 
 For app-wide scheduling across collections, await `drainStaleRevalidation()` before opening the
 next collection's gate or starting an explicit repair read. Drain closes admission and lets
@@ -257,7 +264,7 @@ wire contract, public API, and provider-schema release rules are explicit in
 [Policies/SUPPORT.md](Policies/SUPPORT.md) and [Policies/SEMVER.md](Policies/SEMVER.md). The DocC
 catalog begins at `ElectricCircuitsSwift` in Xcode's documentation viewer.
 
-## Install 0.7.1
+## Install 0.8.0
 
 Custom `CollectionStore` providers must implement `staleMaterializations()` and
 `clearStale(_:ifMarkedAt:)`. A snapshot omission or feed delete of a held row releases only that
@@ -275,7 +282,7 @@ dependencies.
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.7.1"),
+  .package(url: "https://github.com/indexedlabs/electric-circuits-swift.git", from: "0.8.0"),
 ]
 ```
 
