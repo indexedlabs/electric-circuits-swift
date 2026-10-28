@@ -613,6 +613,7 @@ struct TransportFaultMatrixTests {
     #expect(requests.count == 3)
     #expect(URLComponents(url: requests[0].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "-1")
     #expect(URLComponents(url: requests[1].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "1")
+    #expect(URLComponents(url: requests[2].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "2")
     #expect(await materializer.cursor() == StreamCursor(offset: "2"))
     #expect(await materializer.rows().keys.sorted() == ["1", "2"])
     try await coordinator.stop()
@@ -634,5 +635,15 @@ struct TransportFaultMatrixTests {
     #expect(streamRequests[0].url?.query?.contains("live=sse") == true)
     #expect(requests.count == 1)
     #expect(requests[0].url?.query?.contains("live=long-poll") == true)
+
+    let goneTransport = SSEFaultTransport([.status(410, contentType: nil)])
+    let goneReader = ShapeStreamReader(
+      streamURL: URL(string: "https://streams.test/s1")!, transport: goneTransport,
+      materializer: InMemoryShapeMaterializer(), configuration: .init(liveReadMode: .sse))
+    await #expect(throws: StreamError.terminal(path: "/s1", status: 410, reason: .gone)) {
+      try await goneReader.run()
+    }
+    #expect(await goneTransport.streamRequests.count == 1)
+    #expect(await goneTransport.requests.isEmpty)
   }
 }
