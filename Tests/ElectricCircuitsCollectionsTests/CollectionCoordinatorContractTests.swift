@@ -335,7 +335,8 @@ struct CollectionCoordinatorContractTests {
   static let classifiedFailures: [CollectionLoadFailure] = [
     .authority(errorType: "ClientError.http", message: "HTTP 403"),
     .authority(errorType: "NativeCircuitsAuthorityError.changed", message: "authority_changed"),
-    .authority(errorType: "NativeCircuitsAuthorityError.missingReceipt", message: "metadata mismatch"),
+    .authority(
+      errorType: "NativeCircuitsAuthorityError.missingReceipt", message: "metadata mismatch"),
     .transport(errorType: "URLError", message: "NSURLErrorDomain -1009"),
   ]
 
@@ -364,7 +365,9 @@ struct CollectionCoordinatorContractTests {
   }
 
   @Test(.timeLimit(.minutes(5)), arguments: classifiedFailures)
-  func liveRunPreservesClassifiedFailureAndCachedRows(_ failure: CollectionLoadFailure) async throws {
+  func liveRunPreservesClassifiedFailureAndCachedRows(
+    _ failure: CollectionLoadFailure
+  ) async throws {
     let row = CoordinatorIssue(id: 1, title: "Cached")
     let source = ScriptedIssueSource(outcomes: [.success([row])])
     let store = InMemoryCollectionStore<CoordinatorIssue, Int>(key: \.id)
@@ -389,7 +392,8 @@ struct CollectionCoordinatorContractTests {
   }
 
   @Test func refreshCleanupPreservesClassifiedFailureWithoutStartingAReplacement() async throws {
-    let failure = CollectionLoadFailure.transport(errorType: "ClientError.http", message: "HTTP 503")
+    let failure = CollectionLoadFailure.transport(
+      errorType: "ClientError.http", message: "HTTP 503")
     let source = ScriptedIssueSource(
       outcomes: [.success([])], stopFailures: 1, stopFailure: failure)
     let coordinator = CollectionCoordinator(
