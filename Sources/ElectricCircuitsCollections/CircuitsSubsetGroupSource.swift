@@ -149,7 +149,7 @@ public struct CircuitsSubsetGroupSource: Sendable {
             telemetry: telemetry,
             recreatePolicy: recreatePolicy
           )
-          try await lifecycle.install(coordinator)
+          try await lifecycle.install(coordinator, materializer: materializer)
           let states = await coordinator.stateUpdates
           do {
             try await withTaskCancellationHandler {
@@ -275,6 +275,7 @@ private actor CircuitsGroupSessionLifecycle {
   private let client: ElectricCircuitsClient
   private let initialHandle: ShapeHandle
   private var coordinator: ShapeSubscriptionCoordinator?
+  private var materializer: CircuitsGroupTailMaterializer?
   private var coordinatorStarted = false
   private var stopped = false
   private var stopTask: Task<Void, Error>?
@@ -284,12 +285,16 @@ private actor CircuitsGroupSessionLifecycle {
     self.initialHandle = initialHandle
   }
 
-  func install(_ coordinator: ShapeSubscriptionCoordinator) async throws {
+  func install(
+    _ coordinator: ShapeSubscriptionCoordinator, materializer: CircuitsGroupTailMaterializer
+  ) async throws {
     guard !stopped else {
+      await materializer.refuse()
       try await coordinator.stop()
       throw CancellationError()
     }
     self.coordinator = coordinator
+    self.materializer = materializer
   }
 
   func markCoordinatorStarted() {
@@ -308,10 +313,14 @@ private actor CircuitsGroupSessionLifecycle {
     }
     stopped = true
     let coordinator = coordinator
+    let materializer = materializer
     let coordinatorStarted = coordinatorStarted
     let client = client
     let initialHandle = initialHandle
     let task = Task<Void, Error> {
+      // A stop can come before setup confirmed the group, while the coordinator's reader waits
+      // on the setup permit; the coordinator's stop waits for that reader, so refuse first.
+      await materializer?.refuse()
       if let coordinator {
         try await coordinator.stop()
       }
@@ -338,6 +347,7 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
   // application cannot commit against the same cursor. Setup holds it until it has confirmed
   // the stream belongs to the snapshot's group.
   private var applying = true
+  private var setupHoldsPermit = true
   private var refused = false
   private var applicationWaiters: [CheckedContinuation<Void, Never>] = []
   private var sourceVersion: CollectionSourceVersion
@@ -362,11 +372,18 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
   }
 
   /// Lets batches through once setup has confirmed the coordinator read the snapshot's group.
-  func open() { releasePermit() }
+  func open() { releaseSetupPermit() }
 
-  /// Refuses every batch: the coordinator's stream is not the snapshot's group.
+  /// Refuses every later batch: the coordinator's stream is not the snapshot's group, or the
+  /// session is stopping. A batch already applying finishes.
   func refuse() {
     refused = true
+    releaseSetupPermit()
+  }
+
+  private func releaseSetupPermit() {
+    guard setupHoldsPermit else { return }
+    setupHoldsPermit = false
     releasePermit()
   }
 

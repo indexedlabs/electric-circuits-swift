@@ -121,13 +121,24 @@ private actor GroupStreamServer: HTTPTransport {
   /// The group id each load answers with; the last one repeats.
   private var groupIDs: [String]
   private var nextOffset = 10
+  /// The load (1-based) that waits for `releaseHeldLoad()` before answering.
+  private let heldLoad: Int?
+  private var heldLoadRelease: CheckedContinuation<Void, Never>?
+  private var heldLoadReleased = false
   private(set) var loads: [SubsetGroupRequest] = []
   private(set) var streamURLs: [URL] = []
   private(set) var releases: [URL] = []
 
-  init(batches: [String], groupIDs: [String] = ["group-1"]) {
+  init(batches: [String], groupIDs: [String] = ["group-1"], heldLoad: Int? = nil) {
     self.batches = batches
     self.groupIDs = groupIDs
+    self.heldLoad = heldLoad
+  }
+
+  func releaseHeldLoad() {
+    heldLoadReleased = true
+    heldLoadRelease?.resume()
+    heldLoadRelease = nil
   }
 
   func send(_ request: URLRequest) async throws -> HTTPResponse {
@@ -135,6 +146,9 @@ private actor GroupStreamServer: HTTPTransport {
     switch (request.httpMethod, path) {
     case ("POST", "/v1/subsets/load"):
       loads.append(try JSONDecoder().decode(SubsetGroupRequest.self, from: request.httpBody!))
+      if loads.count == heldLoad, !heldLoadReleased {
+        await withCheckedContinuation { heldLoadRelease = $0 }
+      }
       let id = groupIDs.count > 1 ? groupIDs.removeFirst() : groupIDs[0]
       return reply(
         groupLoadAnswer.replacingOccurrences(of: "group-1", with: id), request: request)
@@ -474,6 +488,40 @@ struct CircuitsSubsetGroupSourceTests {
     #expect(await offered.batches.isEmpty)
     #expect(
       Set(await server.releases.map(\.path)) == ["/v1/shapes/group-1", "/v1/shapes/group-2"])
+  }
+
+  @Test func cancellingRunWhileTheSubscriptionLoadsStillTearsDownAndReleases() async throws {
+    // The subscription's own load (the second) answers only after `run` is cancelled, and the
+    // stream then delivers a batch at once, so its reader can reach the source while the
+    // coordinator's cancelled start is stopping it.
+    for _ in 0..<20 {
+      let server = GroupStreamServer(batches: groupBatches, heldLoad: 2)
+      let session = try await makeSource(server, mode: .longPoll).materialize(
+        threeTableDemand(), materializationID: CollectionMaterializationID(rawValue: "scope-1"))
+      let offered = GroupBatchLog()
+      let run = Task { try await session.run { batch in await offered.append(batch) } }
+      await waitUntil { await server.loads.count == 2 }
+      run.cancel()
+      await server.releaseHeldLoad()
+
+      let finished = await withTaskGroup(of: Bool.self) { group in
+        group.addTask {
+          _ = try? await run.value
+          return true
+        }
+        group.addTask {
+          try? await Task.sleep(for: .seconds(10))
+          return false
+        }
+        let first = await group.next() ?? false
+        group.cancelAll()
+        return first
+      }
+      #expect(finished, "run did not finish after cancellation")
+      guard finished else { return }
+      #expect(await offered.batches.isEmpty)
+      #expect(await server.releases.contains { $0.path == "/v1/shapes/group-1" })
+    }
   }
 
   @Test func envelopeForATableOutsideTheGroupFailsTheGroup() async throws {
