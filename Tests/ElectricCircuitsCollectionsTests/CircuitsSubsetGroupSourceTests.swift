@@ -123,16 +123,22 @@ private actor GroupStreamServer: HTTPTransport {
   private var nextOffset = 10
   /// The load (1-based) that waits for `releaseHeldLoad()` before answering.
   private let heldLoad: Int?
+  /// After the scripted batches, keep answering with one new `tag` row per read.
+  private let endless: Bool
   private var heldLoadRelease: CheckedContinuation<Void, Never>?
   private var heldLoadReleased = false
   private(set) var loads: [SubsetGroupRequest] = []
   private(set) var streamURLs: [URL] = []
   private(set) var releases: [URL] = []
 
-  init(batches: [String], groupIDs: [String] = ["group-1"], heldLoad: Int? = nil) {
+  init(
+    batches: [String], groupIDs: [String] = ["group-1"], heldLoad: Int? = nil,
+    endless: Bool = false
+  ) {
     self.batches = batches
     self.groupIDs = groupIDs
     self.heldLoad = heldLoad
+    self.endless = endless
   }
 
   func releaseHeldLoad() {
@@ -188,6 +194,12 @@ private actor GroupStreamServer: HTTPTransport {
   }
 
   private func takeBatch() -> String? {
+    if batches.isEmpty, endless {
+      let n = nextOffset + 1
+      batches.append(
+        #"[{"type":"public.tag","key":"t\#(n)","value":{"id":"t\#(n)","name":"live"},"#
+          + #""headers":{"operation":"insert","lsn":"1/\#(String(n, radix: 16))"}}]"#)
+    }
     guard !batches.isEmpty else { return nil }
     nextOffset += 1
     return batches.removeFirst()
@@ -491,9 +503,11 @@ struct CircuitsSubsetGroupSourceTests {
   }
 
   @Test func cancellingRunWhileTheSubscriptionLoadsStillTearsDownAndReleases() async throws {
-    // The subscription's own load (the second) answers only after `run` is cancelled, and the
-    // stream then delivers a batch at once, so its reader can reach the source while the
-    // coordinator's cancelled start is stopping it.
+    // A smoke test of teardown under cancellation: the subscription's own load (the second)
+    // answers only after `run` is cancelled, and the stream then delivers a batch at once.
+    // Whether the coordinator launches its reader before the cancelled start stops it depends on
+    // scheduling, so this does not deterministically reach a reader waiting on the setup permit;
+    // it checks that every order it does reach finishes, applies nothing and releases the group.
     for _ in 0..<20 {
       let server = GroupStreamServer(batches: groupBatches, heldLoad: 2)
       let session = try await makeSource(server, mode: .longPoll).materialize(
@@ -521,6 +535,38 @@ struct CircuitsSubsetGroupSourceTests {
       guard finished else { return }
       #expect(await offered.batches.isEmpty)
       #expect(await server.releases.contains { $0.path == "/v1/shapes/group-1" })
+    }
+  }
+
+  @Test(arguments: [LiveReadMode.longPoll, .sse])
+  func stoppingAStreamingSessionEndsRunWithoutAFailure(mode: LiveReadMode) async throws {
+    // The stream never runs dry, so batches keep arriving while the session stops.
+    for _ in 0..<20 {
+      let server = GroupStreamServer(batches: [], endless: true)
+      let demand = threeTableDemand()
+      let id = CollectionMaterializationID(rawValue: "scope-1")
+      let session = try await makeSource(server, mode: mode).materialize(
+        demand, materializationID: id)
+      let store = InMemoryCollectionGroupStore()
+      try await store.replaceGroupSnapshot(
+        session.snapshot, materializationID: id, demand: demand.identity(scope: groupScope))
+      let log = GroupBatchLog()
+      let run = Task {
+        try await session.run { batch in
+          try await store.applyGroup(batch, to: id)
+          await log.append(batch)
+        }
+      }
+      await waitUntil { await log.batches.count >= 3 }
+      #expect(await log.batches.count >= 3)
+      try await session.stop()
+      do {
+        try await run.value
+      } catch {
+        Issue.record("a clean stop ended run with \(error)")
+        return
+      }
+      #expect(await server.releases.count == 1)
     }
   }
 

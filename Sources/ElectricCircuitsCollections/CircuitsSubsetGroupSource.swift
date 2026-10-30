@@ -289,7 +289,7 @@ private actor CircuitsGroupSessionLifecycle {
     _ coordinator: ShapeSubscriptionCoordinator, materializer: CircuitsGroupTailMaterializer
   ) async throws {
     guard !stopped else {
-      await materializer.refuse()
+      await materializer.stopBeforeOpen()
       try await coordinator.stop()
       throw CancellationError()
     }
@@ -319,8 +319,9 @@ private actor CircuitsGroupSessionLifecycle {
     let initialHandle = initialHandle
     let task = Task<Void, Error> {
       // A stop can come before setup confirmed the group, while the coordinator's reader waits
-      // on the setup permit; the coordinator's stop waits for that reader, so refuse first.
-      await materializer?.refuse()
+      // on the setup permit; the coordinator's stop waits for that reader, so refuse it first.
+      // Once setup has opened the tail, the coordinator's stop alone ends the reader.
+      await materializer?.stopBeforeOpen()
       if let coordinator {
         try await coordinator.stop()
       }
@@ -374,11 +375,19 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
   /// Lets batches through once setup has confirmed the coordinator read the snapshot's group.
   func open() { releaseSetupPermit() }
 
-  /// Refuses every later batch: the coordinator's stream is not the snapshot's group, or the
-  /// session is stopping. A batch already applying finishes.
+  /// Refuses every later batch: the coordinator's stream is not the snapshot's group. A batch
+  /// already applying finishes.
   func refuse() {
     refused = true
     releaseSetupPermit()
+  }
+
+  /// Refuses batches only while setup still holds the permit, so a stop before setup confirmed
+  /// the group frees a reader waiting on it. After `open()` it does nothing: a batch arriving
+  /// while the session stops is then an ordinary batch, not a failure.
+  func stopBeforeOpen() {
+    guard setupHoldsPermit else { return }
+    refuse()
   }
 
   private func releaseSetupPermit() {
