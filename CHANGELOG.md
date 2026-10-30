@@ -3,6 +3,18 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
+## Unreleased
+
+- Add shape group loads. `ElectricCircuitsClient.loadSubsetGroup(_:)` posts one subscription and
+  every member to `POST v1/subsets/load` and returns one handle, one stream, one snapshot position
+  and table-tagged rows; an answer that doesn't list the requested members fails the load.
+  `ShapeSubscriptionCoordinator(groupRequest:)` renews a group by loading it again.
+- Add `CircuitsSubsetGroupSource` in `ElectricCircuitsCollections`. It reads a group's one stream,
+  routes each envelope to its member by `type`, keys rows by table and key, and hands every batch
+  to a `CollectionGroupStore` as one `CollectionGroupChangeBatch` with the group's one cursor.
+  `InMemoryCollectionGroupStore` is the reference provider. The single-table source, coordinator
+  and `CollectionStore` are unchanged.
+
 ## 0.8.0
 
 - Add opt-in SSE live reads through `ElectricCircuitsClient.Configuration`. The reader holds one
