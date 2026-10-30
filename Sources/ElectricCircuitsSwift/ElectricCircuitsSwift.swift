@@ -702,6 +702,10 @@ public actor ElectricCircuitsClient {
   public func querySubset(_ request: SubsetQuery) async throws -> SubsetResponse {
     try await send(path: "v1/subsets/query", method: "POST", body: request)
   }
+  /// The group load's one native call; its callers check the answer against the request.
+  func sendGroupLoad<Response: Decodable>(_ request: SubsetGroupRequest) async throws -> Response {
+    try await send(path: "v1/subsets/load", method: "POST", body: request)
+  }
 
   /// Reads the durable stream's current frontier without consuming a batch. Subset-feed clients
   /// use this HEAD checkpoint to fence the initial snapshot before starting long-poll delivery.

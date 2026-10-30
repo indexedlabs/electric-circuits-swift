@@ -112,6 +112,37 @@ demand without it is rejected before any server resource exists. Rows that leave
 released from the materialization's claim, so hold a separate demand for anything that must stay
 local beyond the page.
 
+`CircuitsSubsetGroupSource` loads several tables as one shape group, such as a Record and its
+companion tables: one `loadSubsetGroup(_:)` call names the subscription and every member and
+returns one handle, one stream, one snapshot position and rows tagged by table. Each
+`CollectionGroupMember` names its table, predicate and the `CollectionDefinition` its rows land
+in. The source routes each stream envelope to its member by `type`, keys rows by table and key
+so equal keys in two tables never collide, and hands every batch to a `CollectionGroupStore` as
+one `CollectionGroupChangeBatch`: every member's changes and the group's one cursor, which the
+store commits in one transaction. A refused member, a `503` or a broken stream fails the whole
+group. `InMemoryCollectionGroupStore` is the reference provider.
+
+Groups are not ready to enable for users yet. The group route has only the load call, so setup
+loads the group twice and every lease renewal re-reads the whole group snapshot; the client decodes
+only the claim. A group whose rows grow past `ResponseDecodingLimits` after setup fails at its next
+renewal. A rows-free renewal (OTTO-10739) is needed first.
+
+```swift
+let demand = CollectionGroupDemand(members: [
+  CollectionGroupMember(
+    definition: records, table: "public.record", predicate: RecordFields.id == recordID,
+    decodeRow: Record.init(row:), decodeKey: { $0 }),
+  CollectionGroupMember(
+    definition: assignments, table: "public.assignment",
+    predicate: AssignmentFields.recordID == recordID,
+    decodeRow: Assignment.init(row:), decodeKey: { $0 }),
+])
+let session = try await groupSource.materialize(demand, materializationID: id)
+try await store.replaceGroupSnapshot(
+  session.snapshot, materializationID: id, demand: demand.identity(scope: scope))
+try await session.run { batch in try await store.applyGroup(batch, to: id) }
+```
+
 ```swift
 let client = ElectricCircuitsClient(baseURL: URL(string: "https://engine.example")!)
 let shape = try await client.createShape(ShapeRequest(table: "public.items"))

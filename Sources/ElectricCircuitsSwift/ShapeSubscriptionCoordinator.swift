@@ -232,6 +232,14 @@ public enum ShapeSubscriptionKind: Equatable, Sendable {
   case subsetFeed
 }
 
+/// The request a coordinator creates and renews its claim with. A group load renews by posting
+/// the same subscription and members again.
+private enum ShapeSubscriptionClaimRoute: Sendable {
+  case shape(ShapeRequest)
+  case subsetFeed(ShapeRequest)
+  case subsetGroup(SubsetGroupRequest)
+}
+
 private struct MaterializerFailure: Error, Sendable {}
 private struct CoordinatedMaterializer: ShapeMaterializer {
   let base: any ShapeMaterializer
@@ -267,14 +275,13 @@ public actor ShapeSubscriptionCoordinator {
 
   private let client: ElectricCircuitsClient
   private let transport: any HTTPTransport
-  private let request: ShapeRequest
+  private let route: ShapeSubscriptionClaimRoute
   private let materializer: any ShapeMaterializer
   private let retryPolicy: ShapeSubscriptionRetryPolicy
   private let clock: any ShapeSubscriptionClock
   private let capacity: ShapeSubscriptionCapacity?
   private let responseDecodingLimits: ResponseDecodingLimits
   private let telemetry: TelemetryReporter
-  private let kind: ShapeSubscriptionKind
   private let recreatePolicy: ShapeSubscriptionRecreatePolicy
   private var continuation: AsyncStream<ShapeSubscriptionState>.Continuation?
   private var handle: ShapeHandle?
@@ -319,16 +326,62 @@ public actor ShapeSubscriptionCoordinator {
     kind: ShapeSubscriptionKind = .shape,
     recreatePolicy: ShapeSubscriptionRecreatePolicy = .init()
   ) {
+    let route: ShapeSubscriptionClaimRoute =
+      switch kind {
+      case .shape: .shape(request)
+      case .subsetFeed: .subsetFeed(request)
+      }
+    self.init(
+      client: client, transport: transport, route: route, materializer: materializer,
+      retryPolicy: retryPolicy, clock: clock, capacity: capacity,
+      responseDecodingLimits: responseDecodingLimits, telemetry: telemetry,
+      recreatePolicy: recreatePolicy)
+  }
+
+  /// A coordinator for one shape group: it loads the group, reads the group's one stream and
+  /// renews by loading the same subscription and members again.
+  ///
+  /// A renewal is a full group load: the engine re-reads every member's snapshot and the answer
+  /// carries its rows, which are not decoded. The answer still counts against
+  /// `ResponseDecodingLimits`, so a group whose rows outgrow the limit fails at its next renewal.
+  /// A rows-free renewal is OTTO-10739; don't enable groups for users before it lands.
+  public init(
+    client: ElectricCircuitsClient, transport: any HTTPTransport,
+    groupRequest: SubsetGroupRequest, materializer: any ShapeMaterializer,
+    retryPolicy: ShapeSubscriptionRetryPolicy = .init(),
+    clock: any ShapeSubscriptionClock = ContinuousShapeSubscriptionClock(),
+    capacity: ShapeSubscriptionCapacity? = nil,
+    responseDecodingLimits: ResponseDecodingLimits = .default,
+    telemetry: TelemetryReporter = .noop,
+    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init()
+  ) {
+    // Only a load that names its subscription renews the same group; without one, every
+    // renewal would mint a new group and report a replacement.
+    precondition(
+      groupRequest.subscription != nil, "a group coordinator needs a stable subscription")
+    self.init(
+      client: client, transport: transport, route: .subsetGroup(groupRequest),
+      materializer: materializer, retryPolicy: retryPolicy, clock: clock, capacity: capacity,
+      responseDecodingLimits: responseDecodingLimits, telemetry: telemetry,
+      recreatePolicy: recreatePolicy)
+  }
+
+  private init(
+    client: ElectricCircuitsClient, transport: any HTTPTransport,
+    route: ShapeSubscriptionClaimRoute, materializer: any ShapeMaterializer,
+    retryPolicy: ShapeSubscriptionRetryPolicy, clock: any ShapeSubscriptionClock,
+    capacity: ShapeSubscriptionCapacity?, responseDecodingLimits: ResponseDecodingLimits,
+    telemetry: TelemetryReporter, recreatePolicy: ShapeSubscriptionRecreatePolicy
+  ) {
     self.client = client
     self.transport = transport
-    self.request = request
+    self.route = route
     self.materializer = materializer
     self.retryPolicy = retryPolicy
     self.clock = clock
     self.capacity = capacity
     self.responseDecodingLimits = responseDecodingLimits
     self.telemetry = telemetry
-    self.kind = kind
     self.recreatePolicy = recreatePolicy
     let updates = AsyncStream<ShapeSubscriptionState>.makeStream()
     stateUpdates = updates.stream
@@ -719,11 +772,13 @@ public actor ShapeSubscriptionCoordinator {
     }
     try Task.checkCancellation()
     return try await recreatingOnGone(operation: "create") {
-      switch self.kind {
-      case .shape:
-        try await self.client.createShape(self.request)
-      case .subsetFeed:
-        try await self.client.createSubsetFeed(self.request)
+      switch self.route {
+      case .shape(let request):
+        try await self.client.createShape(request)
+      case .subsetFeed(let request):
+        try await self.client.createSubsetFeed(request)
+      case .subsetGroup(let request):
+        try await self.client.claimSubsetGroup(request)
       }
     }
   }
@@ -801,11 +856,15 @@ public actor ShapeSubscriptionCoordinator {
   /// fresh scope instead of inheriting two live server claims.
   private func renewWithRetry() async throws -> ShapeHandle {
     try await recreatingOnGone(operation: "renew") {
-      switch self.kind {
-      case .shape:
-        try await self.client.renewShape(self.request)
-      case .subsetFeed:
-        try await self.client.createSubsetFeed(self.request)
+      switch self.route {
+      case .shape(let request):
+        try await self.client.renewShape(request)
+      case .subsetFeed(let request):
+        try await self.client.createSubsetFeed(request)
+      case .subsetGroup(let request):
+        // A renewal is the same load and still carries the group's rows; only its claim is
+        // decoded. A rows-free renewal needs a server route (OTTO-10739).
+        try await self.client.claimSubsetGroup(request)
       }
     }
   }

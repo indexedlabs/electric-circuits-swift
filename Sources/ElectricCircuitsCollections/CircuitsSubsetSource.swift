@@ -239,7 +239,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       .joined(separator: "|")
   }
 
-  fileprivate static func pageVersion(_ response: SubsetResponse) -> CollectionSourceVersion? {
+  static func pageVersion(_ response: SubsetResponse) -> CollectionSourceVersion? {
     guard let lsn = postgresLSN(response.lsn) else { return nil }
     return CollectionSourceVersion(
       rawValue: lsn.rawValue, order: lsn.order,
@@ -249,7 +249,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
 
   /// PostgreSQL LSNs are two unsigned hexadecimal 32-bit words. A `UInt64` sort key is portable
   /// to Indexed/GRDB stores and avoids trusting lexicographic wire strings.
-  fileprivate static func postgresLSN(_ value: String) -> CollectionSourceVersion? {
+  static func postgresLSN(_ value: String) -> CollectionSourceVersion? {
     let words = value.split(separator: "/", omittingEmptySubsequences: false)
     guard words.count == 2, !words[0].isEmpty, !words[1].isEmpty,
       let high = UInt64(words[0], radix: 16), let low = UInt64(words[1], radix: 16),
