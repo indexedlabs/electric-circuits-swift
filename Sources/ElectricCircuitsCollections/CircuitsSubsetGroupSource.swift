@@ -174,8 +174,9 @@ public struct CircuitsSubsetGroupSource: Sendable {
                 switch state {
                 case .failed(let failure):
                   // A stop refuses the tail before it stops the coordinator, so a batch caught
-                  // between the two fails the coordinator; that failure is the stop.
-                  if await lifecycle.isStopping { return }
+                  // between the two fails the coordinator; that failure is the stop. Any other
+                  // failure, including one that came before the stop, is reported.
+                  if await materializer.failedForStop() { return }
                   if let cause = await materializer.takeTerminalFailure() { throw cause }
                   throw CircuitsSubsetGroupSourceError.subscription(failure)
                 case .reseedRequired(let outcome):
@@ -304,9 +305,6 @@ private actor CircuitsGroupSessionLifecycle {
     coordinatorStarted = true
   }
 
-  /// Whether the session has been asked to stop.
-  var isStopping: Bool { stopped }
-
   func stop() async throws {
     if let stopTask {
       do {
@@ -356,6 +354,10 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
   private var applying = true
   private var setupHoldsPermit = true
   private var refused = false
+  private var refusingForStop = false
+  /// Set when a batch was refused because the session was stopping, so the coordinator failure
+  /// that refusal causes is reported as the stop rather than as a materializer failure.
+  private var rejectedForStop = false
   private var applicationWaiters: [CheckedContinuation<Void, Never>] = []
   private var sourceVersion: CollectionSourceVersion
   private let applyBatch: @Sendable (CollectionGroupChangeBatch) async throws -> Void
@@ -393,8 +395,12 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
   /// while the session stops is then an ordinary batch, not a failure.
   func stopBeforeOpen() {
     guard setupHoldsPermit else { return }
+    refusingForStop = true
     refuse()
   }
+
+  /// Whether the materializer's last failure was a batch refused because the session stopped.
+  func failedForStop() -> Bool { rejectedForStop }
 
   private func releaseSetupPermit() {
     guard setupHoldsPermit else { return }
@@ -429,7 +435,10 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
     }
     defer { releasePermit() }
     try Task.checkCancellation()
-    if refused { throw CancellationError() }
+    if refused {
+      if refusingForStop { rejectedForStop = true }
+      throw CancellationError()
+    }
     if cursor == nextCursor { return }
     guard cursor == expectedCursor else {
       throw StreamError.cursorConflict(
