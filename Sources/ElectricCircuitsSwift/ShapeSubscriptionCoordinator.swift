@@ -350,6 +350,10 @@ public actor ShapeSubscriptionCoordinator {
     telemetry: TelemetryReporter = .noop,
     recreatePolicy: ShapeSubscriptionRecreatePolicy = .init()
   ) {
+    // Only a load that names its subscription renews the same group; without one, every
+    // renewal would mint a new group and report a replacement.
+    precondition(
+      groupRequest.subscription != nil, "a group coordinator needs a stable subscription")
     self.init(
       client: client, transport: transport, route: .subsetGroup(groupRequest),
       materializer: materializer, retryPolicy: retryPolicy, clock: clock, capacity: capacity,
@@ -769,7 +773,7 @@ public actor ShapeSubscriptionCoordinator {
       case .subsetFeed(let request):
         try await self.client.createSubsetFeed(request)
       case .subsetGroup(let request):
-        try await self.client.loadSubsetGroup(request).handle
+        try await self.client.claimSubsetGroup(request)
       }
     }
   }
@@ -853,8 +857,9 @@ public actor ShapeSubscriptionCoordinator {
       case .subsetFeed(let request):
         try await self.client.createSubsetFeed(request)
       case .subsetGroup(let request):
-        // A renewal answers with the group's snapshot again; only its handle is kept here.
-        try await self.client.loadSubsetGroup(request).handle
+        // A renewal is the same load and still carries the group's rows; only its claim is
+        // decoded. A rows-free renewal needs a server route (OTTO-10739).
+        try await self.client.claimSubsetGroup(request)
       }
     }
   }

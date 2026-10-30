@@ -88,6 +88,7 @@ private func threeTableDemand() -> CollectionGroupDemand {
 private let groupLoadAnswer = #"""
   {"groupId":"group-1","shapeId":"group-1","subscription":"scope-1","streamPath":"/streams/group-1",
    "streamUrl":"https://engine.test/streams/group-1","offset":"10","lsn":"0/10",
+   "snapshot":"100:110:","horizon":"0/15",
    "rows":[{"table":"public.record","value":{"id":"1","title":"Record"}},
            {"table":"public.assignment","value":{"id":"1","person":"Ada"}},
            {"table":"public.assignment","value":{"id":"2","person":"Grace"}},
@@ -99,14 +100,18 @@ private let groupLoadAnswer = #"""
 
 /// One batch touching all three tables, with a delete of key "1" in `assignment` while key "1"
 /// stays in `record` and `tag`; then a delete of key "1" in `record` and an update of key "1"
-/// in `tag`.
+/// in `tag`. The first envelope committed inside the group snapshot (xid 105 below its xmax), so
+/// the snapshot gate skips it. The `tag` update carries an LSN below the `record` delete before
+/// it, as a deferred query-back can; it is applied only because rows are versioned per table
+/// and key, not per key.
 private let groupBatches = [
-  #"[{"type":"public.record","key":"1","value":{"id":"1","title":"Record v2"},"headers":{"operation":"update","lsn":"0/20"}},"#
+  #"[{"type":"public.assignment","key":"2","value":{"id":"2","person":"Grace (in snapshot)"},"headers":{"operation":"update","lsn":"0/F","txid":"105"}},"#
+    + #"{"type":"public.record","key":"1","value":{"id":"1","title":"Record v2"},"headers":{"operation":"update","lsn":"0/20"}},"#
     + #"{"type":"public.assignment","key":"1","headers":{"operation":"delete","lsn":"0/20"}},"#
     + #"{"type":"public.assignment","key":"3","value":{"id":"3","person":"Linus"},"headers":{"operation":"insert","lsn":"0/20"}},"#
     + #"{"type":"public.tag","key":"2","value":{"id":"2","name":"later"},"headers":{"operation":"insert","lsn":"0/20"}}]"#,
   #"[{"type":"public.record","key":"1","headers":{"operation":"delete","lsn":"0/30"}},"#
-    + #"{"type":"public.tag","key":"1","value":{"id":"1","name":"urgent v2"},"headers":{"operation":"update","lsn":"0/30"}}]"#,
+    + #"{"type":"public.tag","key":"1","value":{"id":"1","name":"urgent v2"},"headers":{"operation":"update","lsn":"0/19"}}]"#,
 ]
 
 /// A mock of the gateway's group-only `subsets/load` and the group's one stream, answering
@@ -181,8 +186,6 @@ private actor GroupBatchLog {
   private(set) var batches: [CollectionGroupChangeBatch] = []
   func append(_ batch: CollectionGroupChangeBatch) { batches.append(batch) }
 }
-
-private struct StoreRefusal: Error {}
 
 private func makeSource(_ server: GroupStreamServer, mode: LiveReadMode)
   -> CircuitsSubsetGroupSource
@@ -409,17 +412,40 @@ struct CircuitsSubsetGroupSourceTests {
     let demand = threeTableDemand()
     let id = CollectionMaterializationID(rawValue: "scope-1")
     let session = try await source.materialize(demand, materializationID: id)
+    // The store holds the group without `tags`, so it refuses the first batch at its last
+    // member, after the `record` and `assignment` changes are already in its working copy.
     let store = InMemoryCollectionGroupStore()
     try await store.replaceGroupSnapshot(
-      session.snapshot, materializationID: id, demand: demand.identity(scope: groupScope))
+      CollectionGroupSnapshot(
+        members: session.snapshot.members.filter { $0.collection != tags.id },
+        fence: session.snapshot.fence, sourceVersion: session.snapshot.sourceVersion,
+        cursor: session.snapshot.cursor),
+      materializationID: id, demand: demand.identity(scope: groupScope))
+    let attempts = GroupBatchLog()
 
-    await #expect(throws: CircuitsSubsetGroupSourceError.self) {
-      try await session.run { _ in throw StoreRefusal() }
+    await #expect(throws: CircuitsSubsetGroupSourceError.subscription(.materializer)) {
+      try await session.run { batch in
+        await attempts.append(batch)
+        try await store.applyGroup(batch, to: id)
+      }
     }
+    // The refused batch was the only one offered: the source never moved past it.
+    let offered = await attempts.batches
+    #expect(offered.count == 1)
+    #expect(offered.first?.expectedCursor == session.snapshot.cursor)
+    #expect(offered.first?.cursor.offset == "11")
+    // Neither table nor the cursor changed.
     #expect(try await store.groupMaterialization(id)?.cursor == session.snapshot.cursor)
     #expect(
       await store.rows(in: records.id, scope: groupScope, as: GroupRecord.self, key: String.self)
         == ["1": GroupRecord(id: "1", title: "Record")])
+    #expect(
+      await store.rows(
+        in: assignments.id, scope: groupScope, as: GroupAssignment.self, key: String.self)
+        == [
+          "1": GroupAssignment(id: "1", person: "Ada"),
+          "2": GroupAssignment(id: "2", person: "Grace"),
+        ])
     #expect(await server.releases.count == 1)
   }
 

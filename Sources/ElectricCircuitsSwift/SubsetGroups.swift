@@ -155,3 +155,49 @@ extension ElectricCircuitsClient {
     return response
   }
 }
+
+/// The claim fields of a group load answer. Decoding skips `rows`, so a renewal never builds the
+/// group's snapshot rows only to throw them away.
+private struct SubsetGroupClaim: Decodable {
+  var shapeId: String
+  var subscription: String?
+  var leaseSeconds: Int?
+  var streamPath: String
+  var streamURL: URL
+  var results: [SubsetGroupMemberResult]
+
+  enum CodingKeys: String, CodingKey {
+    case shapeId, subscription, leaseSeconds, streamPath
+    case streamURL = "streamUrl"
+    case results
+  }
+}
+
+extension ElectricCircuitsClient {
+  /// Creates or renews a group's claim with the same request `loadSubsetGroup(_:)` sends, keeping
+  /// only its handle. The coordinator uses it for start and lease renewal, where the snapshot rows
+  /// the answer still carries are not wanted.
+  func claimSubsetGroup(_ request: SubsetGroupRequest) async throws -> ShapeHandle {
+    let claim: SubsetGroupClaim = try await sendGroupLoad(request)
+    guard claim.results.count == request.members.count else {
+      throw ClientError.decoding("group response members do not match request")
+    }
+    for (member, result) in zip(request.members, claim.results) {
+      if let key = member.key, result.key != key {
+        throw ClientError.decoding("group response members do not match request")
+      }
+    }
+    var subscription = claim.subscription
+    if let requested = request.subscription {
+      if let echoed = subscription, echoed != requested {
+        throw ClientError.decoding("group response subscription does not match request")
+      }
+      subscription = requested
+    }
+    return ShapeHandle(
+      response: ShapeResponse(
+        shapeId: claim.shapeId, table: claim.results.map(\.table).joined(separator: ","),
+        streamPath: claim.streamPath, streamURL: claim.streamURL, subscription: subscription,
+        leaseSeconds: claim.leaseSeconds))
+  }
+}

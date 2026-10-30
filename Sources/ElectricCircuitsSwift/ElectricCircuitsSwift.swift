@@ -702,8 +702,8 @@ public actor ElectricCircuitsClient {
   public func querySubset(_ request: SubsetQuery) async throws -> SubsetResponse {
     try await send(path: "v1/subsets/query", method: "POST", body: request)
   }
-  /// The group load's one native call; `loadSubsetGroup(_:)` checks the answer against the request.
-  func sendGroupLoad(_ request: SubsetGroupRequest) async throws -> SubsetGroupResponse {
+  /// The group load's one native call; its callers check the answer against the request.
+  func sendGroupLoad<Response: Decodable>(_ request: SubsetGroupRequest) async throws -> Response {
     try await send(path: "v1/subsets/load", method: "POST", body: request)
   }
 
