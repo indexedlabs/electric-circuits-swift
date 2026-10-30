@@ -14,6 +14,11 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   to a `CollectionGroupStore` as one `CollectionGroupChangeBatch` with the group's one cursor.
   `InMemoryCollectionGroupStore` is the reference provider. The single-table source, coordinator
   and `CollectionStore` are unchanged.
+- Known limitation: the group route has only the load call, so setup loads the group twice and
+  every lease renewal re-reads the group's snapshot. The engine does that read and the response
+  carries the rows, though the client decodes only the claim. A group whose rows grow past
+  `ResponseDecodingLimits` after setup fails at its next renewal. Don't enable groups for users
+  until a rows-free renewal lands (OTTO-10739).
 
 ## 0.8.0
 

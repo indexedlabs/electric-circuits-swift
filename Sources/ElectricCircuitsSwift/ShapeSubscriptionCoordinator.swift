@@ -340,6 +340,11 @@ public actor ShapeSubscriptionCoordinator {
 
   /// A coordinator for one shape group: it loads the group, reads the group's one stream and
   /// renews by loading the same subscription and members again.
+  ///
+  /// A renewal is a full group load: the engine re-reads every member's snapshot and the answer
+  /// carries its rows, which are not decoded. The answer still counts against
+  /// `ResponseDecodingLimits`, so a group whose rows outgrow the limit fails at its next renewal.
+  /// A rows-free renewal is OTTO-10739; don't enable groups for users before it lands.
   public init(
     client: ElectricCircuitsClient, transport: any HTTPTransport,
     groupRequest: SubsetGroupRequest, materializer: any ShapeMaterializer,
