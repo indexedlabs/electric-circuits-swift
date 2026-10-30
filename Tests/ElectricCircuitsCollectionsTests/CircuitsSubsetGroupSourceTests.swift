@@ -118,27 +118,34 @@ private let groupBatches = [
 /// stream reads by long-poll through `send` and by SSE through `stream`.
 private actor GroupStreamServer: HTTPTransport {
   private var batches: [String]
+  /// The group id each load answers with; the last one repeats.
+  private var groupIDs: [String]
   private var nextOffset = 10
   private(set) var loads: [SubsetGroupRequest] = []
   private(set) var streamURLs: [URL] = []
   private(set) var releases: [URL] = []
 
-  init(batches: [String]) { self.batches = batches }
+  init(batches: [String], groupIDs: [String] = ["group-1"]) {
+    self.batches = batches
+    self.groupIDs = groupIDs
+  }
 
   func send(_ request: URLRequest) async throws -> HTTPResponse {
     let path = request.url?.path ?? ""
     switch (request.httpMethod, path) {
     case ("POST", "/v1/subsets/load"):
       loads.append(try JSONDecoder().decode(SubsetGroupRequest.self, from: request.httpBody!))
-      return reply(groupLoadAnswer, request: request)
-    case ("GET", "/streams/group-1"):
+      let id = groupIDs.count > 1 ? groupIDs.removeFirst() : groupIDs[0]
+      return reply(
+        groupLoadAnswer.replacingOccurrences(of: "group-1", with: id), request: request)
+    case ("GET", let path) where path.hasPrefix("/streams/"):
       streamURLs.append(request.url!)
       guard let body = takeBatch() else {
         try await Task.sleep(for: .seconds(3_600))
         throw CancellationError()
       }
       return reply(body, request: request, headers: ["stream-next-offset": "\(nextOffset)"])
-    case ("DELETE", "/v1/shapes/group-1"):
+    case ("DELETE", let path) where path.hasPrefix("/v1/shapes/"):
       releases.append(request.url!)
       return reply("", request: request, status: 204)
     default:
@@ -447,6 +454,26 @@ struct CircuitsSubsetGroupSourceTests {
           "2": GroupAssignment(id: "2", person: "Grace"),
         ])
     #expect(await server.releases.count == 1)
+  }
+
+  @Test func coordinatorLoadingAnotherGroupThanTheSnapshotsRequiresReseed() async throws {
+    // The group was released between setup's load and the subscription's own load, which
+    // answers with a new group whose stream does not continue from the snapshot's cursor.
+    let server = GroupStreamServer(batches: groupBatches, groupIDs: ["group-1", "group-2"])
+    let session = try await makeSource(server, mode: .longPoll).materialize(
+      threeTableDemand(), materializationID: CollectionMaterializationID(rawValue: "scope-1"))
+    let offered = GroupBatchLog()
+
+    do {
+      try await session.run { batch in await offered.append(batch) }
+      Issue.record("expected the replaced group to require a reseed")
+    } catch CircuitsSubsetGroupSourceError.subscription(.reseedRequired(let outcome)) {
+      #expect(
+        outcome.reason == .replacement(previousShapeID: "group-1", replacementShapeID: "group-2"))
+    }
+    #expect(await offered.batches.isEmpty)
+    #expect(
+      Set(await server.releases.map(\.path)) == ["/v1/shapes/group-1", "/v1/shapes/group-2"])
   }
 
   @Test func envelopeForATableOutsideTheGroupFailsTheGroup() async throws {

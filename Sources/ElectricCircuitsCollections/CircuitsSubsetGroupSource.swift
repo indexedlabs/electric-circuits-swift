@@ -153,7 +153,21 @@ public struct CircuitsSubsetGroupSource: Sendable {
           let states = await coordinator.stateUpdates
           do {
             try await withTaskCancellationHandler {
-              _ = try await coordinator.start()
+              // The coordinator's own load must renew the group the snapshot came from. A
+              // different group means the first was released in between (a retired table, a
+              // reset or a lapsed lease): its stream does not continue from this snapshot's
+              // cursor, so the caller reseeds, and no batch from it reaches the store.
+              let started = try await coordinator.start()
+              guard started.id == handle.id else {
+                await materializer.refuse()
+                throw CircuitsSubsetGroupSourceError.subscription(
+                  .reseedRequired(
+                    ShapeSubscriptionReseedRequired(
+                      reason: .replacement(
+                        previousShapeID: handle.id, replacementShapeID: started.id),
+                      previous: handle, replacement: started)))
+              }
+              await materializer.open()
               await lifecycle.markCoordinatorStarted()
               for await state in states {
                 try Task.checkCancellation()
@@ -321,8 +335,10 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
   private var passedSnapshotHorizon = false
   private var rowVersions: [GroupRowKey: CollectionSourceVersion] = [:]
   // Actors are reentrant across store application; hold this FIFO permit across it so a second
-  // application cannot commit against the same cursor.
-  private var applying = false
+  // application cannot commit against the same cursor. Setup holds it until it has confirmed
+  // the stream belongs to the snapshot's group.
+  private var applying = true
+  private var refused = false
   private var applicationWaiters: [CheckedContinuation<Void, Never>] = []
   private var sourceVersion: CollectionSourceVersion
   private let applyBatch: @Sendable (CollectionGroupChangeBatch) async throws -> Void
@@ -345,6 +361,23 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
     applyBatch = apply
   }
 
+  /// Lets batches through once setup has confirmed the coordinator read the snapshot's group.
+  func open() { releasePermit() }
+
+  /// Refuses every batch: the coordinator's stream is not the snapshot's group.
+  func refuse() {
+    refused = true
+    releasePermit()
+  }
+
+  private func releasePermit() {
+    if applicationWaiters.isEmpty {
+      applying = false
+    } else {
+      applicationWaiters.removeFirst().resume()
+    }
+  }
+
   func takeTerminalFailure() -> (any Error)? {
     defer { terminalFailure = nil }
     return terminalFailure
@@ -362,14 +395,9 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
     } else {
       applying = true
     }
-    defer {
-      if applicationWaiters.isEmpty {
-        applying = false
-      } else {
-        applicationWaiters.removeFirst().resume()
-      }
-    }
+    defer { releasePermit() }
     try Task.checkCancellation()
+    if refused { throw CancellationError() }
     if cursor == nextCursor { return }
     guard cursor == expectedCursor else {
       throw StreamError.cursorConflict(
