@@ -173,6 +173,9 @@ public struct CircuitsSubsetGroupSource: Sendable {
                 try Task.checkCancellation()
                 switch state {
                 case .failed(let failure):
+                  // A stop refuses the tail before it stops the coordinator, so a batch caught
+                  // between the two fails the coordinator; that failure is the stop.
+                  if await lifecycle.isStopping { return }
                   if let cause = await materializer.takeTerminalFailure() { throw cause }
                   throw CircuitsSubsetGroupSourceError.subscription(failure)
                 case .reseedRequired(let outcome):
@@ -300,6 +303,9 @@ private actor CircuitsGroupSessionLifecycle {
   func markCoordinatorStarted() {
     coordinatorStarted = true
   }
+
+  /// Whether the session has been asked to stop.
+  var isStopping: Bool { stopped }
 
   func stop() async throws {
     if let stopTask {
