@@ -495,6 +495,11 @@ public struct ShapeStreamReader: Sendable {
     if let control = result.batch.controls.first(where: { $0.isMustRefetch }) {
       throw StreamError.mustRefetch(path: streamURL.path, control: control)
     }
+    // A control kind this reader does not know may also say the stream cannot complete what the
+    // reader holds; skipping it would commit past an instruction, so it fails closed as well.
+    if let control = result.batch.controls.first {
+      throw StreamError.decoding("unsupported stream control '\(control.control)'")
+    }
     let span = telemetry.beginSpan(name: "electric.materializer.apply", kind: .internalSpan)
     let started = DispatchTime.now().uptimeNanoseconds
     do {

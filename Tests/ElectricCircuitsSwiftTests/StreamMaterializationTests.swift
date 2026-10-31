@@ -252,6 +252,28 @@ struct StreamMaterializationTests {
     #expect(try await materializer.currentCursor() == start)
   }
 
+  @Test func anUnknownControlFailsClosedWithoutCommitting() async throws {
+    let unknown =
+      #"[{"type":"__circuits.control","key":"resync","value":{"control":"resync"},"#
+      + #""headers":{"operation":"control"}}]"#
+    let transport = ScriptedStreamTransport(responses: [
+      streamResponse(unknown, headers: ["stream-next-offset": "42"])
+    ])
+    let materializer = InMemoryShapeMaterializer()
+    let start = StreamCursor(offset: "41")
+    try await materializer.apply(ChangeBatch(), expecting: nil, advancingTo: start)
+    let reader = ShapeStreamReader(
+      streamURL: URL(string: "https://streams.test/shape/s1")!,
+      transport: transport,
+      materializer: materializer,
+      startingAt: start)
+
+    await #expect(throws: StreamError.decoding("unsupported stream control 'resync'")) {
+      try await reader.run()
+    }
+    #expect(try await materializer.currentCursor() == start)
+  }
+
   @Test func idle204WithUnchangedOffsetDoesNotApply() async throws {
     let transport = ScriptedStreamTransport(responses: [
       streamResponse("", status: 204, headers: ["stream-next-offset": "41"]),

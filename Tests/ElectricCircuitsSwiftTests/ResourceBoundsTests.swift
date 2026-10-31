@@ -168,6 +168,28 @@ struct ResourceBoundsTests {
     #expect(await materializer.applications == 0)
   }
 
+  @Test func aControlCountsAgainstTheEventLimit() async throws {
+    let prior = StreamCursor(offset: "41")
+    let rowAndControl =
+      #"[{"type":"public.items","key":"1","value":{"id":1},"headers":{"operation":"upsert"}},"#
+      + #"{"type":"__circuits.control","key":"must-refetch","value":{"control":"must-refetch"},"#
+      + #""headers":{"operation":"control"}}]"#
+    let transport = BoundsTransport(responses: [
+      boundsResponse(rowAndControl, headers: ["stream-next-offset": "42"])
+    ])
+    let materializer = BoundsMaterializer(rows: ["old": ["id": .int(0)]], cursor: prior)
+    let reader = ShapeStreamReader(
+      streamURL: URL(string: "https://streams.test/shape/s1")!, transport: transport,
+      materializer: materializer, startingAt: prior,
+      responseDecodingLimits: .init(
+        maximumDecodedResponseBytes: 10_000, maximumChangeEventsPerStreamBatch: 1))
+    await #expect(throws: StreamError.batchTooLarge(limit: 1, observed: 2)) {
+      try await reader.run()
+    }
+    #expect(try await materializer.currentCursor() == prior)
+    #expect(await materializer.applications == 0)
+  }
+
   @Test func exactEventLimitAndEmptyCursorAdvancementPass() async throws {
     let oneTransport = BoundsTransport(responses: [
       boundsResponse(oneChange, headers: ["stream-next-offset": "42"])

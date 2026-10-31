@@ -698,6 +698,23 @@ struct CircuitsSubsetGroupSourceTests {
     }
     #expect(await applied.batches.isEmpty, "a batch carrying the marker must not be applied")
     #expect(await server.releases.count == 1)
+
+    // The reload: a new load, whose snapshot replaces the rows, reading on from its own frontier
+    // without seeing the marker again.
+    let store = InMemoryCollectionGroupStore()
+    let id = CollectionMaterializationID(rawValue: "scope-1")
+    let identity = threeTableDemand().identity(scope: groupScope)
+    let reloaded = try await makeSource(server, mode: mode).materialize(
+      threeTableDemand(), materializationID: id)
+    try await store.replaceGroupSnapshot(reloaded.snapshot, materializationID: id, demand: identity)
+    #expect(await server.loads.count == 2)
+    #expect(
+      reloaded.snapshot.rows(in: assignments.id, as: GroupAssignment.self, key: String.self)
+        == [GroupAssignment(id: "1", person: "Ada"), GroupAssignment(id: "2", person: "Grace")])
+    let run = Task { try await reloaded.run { batch in try await store.applyGroup(batch, to: id) } }
+    await waitUntil { await server.streamURLs.count >= 2 }
+    try await reloaded.stop()
+    try await run.value
   }
 
   @Test func envelopeForATableOutsideTheGroupFailsTheGroup() async throws {
