@@ -124,6 +124,8 @@ private actor GroupStreamServer: HTTPTransport {
   private let goneStatus: Int
   /// The lease each load's answer names; nil names none.
   private let leaseSeconds: Int?
+  /// How long each load takes to answer.
+  private let loadDelay: Duration
   /// After the scripted batches, keep answering with one new `tag` row per read.
   private let endless: Bool
   private(set) var loads: [SubsetGroupRequest] = []
@@ -132,9 +134,10 @@ private actor GroupStreamServer: HTTPTransport {
 
   init(
     batches: [String], goneReads: Int = 0, goneStatus: Int = 410, endless: Bool = false,
-    leaseSeconds: Int? = nil
+    leaseSeconds: Int? = nil, loadDelay: Duration = .zero
   ) {
     self.leaseSeconds = leaseSeconds
+    self.loadDelay = loadDelay
     self.batches = batches
     self.goneReads = goneReads
     self.goneStatus = goneStatus
@@ -146,6 +149,7 @@ private actor GroupStreamServer: HTTPTransport {
     switch (request.httpMethod, path) {
     case ("POST", "/v1/subsets/load"):
       loads.append(try JSONDecoder().decode(SubsetGroupRequest.self, from: request.httpBody!))
+      try await Task.sleep(for: loadDelay)
       let answer = leaseSeconds.map {
         groupLoadAnswer.replacingOccurrences(
           of: #""streamPath":"#, with: #""leaseSeconds":\#($0),"streamPath":"#)
@@ -599,6 +603,31 @@ struct CircuitsSubsetGroupSourceTests {
     _ = await run.result
     await waitUntil { await !server.releases.isEmpty }
     #expect(await server.releases.contains { $0.path == "/v1/shapes/group-1" })
+  }
+
+  @Test func aSlowSetupLoadShortensTheFirstRenewal() async throws {
+    // A 30-second lease renews every 10 seconds, and the lease may have begun as the request
+    // reached the server, so the load's own time counts against the first interval.
+    let loadDelay = Duration.milliseconds(50)
+    let server = GroupStreamServer(batches: [], leaseSeconds: 30, loadDelay: loadDelay)
+    let clock = GroupSourceLeaseClock()
+    let session = try await makeSource(server, mode: .longPoll, clock: clock).materialize(
+      threeTableDemand(), materializationID: CollectionMaterializationID(rawValue: "scope-1"))
+
+    let run = Task { try await session.run { _ in } }
+    await waitUntil { await !clock.sleeps.isEmpty }
+    let first = try #require(await clock.sleeps.first)
+    #expect(first <= .seconds(10) - loadDelay)
+    #expect(await server.loads.count == 1)
+
+    // The renewal comes when that sleep ends, inside the lease.
+    await clock.wake()
+    await waitUntil { await server.loads.count >= 2 }
+    #expect(await server.loads.count == 2)
+
+    run.cancel()
+    _ = await run.result
+    await waitUntil { await !server.releases.isEmpty }
   }
 
   @Test func aStopDuringSetupReleasesTheGroupAndAppliesNothing() async throws {
