@@ -122,13 +122,19 @@ private actor GroupStreamServer: HTTPTransport {
   /// How many stream reads answer `goneStatus` before the scripted batches start.
   private var goneReads: Int
   private let goneStatus: Int
+  /// The lease each load's answer names; nil names none.
+  private let leaseSeconds: Int?
   /// After the scripted batches, keep answering with one new `tag` row per read.
   private let endless: Bool
   private(set) var loads: [SubsetGroupRequest] = []
   private(set) var streamURLs: [URL] = []
   private(set) var releases: [URL] = []
 
-  init(batches: [String], goneReads: Int = 0, goneStatus: Int = 410, endless: Bool = false) {
+  init(
+    batches: [String], goneReads: Int = 0, goneStatus: Int = 410, endless: Bool = false,
+    leaseSeconds: Int? = nil
+  ) {
+    self.leaseSeconds = leaseSeconds
     self.batches = batches
     self.goneReads = goneReads
     self.goneStatus = goneStatus
@@ -140,7 +146,11 @@ private actor GroupStreamServer: HTTPTransport {
     switch (request.httpMethod, path) {
     case ("POST", "/v1/subsets/load"):
       loads.append(try JSONDecoder().decode(SubsetGroupRequest.self, from: request.httpBody!))
-      return reply(groupLoadAnswer, request: request)
+      let answer = leaseSeconds.map {
+        groupLoadAnswer.replacingOccurrences(
+          of: #""streamPath":"#, with: #""leaseSeconds":\#($0),"streamPath":"#)
+      }
+      return reply(answer ?? groupLoadAnswer, request: request)
     case ("GET", let path) where path.hasPrefix("/streams/"):
       streamURLs.append(request.url!)
       if goneReads > 0 {
@@ -214,15 +224,54 @@ private actor GroupBatchLog {
   func append(_ batch: CollectionGroupChangeBatch) { batches.append(batch) }
 }
 
-private func makeSource(_ server: GroupStreamServer, mode: LiveReadMode)
-  -> CircuitsSubsetGroupSource
-{
+private func makeSource(
+  _ server: GroupStreamServer, mode: LiveReadMode,
+  clock: any ShapeSubscriptionClock = ContinuousShapeSubscriptionClock()
+) -> CircuitsSubsetGroupSource {
   CircuitsSubsetGroupSource(
     client: ElectricCircuitsClient(
       baseURL: URL(string: "https://engine.test")!, transport: server,
       configuration: .init(liveReadMode: mode)),
     transport: server,
-    retryPolicy: ShapeSubscriptionRetryPolicy(maxRetries: 0))
+    retryPolicy: ShapeSubscriptionRetryPolicy(maxRetries: 0),
+    clock: clock)
+}
+
+/// Records each sleep and holds it until the test wakes it or its task is cancelled.
+private actor GroupSourceLeaseClock: ShapeSubscriptionClock {
+  private(set) var sleeps: [Duration] = []
+  private var sleeping: [UUID: CheckedContinuation<Void, Error>] = [:]
+  private var cancelled: Set<UUID> = []
+
+  func sleep(for duration: Duration) async throws {
+    sleeps.append(duration)
+    let id = UUID()
+    try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        if cancelled.remove(id) != nil {
+          continuation.resume(throwing: CancellationError())
+        } else {
+          sleeping[id] = continuation
+        }
+      }
+    } onCancel: {
+      Task { await self.cancel(id) }
+    }
+  }
+
+  private func cancel(_ id: UUID) {
+    if let sleeper = sleeping.removeValue(forKey: id) {
+      sleeper.resume(throwing: CancellationError())
+    } else {
+      cancelled.insert(id)
+    }
+  }
+
+  func wake() {
+    let woken = sleeping
+    sleeping.removeAll()
+    for sleeper in woken.values { sleeper.resume() }
+  }
 }
 
 private func waitUntil(_ condition: @Sendable () async -> Bool) async {
@@ -524,6 +573,32 @@ struct CircuitsSubsetGroupSourceTests {
       await waitUntil { await !server.releases.isEmpty }
       #expect(await server.releases.contains { $0.path == "/v1/shapes/group-1" })
     }
+  }
+
+  @Test func aSessionRenewsItsSetupLoadCountingFromThatLoad() async throws {
+    let server = GroupStreamServer(batches: [], leaseSeconds: 30)
+    let clock = GroupSourceLeaseClock()
+    let session = try await makeSource(server, mode: .longPoll, clock: clock).materialize(
+      threeTableDemand(), materializationID: CollectionMaterializationID(rawValue: "scope-1"))
+    // The caller commits its snapshot between the load and `run`.
+    try await Task.sleep(for: .milliseconds(50))
+
+    let run = Task { try await session.run { _ in } }
+    await waitUntil { await !clock.sleeps.isEmpty }
+    let first = try #require(await clock.sleeps.first)
+    #expect(first < .seconds(10))
+    #expect(first > .zero)
+    #expect(await server.loads.count == 1)
+
+    await clock.wake()
+    await waitUntil { await clock.sleeps.count >= 2 }
+    #expect(await server.loads.count == 2)
+    #expect(await clock.sleeps[1] == .seconds(10))
+
+    run.cancel()
+    _ = await run.result
+    await waitUntil { await !server.releases.isEmpty }
+    #expect(await server.releases.contains { $0.path == "/v1/shapes/group-1" })
   }
 
   @Test func aStopDuringSetupReleasesTheGroupAndAppliesNothing() async throws {

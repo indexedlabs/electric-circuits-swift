@@ -11,6 +11,13 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   `POST v1/subsets/load`. A group released between setup and the first read now ends the stream
   with a terminal response and requires a reseed, rather than reporting a replacement at setup.
 
+## 0.10.0
+
+- Add `ElectricCircuitsClient.Configuration(liveReadMode:)` taking a closure. A stream reader asks
+  it before each live read, so a reader that is already streaming takes a changed mode at its next
+  read instead of keeping the mode it started with. A reader that fell back from SSE stays on
+  long-poll for its lifetime. `Configuration` equality compares the modes both resolve to now.
+
 ## 0.9.0
 
 - Add shape group loads. `ElectricCircuitsClient.loadSubsetGroup(_:)` posts one subscription and
