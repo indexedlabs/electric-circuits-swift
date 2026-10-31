@@ -27,6 +27,15 @@ public struct EnvelopeHeaders: Codable, Equatable, Sendable {
   public var lsn: String?
   public var seq: UInt64?
   public var last: Bool?
+  /// The change's Postgres commit time in milliseconds since the Unix epoch, on the source's
+  /// clock (`headers.commit_ts`). The engine stamps it on live changes only; it is telemetry, for
+  /// measuring time to data, and nothing orders on it.
+  public var commitTimestamp: Int64?
+
+  private enum CodingKeys: String, CodingKey {
+    case operation, txid, offset, lsn, seq, last
+    case commitTimestamp = "commit_ts"
+  }
 
   public init(
     operation: ChangeOperation,
@@ -34,7 +43,8 @@ public struct EnvelopeHeaders: Codable, Equatable, Sendable {
     offset: String? = nil,
     lsn: String? = nil,
     seq: UInt64? = nil,
-    last: Bool? = nil
+    last: Bool? = nil,
+    commitTimestamp: Int64? = nil
   ) {
     self.operation = operation
     self.txid = txid
@@ -42,7 +52,60 @@ public struct EnvelopeHeaders: Codable, Equatable, Sendable {
     self.lsn = lsn
     self.seq = seq
     self.last = last
+    self.commitTimestamp = commitTimestamp
   }
+}
+
+/// How one live batch reached the reader, for measuring time to data. During
+/// `ShapeMaterializer.apply` of a live batch, `LiveDelivery.current` holds it, so a materializer
+/// (and the store a source hands the batch to) can read it without a protocol change. Times are
+/// milliseconds since the Unix epoch: `serverSentAt` on the gateway's clock, `receivedAt` on this
+/// device's.
+public struct LiveDelivery: Equatable, Sendable {
+  /// One envelope of the batch: its `type` and its `headers.commit_ts`, when the engine sent one.
+  public struct Change: Equatable, Sendable {
+    public let table: String
+    public let commitTimestamp: Int64?
+
+    public init(table: String, commitTimestamp: Int64?) {
+      self.table = table
+      self.commitTimestamp = commitTimestamp
+    }
+  }
+
+  /// The mode of the read that delivered the batch.
+  public let mode: LiveReadMode
+  /// The gateway's send time: SSE's `server-time:` field on the batch's last `data` event, or a
+  /// long-poll response's `x-indexed-sync-server-time` header. `nil` when the server sent none.
+  public let serverSentAt: Int64?
+  /// When the reader held the complete batch, before it applied it.
+  public let receivedAt: Int64
+  /// Whether this is the first batch with changes since the reader's tail started, after its
+  /// snapshot or after a retry. A long-poll's next request and SSE's routine reconnection are
+  /// not a new start.
+  public let firstAfterReconnect: Bool
+  /// The batch's envelopes in stream order.
+  public let changes: [Change]
+
+  public init(
+    mode: LiveReadMode, serverSentAt: Int64?, receivedAt: Int64, firstAfterReconnect: Bool,
+    changes: [Change]
+  ) {
+    self.mode = mode
+    self.serverSentAt = serverSentAt
+    self.receivedAt = receivedAt
+    self.firstAfterReconnect = firstAfterReconnect
+    self.changes = changes
+  }
+
+  /// The delivery of the live batch being applied, set by `ShapeStreamReader` around
+  /// `ShapeMaterializer.apply`. `nil` outside a live apply.
+  @TaskLocal public static var current: LiveDelivery?
+
+  /// The gateway's response header carrying its wall-clock time in Unix milliseconds.
+  public static let serverTimeHeader = "x-indexed-sync-server-time"
+
+  static func now() -> Int64 { Int64((Date().timeIntervalSince1970 * 1000).rounded(.down)) }
 }
 
 /// One State-Protocol change event from a native shape stream.
@@ -366,6 +429,7 @@ public struct ShapeStreamReader: Sendable {
         throw StreamError.startingCursorMismatch(durable: expectedCursor, requested: initialCursor)
       }
     }
+    await liveReadState.beginTail()
     while true {
       try Task.checkCancellation()
       if await liveReadState.mode == .sse {
@@ -409,6 +473,14 @@ public struct ShapeStreamReader: Sendable {
     /// Resolved before each live read; a fallback from SSE outlasts any later answer.
     var mode: LiveReadMode { fellBack ? .longPoll : configuration.liveReadMode }
     func fallBack() { fellBack = true }
+    /// Whether a batch with changes has been applied since `run()` last started its tail.
+    private var deliveredSinceTailStart = false
+    func beginTail() { deliveredSinceTailStart = false }
+    /// True for the first batch with changes after the tail started; marks it delivered.
+    func takeFirstDelivery() -> Bool {
+      defer { deliveredSinceTailStart = true }
+      return !deliveredSinceTailStart
+    }
     func setMaximumEventBytes(_ value: Int) { maximumEventBytes = value }
   }
 
@@ -416,11 +488,23 @@ public struct ShapeStreamReader: Sendable {
     -> StreamCursor
   {
     try Task.checkCancellation()
+    var delivery: LiveDelivery?
+    if !result.batch.isEmpty {
+      let first = await liveReadState.takeFirstDelivery()
+      delivery = LiveDelivery(
+        mode: result.mode, serverSentAt: result.serverSentAt, receivedAt: result.receivedAt,
+        firstAfterReconnect: first,
+        changes: result.batch.envelopes.map {
+          LiveDelivery.Change(table: $0.type, commitTimestamp: $0.headers.commitTimestamp)
+        })
+    }
     let span = telemetry.beginSpan(name: "electric.materializer.apply", kind: .internalSpan)
     let started = DispatchTime.now().uptimeNanoseconds
     do {
-      try await materializer.apply(
-        result.batch, expecting: expectedCursor, advancingTo: result.cursor)
+      try await LiveDelivery.$current.withValue(delivery) {
+        try await materializer.apply(
+          result.batch, expecting: expectedCursor, advancingTo: result.cursor)
+      }
     } catch {
       telemetry.endSpan(
         span, attributes: ["electric.operation": "apply", "error.type": "materializer"])
@@ -500,6 +584,8 @@ public struct ShapeStreamReader: Sendable {
     var expectedCursor: StreamCursor?
     var parser: SSEParser
     var pending = ChangeBatch()
+    /// The `server-time:` of the last `data` event folded into `pending`.
+    private var pendingServerTime: Int64?
     private(set) var maximumEventBytes: Int
     private let clock = ContinuousClock()
     private var lastActivity: ContinuousClock.Instant
@@ -593,6 +679,7 @@ public struct ShapeStreamReader: Sendable {
               observed: limits.maximumChangeEventsPerStreamBatch + 1)
           }
           pending.envelopes.append(contentsOf: batch.envelopes)
+          pendingServerTime = event.serverTime ?? pendingServerTime
         case "control":
           let control: Control
           do { control = try JSONDecoder().decode(Control.self, from: event.data) } catch {
@@ -608,10 +695,13 @@ public struct ShapeStreamReader: Sendable {
               lastActivity = clock.now
             }
             cursor = try await reader.commit(
-              PollResult(batch: pending, cursor: StreamCursor(offset: offset, lsn: lsn)),
+              PollResult(
+                batch: pending, cursor: StreamCursor(offset: offset, lsn: lsn), mode: .sse,
+                serverSentAt: pendingServerTime, receivedAt: LiveDelivery.now()),
               expecting: expectedCursor)
             expectedCursor = cursor
             pending = ChangeBatch()
+            pendingServerTime = nil
           }
           if control.streamClosed == true {
             throw StreamError.terminal(path: reader.streamURL.path, status: 200, reason: .closed)
@@ -631,6 +721,11 @@ public struct ShapeStreamReader: Sendable {
   private struct PollResult: Sendable {
     let batch: ChangeBatch
     let cursor: StreamCursor
+    let mode: LiveReadMode
+    /// The gateway's send time (Unix ms), when it sent one.
+    var serverSentAt: Int64? = nil
+    /// When this device held the complete batch (Unix ms).
+    var receivedAt: Int64 = LiveDelivery.now()
   }
 
   private func streamRequest(at cursor: StreamCursor, mode: LiveReadMode) throws -> URLRequest {
@@ -676,6 +771,7 @@ public struct ShapeStreamReader: Sendable {
         "electric.http.requests", attributes: ["http.method": "GET", "error.type": "transport"])
       throw error
     }
+    let receivedAt = LiveDelivery.now()
     let headers = response.response
     let attributes = [
       "http.method": "GET", "http.route": "/stream", "http.status_code": "\(headers.statusCode)",
@@ -741,14 +837,20 @@ public struct ShapeStreamReader: Sendable {
       throw StreamError.missingNextOffset(path: streamURL.path)
     }
     let lsn = batch.envelopes.reversed().compactMap { $0.headers.lsn }.first ?? cursor.lsn
-    return PollResult(batch: batch, cursor: StreamCursor(offset: nextOffset, lsn: lsn))
+    return PollResult(
+      batch: batch, cursor: StreamCursor(offset: nextOffset, lsn: lsn), mode: .longPoll,
+      serverSentAt: headers.value(forHTTPHeaderField: LiveDelivery.serverTimeHeader).flatMap {
+        Int64($0)
+      },
+      receivedAt: receivedAt)
   }
 
   private func emptyPollResult(nextOffset: String?, preserving cursor: StreamCursor) -> PollResult?
   {
     guard let nextOffset, !nextOffset.isEmpty, nextOffset != cursor.offset else { return nil }
     return PollResult(
-      batch: ChangeBatch(), cursor: StreamCursor(offset: nextOffset, lsn: cursor.lsn))
+      batch: ChangeBatch(), cursor: StreamCursor(offset: nextOffset, lsn: cursor.lsn),
+      mode: .longPoll)
   }
 }
 
