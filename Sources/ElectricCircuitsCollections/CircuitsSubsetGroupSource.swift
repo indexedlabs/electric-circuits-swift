@@ -135,8 +135,9 @@ public struct CircuitsSubsetGroupSource: Sendable {
           let materializer = CircuitsGroupTailMaterializer(
             members: demand.members, routes: routes, cursor: cursor,
             sourceVersion: snapshotVersion, apply: apply)
-          // The coordinator loads the same subscription and members again, which renews the group
-          // this setup created and reads its stream from the snapshot's cursor.
+          // The coordinator starts on the group this setup loaded and reads its stream from the
+          // snapshot's cursor. If the group was released in between (a retired table, a reset or
+          // a lapsed lease), its first read ends the stream and the caller reseeds.
           let coordinator = ShapeSubscriptionCoordinator(
             client: client,
             transport: transport,
@@ -147,26 +148,14 @@ public struct CircuitsSubsetGroupSource: Sendable {
             capacity: capacity,
             responseDecodingLimits: responseDecodingLimits,
             telemetry: telemetry,
-            recreatePolicy: recreatePolicy
+            recreatePolicy: recreatePolicy,
+            setupClaim: handle
           )
           try await lifecycle.install(coordinator, materializer: materializer)
           let states = await coordinator.stateUpdates
           do {
             try await withTaskCancellationHandler {
-              // The coordinator's own load must renew the group the snapshot came from. A
-              // different group means the first was released in between (a retired table, a
-              // reset or a lapsed lease): its stream does not continue from this snapshot's
-              // cursor, so the caller reseeds, and no batch from it reaches the store.
-              let started = try await coordinator.start()
-              guard started.id == handle.id else {
-                await materializer.refuse()
-                throw CircuitsSubsetGroupSourceError.subscription(
-                  .reseedRequired(
-                    ShapeSubscriptionReseedRequired(
-                      reason: .replacement(
-                        previousShapeID: handle.id, replacementShapeID: started.id),
-                      previous: handle, replacement: started)))
-              }
+              try await coordinator.start()
               await materializer.open()
               await lifecycle.markCoordinatorStarted()
               for await state in states {

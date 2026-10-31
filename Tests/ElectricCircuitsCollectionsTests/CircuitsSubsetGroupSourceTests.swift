@@ -118,33 +118,19 @@ private let groupBatches = [
 /// stream reads by long-poll through `send` and by SSE through `stream`.
 private actor GroupStreamServer: HTTPTransport {
   private var batches: [String]
-  /// The group id each load answers with; the last one repeats.
-  private var groupIDs: [String]
   private var nextOffset = 10
-  /// The load (1-based) that waits for `releaseHeldLoad()` before answering.
-  private let heldLoad: Int?
+  /// How many stream reads answer `410` before the scripted batches start.
+  private var goneReads: Int
   /// After the scripted batches, keep answering with one new `tag` row per read.
   private let endless: Bool
-  private var heldLoadRelease: CheckedContinuation<Void, Never>?
-  private var heldLoadReleased = false
   private(set) var loads: [SubsetGroupRequest] = []
   private(set) var streamURLs: [URL] = []
   private(set) var releases: [URL] = []
 
-  init(
-    batches: [String], groupIDs: [String] = ["group-1"], heldLoad: Int? = nil,
-    endless: Bool = false
-  ) {
+  init(batches: [String], goneReads: Int = 0, endless: Bool = false) {
     self.batches = batches
-    self.groupIDs = groupIDs
-    self.heldLoad = heldLoad
+    self.goneReads = goneReads
     self.endless = endless
-  }
-
-  func releaseHeldLoad() {
-    heldLoadReleased = true
-    heldLoadRelease?.resume()
-    heldLoadRelease = nil
   }
 
   func send(_ request: URLRequest) async throws -> HTTPResponse {
@@ -152,14 +138,13 @@ private actor GroupStreamServer: HTTPTransport {
     switch (request.httpMethod, path) {
     case ("POST", "/v1/subsets/load"):
       loads.append(try JSONDecoder().decode(SubsetGroupRequest.self, from: request.httpBody!))
-      if loads.count == heldLoad, !heldLoadReleased {
-        await withCheckedContinuation { heldLoadRelease = $0 }
-      }
-      let id = groupIDs.count > 1 ? groupIDs.removeFirst() : groupIDs[0]
-      return reply(
-        groupLoadAnswer.replacingOccurrences(of: "group-1", with: id), request: request)
+      return reply(groupLoadAnswer, request: request)
     case ("GET", let path) where path.hasPrefix("/streams/"):
       streamURLs.append(request.url!)
+      if goneReads > 0 {
+        goneReads -= 1
+        return reply("gone", request: request, status: 410)
+      }
       guard let body = takeBatch() else {
         try await Task.sleep(for: .seconds(3_600))
         throw CancellationError()
@@ -300,13 +285,12 @@ struct CircuitsSubsetGroupSourceTests {
     #expect(record.cursor == StreamCursor(offset: "12", lsn: "0/30"))
     #expect(record.collections == [records.id, assignments.id, tags.id])
 
-    // Setup loads the group and the subscription renews it under the same claim and members.
+    // Setup loads the group once, and the subscription starts on that load.
     let loads = await server.loads
-    #expect(loads.count == 2)
-    #expect(loads.allSatisfy { $0.subscription == "scope-1" })
+    #expect(loads.count == 1)
+    #expect(loads.first?.subscription == "scope-1")
     #expect(
       loads.first?.members.map(\.table) == ["public.record", "public.assignment", "public.tag"])
-    #expect(loads.first == loads.last)
     let live = await server.streamURLs.compactMap {
       URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems?
         .first { $0.name == "live" }?.value
@@ -482,41 +466,31 @@ struct CircuitsSubsetGroupSourceTests {
     #expect(await server.releases.count == 1)
   }
 
-  @Test func coordinatorLoadingAnotherGroupThanTheSnapshotsRequiresReseed() async throws {
-    // The group was released between setup's load and the subscription's own load, which
-    // answers with a new group whose stream does not continue from the snapshot's cursor.
-    let server = GroupStreamServer(batches: groupBatches, groupIDs: ["group-1", "group-2"])
+  @Test func aGroupReleasedBetweenSetupAndItsFirstReadRequiresReseed() async throws {
+    // The group was released after setup's load, so its stream is gone. Nothing from it reaches
+    // the store, and the caller loads again.
+    let server = GroupStreamServer(batches: groupBatches, goneReads: 1)
     let session = try await makeSource(server, mode: .longPoll).materialize(
       threeTableDemand(), materializationID: CollectionMaterializationID(rawValue: "scope-1"))
     let offered = GroupBatchLog()
 
     do {
       try await session.run { batch in await offered.append(batch) }
-      Issue.record("expected the replaced group to require a reseed")
-    } catch CircuitsSubsetGroupSourceError.subscription(.reseedRequired(let outcome)) {
-      #expect(
-        outcome.reason == .replacement(previousShapeID: "group-1", replacementShapeID: "group-2"))
-    }
+      Issue.record("expected the released group to require a reseed")
+    } catch CircuitsSubsetGroupSourceError.subscription(.reseedRequired) {}
     #expect(await offered.batches.isEmpty)
-    #expect(
-      Set(await server.releases.map(\.path)) == ["/v1/shapes/group-1", "/v1/shapes/group-2"])
+    #expect(await server.loads.count == 1)
+    #expect(await server.releases.contains { $0.path == "/v1/shapes/group-1" })
   }
 
-  @Test func cancellingRunWhileTheSubscriptionLoadsStillTearsDownAndReleases() async throws {
-    // A smoke test of teardown under cancellation: the subscription's own load (the second)
-    // answers only after `run` is cancelled, and the stream then delivers a batch at once.
-    // Whether the coordinator launches its reader before the cancelled start stops it depends on
-    // scheduling, so this does not deterministically reach a reader waiting on the setup permit;
-    // it checks that every order it does reach finishes, applies nothing and releases the group.
+  @Test func cancellingRunWhileTheStreamIsReadTearsDownAndReleases() async throws {
     for _ in 0..<20 {
-      let server = GroupStreamServer(batches: groupBatches, heldLoad: 2)
+      let server = GroupStreamServer(batches: [])
       let session = try await makeSource(server, mode: .longPoll).materialize(
         threeTableDemand(), materializationID: CollectionMaterializationID(rawValue: "scope-1"))
-      let offered = GroupBatchLog()
-      let run = Task { try await session.run { batch in await offered.append(batch) } }
-      await waitUntil { await server.loads.count == 2 }
+      let run = Task { try await session.run { _ in } }
+      await waitUntil { await !server.streamURLs.isEmpty }
       run.cancel()
-      await server.releaseHeldLoad()
 
       let finished = await withTaskGroup(of: Bool.self) { group in
         group.addTask {
@@ -533,7 +507,7 @@ struct CircuitsSubsetGroupSourceTests {
       }
       #expect(finished, "run did not finish after cancellation")
       guard finished else { return }
-      #expect(await offered.batches.isEmpty)
+      #expect(await server.loads.count == 1)
       #expect(await server.releases.contains { $0.path == "/v1/shapes/group-1" })
     }
   }

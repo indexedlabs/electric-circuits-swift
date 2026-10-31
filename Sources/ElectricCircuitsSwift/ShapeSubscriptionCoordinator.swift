@@ -285,6 +285,8 @@ public actor ShapeSubscriptionCoordinator {
   private let recreatePolicy: ShapeSubscriptionRecreatePolicy
   private var continuation: AsyncStream<ShapeSubscriptionState>.Continuation?
   private var handle: ShapeHandle?
+  /// A claim the caller already holds, which the first start uses instead of creating one.
+  private var setupClaim: ShapeHandle?
   private var pendingRelease: [ShapeHandle] = []
   private var generation: UInt64 = 0
   private var stopping = false
@@ -341,6 +343,9 @@ public actor ShapeSubscriptionCoordinator {
   /// A coordinator for one shape group: it loads the group, reads the group's one stream and
   /// renews by loading the same subscription and members again.
   ///
+  /// `setupClaim` is the handle of a load the caller just made for its snapshot. The coordinator
+  /// starts on it instead of loading the group a second time, and takes over releasing it.
+  ///
   /// A renewal is a full group load: the engine re-reads every member's snapshot and the answer
   /// carries its rows, which are not decoded. The answer still counts against
   /// `ResponseDecodingLimits`, so a group whose rows outgrow the limit fails at its next renewal.
@@ -353,7 +358,8 @@ public actor ShapeSubscriptionCoordinator {
     capacity: ShapeSubscriptionCapacity? = nil,
     responseDecodingLimits: ResponseDecodingLimits = .default,
     telemetry: TelemetryReporter = .noop,
-    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init()
+    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init(),
+    setupClaim: ShapeHandle? = nil
   ) {
     // Only a load that names its subscription renews the same group; without one, every
     // renewal would mint a new group and report a replacement.
@@ -363,7 +369,7 @@ public actor ShapeSubscriptionCoordinator {
       client: client, transport: transport, route: .subsetGroup(groupRequest),
       materializer: materializer, retryPolicy: retryPolicy, clock: clock, capacity: capacity,
       responseDecodingLimits: responseDecodingLimits, telemetry: telemetry,
-      recreatePolicy: recreatePolicy)
+      recreatePolicy: recreatePolicy, setupClaim: setupClaim)
   }
 
   private init(
@@ -371,8 +377,10 @@ public actor ShapeSubscriptionCoordinator {
     route: ShapeSubscriptionClaimRoute, materializer: any ShapeMaterializer,
     retryPolicy: ShapeSubscriptionRetryPolicy, clock: any ShapeSubscriptionClock,
     capacity: ShapeSubscriptionCapacity?, responseDecodingLimits: ResponseDecodingLimits,
-    telemetry: TelemetryReporter, recreatePolicy: ShapeSubscriptionRecreatePolicy
+    telemetry: TelemetryReporter, recreatePolicy: ShapeSubscriptionRecreatePolicy,
+    setupClaim: ShapeHandle? = nil
   ) {
+    self.setupClaim = setupClaim
     self.client = client
     self.transport = transport
     self.route = route
@@ -771,6 +779,10 @@ public actor ShapeSubscriptionCoordinator {
       throw MaterializerFailure()
     }
     try Task.checkCancellation()
+    if let claimed = setupClaim {
+      setupClaim = nil
+      return claimed
+    }
     return try await recreatingOnGone(operation: "create") {
       switch self.route {
       case .shape(let request):
