@@ -339,6 +339,8 @@ struct CircuitsSubsetGroupSourceTests {
     #expect(applied.count == 2)
     #expect(applied.allSatisfy { $0?.mode == mode })
     #expect(applied.map { $0?.firstAfterReconnect } == [true, false])
+    // The snapshot already held "Grace", so the first batch's delivery lists the four applied.
+    #expect(applied.map { $0?.changes.count } == [4, 2])
 
     // Each row is in its own table: deleting key "1" in one table never touched the others.
     #expect(

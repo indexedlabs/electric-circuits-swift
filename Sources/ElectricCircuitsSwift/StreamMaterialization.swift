@@ -80,11 +80,12 @@ public struct LiveDelivery: Equatable, Sendable {
   public let serverSentAt: Int64?
   /// When the reader held the complete batch, before it applied it.
   public let receivedAt: Int64
-  /// Whether this is the first batch with changes since the reader's tail started, after its
-  /// snapshot or after a retry. A long-poll's next request and SSE's routine reconnection are
-  /// not a new start.
+  /// Whether no earlier batch since the reader's tail started (after its snapshot or after a
+  /// retry) applied a change. A long-poll's next request and SSE's routine reconnection are not a
+  /// new start, and a batch whose every envelope a source dropped doesn't count as applied.
   public let firstAfterReconnect: Bool
-  /// The batch's envelopes in stream order.
+  /// The batch's envelopes in stream order; inside `applying(changesAt:_:)`, only those a source
+  /// accepted.
   public let changes: [Change]
 
   public init(
@@ -101,6 +102,36 @@ public struct LiveDelivery: Equatable, Sendable {
   /// The delivery of the live batch being applied, set by `ShapeStreamReader` around
   /// `ShapeMaterializer.apply`. `nil` outside a live apply.
   @TaskLocal public static var current: LiveDelivery?
+
+  /// Runs `operation`, a materializer's store apply, with `current` narrowed to the envelopes at
+  /// `indices`: the ones a source accepted after dropping those its snapshot already holds. With
+  /// none accepted, `current` is `nil`, and the batch doesn't count as the first applied after a
+  /// reconnect. A materializer that never calls this is taken to have applied every envelope.
+  public static func applying<R>(
+    changesAt indices: [Int],
+    isolation: isolated (any Actor)? = #isolation,
+    _ operation: () async throws -> R
+  ) async rethrows -> R {
+    applyReport?.record(applied: indices.count)
+    let narrowed: LiveDelivery? = current.flatMap { delivery in
+      indices.isEmpty
+        ? nil
+        : LiveDelivery(
+          mode: delivery.mode, serverSentAt: delivery.serverSentAt,
+          receivedAt: delivery.receivedAt, firstAfterReconnect: delivery.firstAfterReconnect,
+          changes: indices.map { delivery.changes[$0] })
+    }
+    return try await $current.withValue(narrowed, operation: operation)
+  }
+
+  /// How many envelopes the materializer reported applying, through `applying(changesAt:_:)`.
+  final class ApplyReport: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count: Int?
+    func record(applied: Int) { lock.withLock { count = (count ?? 0) + applied } }
+    var applied: Int? { lock.withLock { count } }
+  }
+  @TaskLocal static var applyReport: ApplyReport?
 
   /// The gateway's response header carrying its wall-clock time in Unix milliseconds.
   public static let serverTimeHeader = "x-indexed-sync-server-time"
@@ -473,14 +504,10 @@ public struct ShapeStreamReader: Sendable {
     /// Resolved before each live read; a fallback from SSE outlasts any later answer.
     var mode: LiveReadMode { fellBack ? .longPoll : configuration.liveReadMode }
     func fallBack() { fellBack = true }
-    /// Whether a batch with changes has been applied since `run()` last started its tail.
-    private var deliveredSinceTailStart = false
+    /// Whether a batch has applied a change since `run()` last started its tail.
+    private(set) var deliveredSinceTailStart = false
     func beginTail() { deliveredSinceTailStart = false }
-    /// True for the first batch with changes after the tail started; marks it delivered.
-    func takeFirstDelivery() -> Bool {
-      defer { deliveredSinceTailStart = true }
-      return !deliveredSinceTailStart
-    }
+    func markDelivered() { deliveredSinceTailStart = true }
     func setMaximumEventBytes(_ value: Int) { maximumEventBytes = value }
   }
 
@@ -490,7 +517,7 @@ public struct ShapeStreamReader: Sendable {
     try Task.checkCancellation()
     var delivery: LiveDelivery?
     if !result.batch.isEmpty {
-      let first = await liveReadState.takeFirstDelivery()
+      let first = !(await liveReadState.deliveredSinceTailStart)
       delivery = LiveDelivery(
         mode: result.mode, serverSentAt: result.serverSentAt, receivedAt: result.receivedAt,
         firstAfterReconnect: first,
@@ -500,10 +527,13 @@ public struct ShapeStreamReader: Sendable {
     }
     let span = telemetry.beginSpan(name: "electric.materializer.apply", kind: .internalSpan)
     let started = DispatchTime.now().uptimeNanoseconds
+    let report = LiveDelivery.ApplyReport()
     do {
-      try await LiveDelivery.$current.withValue(delivery) {
-        try await materializer.apply(
-          result.batch, expecting: expectedCursor, advancingTo: result.cursor)
+      try await LiveDelivery.$applyReport.withValue(report) {
+        try await LiveDelivery.$current.withValue(delivery) {
+          try await materializer.apply(
+            result.batch, expecting: expectedCursor, advancingTo: result.cursor)
+        }
       }
     } catch {
       telemetry.endSpan(
@@ -513,6 +543,9 @@ public struct ShapeStreamReader: Sendable {
       throw error
     }
     telemetry.endSpan(span, attributes: ["electric.operation": "apply"])
+    if delivery != nil, (report.applied ?? result.batch.envelopes.count) > 0 {
+      await liveReadState.markDelivered()
+    }
     telemetry.recordGauge(
       "electric.materializer.duration_ms",
       value: Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000,
@@ -586,6 +619,8 @@ public struct ShapeStreamReader: Sendable {
     var pending = ChangeBatch()
     /// The `server-time:` of the last `data` event folded into `pending`.
     private var pendingServerTime: Int64?
+    /// When the bytes completing the last `data` event folded into `pending` arrived.
+    private var pendingReceivedAt: Int64?
     private(set) var maximumEventBytes: Int
     private let clock = ContinuousClock()
     private var lastActivity: ContinuousClock.Instant
@@ -660,6 +695,7 @@ public struct ShapeStreamReader: Sendable {
     }
 
     func receive(_ bytes: Data) async throws {
+      let bytesReceivedAt = LiveDelivery.now()
       lastActivity = clock.now
       try Task.checkCancellation()
       for event in try parser.append(bytes) {
@@ -679,7 +715,8 @@ public struct ShapeStreamReader: Sendable {
               observed: limits.maximumChangeEventsPerStreamBatch + 1)
           }
           pending.envelopes.append(contentsOf: batch.envelopes)
-          pendingServerTime = event.serverTime ?? pendingServerTime
+          pendingServerTime = event.serverTime
+          pendingReceivedAt = bytesReceivedAt
         case "control":
           let control: Control
           do { control = try JSONDecoder().decode(Control.self, from: event.data) } catch {
@@ -697,11 +734,13 @@ public struct ShapeStreamReader: Sendable {
             cursor = try await reader.commit(
               PollResult(
                 batch: pending, cursor: StreamCursor(offset: offset, lsn: lsn), mode: .sse,
-                serverSentAt: pendingServerTime, receivedAt: LiveDelivery.now()),
+                serverSentAt: pendingServerTime,
+                receivedAt: pendingReceivedAt ?? bytesReceivedAt),
               expecting: expectedCursor)
             expectedCursor = cursor
             pending = ChangeBatch()
             pendingServerTime = nil
+            pendingReceivedAt = nil
           }
           if control.streamClosed == true {
             throw StreamError.terminal(path: reader.streamURL.path, status: 200, reason: .closed)

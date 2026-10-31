@@ -273,6 +273,11 @@ struct CircuitsSubsetSourceTests {
     #expect(batch.cursor.lsn == "0/120")
   }
 
+  private actor AppliedDeliveries {
+    private(set) var values: [LiveDelivery?] = []
+    func append(_ delivery: LiveDelivery?) { values.append(delivery) }
+  }
+
   @Test func snapshotFenceThenAwaitedLiveTailUsesStableSubsetFeedClaim() async throws {
     let transport = NativeSubsetTransport()
     let client = ElectricCircuitsClient(
@@ -312,14 +317,23 @@ struct CircuitsSubsetSourceTests {
     #expect(session.snapshot.fence.rawValue.contains("0/10"))
 
     let applied = AppliedNativeBatches()
+    let delivery = AppliedDeliveries()
     let run = Task {
-      try await session.run { batch in await applied.append(batch) }
+      try await session.run { batch in
+        await delivery.append(LiveDelivery.current)
+        await applied.append(batch)
+      }
     }
     for _ in 0..<10_000 {
       if await applied.values().count == 1 { break }
       await Task.yield()
     }
     let batch = try #require(await applied.values().first)
+    // A table source's apply runs under the batch's delivery, first after the tail started.
+    let firstDelivery = try #require(await delivery.values.first ?? nil)
+    #expect(firstDelivery.mode == .longPoll)
+    #expect(firstDelivery.firstAfterReconnect)
+    #expect(firstDelivery.changes.map(\.table) == ["public.issues"])
     #expect(batch.expectedCursor == StreamCursor(offset: "10", lsn: "0/10"))
     #expect(batch.cursor == StreamCursor(offset: "11", lsn: "0/20"))
     guard case .upsert(let issue, let changeVersion) = try #require(batch.changes.first) else {

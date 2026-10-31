@@ -15,7 +15,13 @@ private func envelopeJSON(_ key: String, commitTimestamp: Int64?) -> String {
 /// restarted reader resumes from it.
 private actor DeliveryRecorder: ShapeMaterializer {
   private(set) var deliveries: [LiveDelivery?] = []
+  private(set) var appliedDeliveries: [LiveDelivery?] = []
   private var cursor: StreamCursor?
+  /// For each batch in turn, the envelope indices a source would accept; nil accepts all
+  /// without calling `LiveDelivery.applying`.
+  private var acceptance: [[Int]?]
+
+  init(acceptance: [[Int]?] = []) { self.acceptance = acceptance }
 
   func currentCursor() async throws -> StreamCursor? { cursor }
 
@@ -23,6 +29,12 @@ private actor DeliveryRecorder: ShapeMaterializer {
     _ batch: ChangeBatch, expecting _: StreamCursor?, advancingTo cursor: StreamCursor
   ) async throws {
     deliveries.append(LiveDelivery.current)
+    if !batch.isEmpty, !acceptance.isEmpty, let accepted = acceptance.removeFirst() {
+      let narrowed = await LiveDelivery.applying(changesAt: accepted) { LiveDelivery.current }
+      appliedDeliveries.append(narrowed)
+    } else {
+      appliedDeliveries.append(LiveDelivery.current)
+    }
     self.cursor = cursor
   }
 }
@@ -109,6 +121,8 @@ func parserReadsServerTimePerEvent() throws {
 @Test("A long-poll batch is applied under its delivery, first after a reader start")
 func longPollBatchesCarryTheirDelivery() async throws {
   let transport = LongPollDeliveryTransport([
+    // An offset-only advance applies nothing and doesn't use up the first-after-start flag.
+    (body: "[]", serverTime: "140", next: "15"),
     (body: "[\(envelopeJSON("a", commitTimestamp: 100))]", serverTime: "150", next: "20"),
     (body: "[\(envelopeJSON("b", commitTimestamp: nil))]", serverTime: nil, next: "30"),
   ])
@@ -125,7 +139,10 @@ func longPollBatchesCarryTheirDelivery() async throws {
     try await reader.run()
   }
 
-  let deliveries = await recorder.deliveries.compactMap { $0 }
+  let recorded = await recorder.deliveries
+  #expect(recorded.count == 4)
+  #expect(recorded.first == .some(nil))
+  let deliveries = recorded.compactMap { $0 }
   #expect(deliveries.count == 3)
   #expect(deliveries.allSatisfy { $0.mode == .longPoll })
   #expect(deliveries.map(\.serverSentAt) == [150, nil, 250])
@@ -137,7 +154,31 @@ func longPollBatchesCarryTheirDelivery() async throws {
       [LiveDelivery.Change(table: "public.items", commitTimestamp: 200)],
     ])
   #expect(deliveries.allSatisfy { $0.receivedAt > 1_700_000_000_000 })
-  #expect(LiveDelivery.current == nil)
+}
+
+@Test("A batch a source drops entirely doesn't count as the first applied after a start")
+func droppedBatchesLeaveTheFirstFlagForTheNextApplied() async throws {
+  let transport = LongPollDeliveryTransport([
+    (body: "[\(envelopeJSON("a", commitTimestamp: 100))]", serverTime: "150", next: "20"),
+    (
+      body: "[\(envelopeJSON("b", commitTimestamp: 110)),\(envelopeJSON("c", commitTimestamp: 120))]",
+      serverTime: "160", next: "30"
+    ),
+    (body: "[\(envelopeJSON("d", commitTimestamp: 130))]", serverTime: "170", next: "40"),
+  ])
+  // The first batch is all in the snapshot; the second applies only its second envelope.
+  let recorder = DeliveryRecorder(acceptance: [[], [1], nil])
+  let reader = ShapeStreamReader(
+    streamURL: deliveryURL, transport: transport, materializer: recorder)
+  await #expect(throws: StreamError.terminal(path: "/stream", status: 404, reason: .notFound)) {
+    try await reader.run()
+  }
+  let applied = await recorder.appliedDeliveries
+  #expect(applied.count == 3)
+  #expect(applied[0] == nil)
+  #expect(applied[1]?.changes == [LiveDelivery.Change(table: "public.items", commitTimestamp: 120)])
+  #expect(applied[1]?.firstAfterReconnect == true)
+  #expect(applied[2]?.firstAfterReconnect == false)
 }
 
 @Test("An SSE batch is applied under its delivery; a routine reconnect is not a new start")
@@ -148,6 +189,10 @@ func sseBatchesCarryTheirDelivery() async throws {
       "time: 150\n\nevent: control\ndata: {\"streamNextOffset\":\"20\"}\n\n",
       "event: data\ndata: [\(envelopeJSON("b", commitTimestamp: nil))]\nserver-time: 160\n\n",
       "event: control\ndata: {\"streamNextOffset\":\"30\"}\n\n",
+      // Two frames fold into one batch; its send time is its last frame's, which has none.
+      "event: data\ndata: [\(envelopeJSON("e", commitTimestamp: 200))]\nserver-time: 210\n\n",
+      "event: data\ndata: [\(envelopeJSON("f", commitTimestamp: 220))]\n\n",
+      "event: control\ndata: {\"streamNextOffset\":\"35\"}\n\n",
     ],
     [
       "event: data\ndata: [\(envelopeJSON("c", commitTimestamp: 300))]\n\n",
@@ -162,10 +207,14 @@ func sseBatchesCarryTheirDelivery() async throws {
     try await reader.run()
   }
 
-  let deliveries = await recorder.deliveries.compactMap { $0 }
-  #expect(deliveries.count == 3)
+  let recorded = await recorder.deliveries
+  #expect(recorded.count == 4)
+  let deliveries = recorded.compactMap { $0 }
+  #expect(deliveries.count == 4)
   #expect(deliveries.allSatisfy { $0.mode == .sse })
-  #expect(deliveries.map(\.serverSentAt) == [150, 160, nil])
-  #expect(deliveries.map(\.firstAfterReconnect) == [true, false, false])
-  #expect(deliveries.map { $0.changes.map(\.commitTimestamp) } == [[100], [nil], [300]])
+  #expect(deliveries.map(\.serverSentAt) == [150, 160, nil, nil])
+  #expect(deliveries.map(\.firstAfterReconnect) == [true, false, false, false])
+  #expect(
+    deliveries.map { $0.changes.map(\.commitTimestamp) } == [[100], [nil], [200, 220], [300]])
+  #expect(deliveries.allSatisfy { $0.receivedAt > 1_700_000_000_000 })
 }
