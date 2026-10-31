@@ -830,3 +830,85 @@ func longPollRemainsDefaultLiveRead() async throws {
   #expect(requests.allSatisfy { $0.url?.query?.contains("live=long-poll") == true })
   #expect(requests.allSatisfy { $0.value(forHTTPHeaderField: "Accept") == "application/json" })
 }
+
+/// Long-polls once, switches the reader's mode source to SSE during that poll, then refuses the
+/// SSE read with a terminal 404.
+private actor SSEModeSwitchTransport: HTTPTransport {
+  private(set) var requests: [URLRequest] = []
+  private let switchToSSE: @Sendable () -> Void
+
+  init(switchToSSE: @escaping @Sendable () -> Void) {
+    self.switchToSSE = switchToSSE
+  }
+
+  func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes _: @Sendable (Data) async throws -> Void
+  ) async throws {
+    requests.append(request)
+    try await onResponse(HTTPURLResponse(
+      url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
+  }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    switchToSSE()
+    return HTTPResponse(
+      data: Data(),
+      response: HTTPURLResponse(url: request.url!, statusCode: 204, httpVersion: nil, headerFields: nil)!)
+  }
+}
+
+private final class LiveReadModeBox: @unchecked Sendable {
+  private let lock = NSLock()
+  private var mode: LiveReadMode
+  init(_ mode: LiveReadMode) { self.mode = mode }
+  func get() -> LiveReadMode { lock.withLock { mode } }
+  func set(_ value: LiveReadMode) { lock.withLock { mode = value } }
+}
+
+@Test("A running reader takes a changed live read mode at its next read")
+func runningReaderTakesChangedLiveReadMode() async throws {
+  let mode = LiveReadModeBox(.longPoll)
+  let transport = SSEModeSwitchTransport { mode.set(.sse) }
+  let reader = ShapeStreamReader(
+    streamURL: sseGateURL, transport: transport, materializer: InMemoryShapeMaterializer(),
+    configuration: .init(liveReadMode: { mode.get() }))
+  await #expect(throws: StreamError.terminal(path: "/stream", status: 404, reason: .notFound)) {
+    try await reader.run()
+  }
+  let requests = await transport.requests
+  #expect(requests.count == 2)
+  #expect(requests[0].url?.query?.contains("live=long-poll") == true)
+  #expect(requests[1].url?.query?.contains("live=sse") == true)
+}
+
+@Test("An SSE fallback outlasts a mode source that still answers SSE")
+func sseFallbackOutlastsModeSource() async throws {
+  let transport = SSEFallbackTransport()
+  let reader = ShapeStreamReader(
+    streamURL: sseGateURL, transport: transport, materializer: InMemoryShapeMaterializer(),
+    configuration: .init(liveReadMode: { .sse }))
+  await #expect(throws: StreamError.terminal(path: "/stream", status: 404, reason: .notFound)) {
+    try await reader.run()
+  }
+  let requests = await transport.requests
+  #expect(requests.count == 3)
+  #expect(requests[0].url?.query?.contains("live=sse") == true)
+  #expect(requests[1].url?.query?.contains("live=long-poll") == true)
+  #expect(requests[2].url?.query?.contains("live=long-poll") == true)
+}
+
+@Test("A client configuration reads its mode source each time")
+func clientConfigurationReadsModeSourceEachTime() {
+  let mode = LiveReadModeBox(.longPoll)
+  var configuration = ElectricCircuitsClient.Configuration(liveReadMode: { mode.get() })
+  #expect(configuration.liveReadMode == .longPoll)
+  mode.set(.sse)
+  #expect(configuration.liveReadMode == .sse)
+  #expect(configuration == .init(liveReadMode: .sse))
+  configuration.liveReadMode = .longPoll
+  mode.set(.sse)
+  #expect(configuration.liveReadMode == .longPoll)
+}

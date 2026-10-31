@@ -341,7 +341,7 @@ public struct ShapeStreamReader: Sendable {
     sseSilenceTimeout: Duration
   ) {
     self.liveReadState = LiveReadState(
-      mode: configuration.liveReadMode,
+      configuration: configuration,
       maximumEventBytes: responseDecodingLimits.maximumDecodedResponseBytes)
     self.streamURL = streamURL
     self.transport = transport
@@ -399,13 +399,16 @@ public struct ShapeStreamReader: Sendable {
   }
 
   private actor LiveReadState {
-    private(set) var mode: LiveReadMode
+    private let configuration: ElectricCircuitsClient.Configuration
+    private var fellBack = false
     private(set) var maximumEventBytes: Int
-    init(mode: LiveReadMode, maximumEventBytes: Int) {
-      self.mode = mode
+    init(configuration: ElectricCircuitsClient.Configuration, maximumEventBytes: Int) {
+      self.configuration = configuration
       self.maximumEventBytes = maximumEventBytes
     }
-    func fallBack() { mode = .longPoll }
+    /// Resolved before each live read; a fallback from SSE outlasts any later answer.
+    var mode: LiveReadMode { fellBack ? .longPoll : configuration.liveReadMode }
+    func fallBack() { fellBack = true }
     func setMaximumEventBytes(_ value: Int) { maximumEventBytes = value }
   }
 

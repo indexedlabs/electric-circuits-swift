@@ -634,10 +634,28 @@ public enum LiveReadMode: String, Sendable, Equatable {
 
 extension ElectricCircuitsClient {
   public struct Configuration: Sendable, Equatable {
-    public var liveReadMode: LiveReadMode
+    private var resolveLiveReadMode: @Sendable () -> LiveReadMode
+
+    /// The live read mode a stream reader uses for its next live read. Setting it fixes the mode.
+    public var liveReadMode: LiveReadMode {
+      get { resolveLiveReadMode() }
+      set { resolveLiveReadMode = { newValue } }
+    }
 
     public init(liveReadMode: LiveReadMode = .longPoll) {
-      self.liveReadMode = liveReadMode
+      resolveLiveReadMode = { liveReadMode }
+    }
+
+    /// Asks `liveReadMode` before each live read, so a reader that is already streaming takes a
+    /// changed mode at its next read rather than keeping the mode it started with. A reader that
+    /// fell back from SSE stays on long-poll for its lifetime whatever the closure returns.
+    public init(liveReadMode: @escaping @Sendable () -> LiveReadMode) {
+      resolveLiveReadMode = liveReadMode
+    }
+
+    /// Compares the modes the two configurations resolve to now.
+    public static func == (lhs: Configuration, rhs: Configuration) -> Bool {
+      lhs.liveReadMode == rhs.liveReadMode
     }
 
     public static let `default` = Configuration()
