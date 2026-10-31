@@ -37,6 +37,19 @@ public struct EnvelopeHeaders: Codable, Equatable, Sendable {
     case commitTimestamp = "commit_ts"
   }
 
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    operation = try container.decode(ChangeOperation.self, forKey: .operation)
+    txid = try container.decodeIfPresent(String.self, forKey: .txid)
+    offset = try container.decodeIfPresent(String.self, forKey: .offset)
+    lsn = try container.decodeIfPresent(String.self, forKey: .lsn)
+    seq = try container.decodeIfPresent(UInt64.self, forKey: .seq)
+    last = try container.decodeIfPresent(Bool.self, forKey: .last)
+    // Telemetry only: a malformed value is dropped rather than failing the batch, so it can
+    // never stop a stream.
+    commitTimestamp = (try? container.decodeIfPresent(Int64.self, forKey: .commitTimestamp)) ?? nil
+  }
+
   public init(
     operation: ChangeOperation,
     txid: String? = nil,
@@ -85,7 +98,8 @@ public struct LiveDelivery: Equatable, Sendable {
   /// new start, and a batch whose every envelope a source dropped doesn't count as applied.
   public let firstAfterReconnect: Bool
   /// The batch's envelopes in stream order; inside `applying(changesAt:_:)`, only those a source
-  /// accepted.
+  /// accepted. For a limited (windowed) demand these are the accepted feed changes that made the
+  /// source re-query its page, not the page rows the store receives.
   public let changes: [Change]
 
   public init(

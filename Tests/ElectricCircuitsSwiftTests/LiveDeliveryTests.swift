@@ -107,6 +107,14 @@ func envelopeHeadersCarryCommitTimestamp() throws {
   let unstamped = try JSONDecoder().decode(
     ChangeEnvelope.self, from: Data(envelopeJSON("b", commitTimestamp: nil).utf8))
   #expect(unstamped.headers.commitTimestamp == nil)
+  // A malformed commit time is dropped, never a decoding failure that would stop the stream.
+  let malformed = try JSONDecoder().decode(
+    ChangeEnvelope.self,
+    from: Data(
+      #"{"type":"public.items","key":"c","headers":{"operation":"delete","lsn":"0/10","commit_ts":"soon"}}"#
+        .utf8))
+  #expect(malformed.headers.commitTimestamp == nil)
+  #expect(malformed.headers.lsn == "0/10")
 }
 
 @Test("The SSE parser reads a data event's server-time and resets it per event")
