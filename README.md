@@ -312,7 +312,8 @@ dependencies: [
 
 Add the `ElectricCircuitsSwift` product to targets that use only the native protocol client. Set
 `ElectricCircuitsClient.Configuration(liveReadMode: .sse)` to hold one live SSE response per
-stream; `.longPoll` remains the default. Add
+stream; `.longPoll` remains the default. Pass a closure instead (`Configuration(liveReadMode: { ... })`)
+to have each reader ask for its mode before every live read, for example behind a feature flag. Add
 `ElectricCircuitsCollections` for typed demands, leases, snapshot/live coordination, and the
 store-provider contract. The optional LinearLite GRDB provider remains a separate example package.
 See [the release guide](Docs/RELEASING.md) for the release contract and versioned-source-control
