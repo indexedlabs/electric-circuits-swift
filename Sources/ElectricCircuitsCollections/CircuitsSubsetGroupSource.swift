@@ -338,8 +338,8 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
   private var passedSnapshotHorizon = false
   private var rowVersions: [GroupRowKey: CollectionSourceVersion] = [:]
   // Actors are reentrant across store application; hold this FIFO permit across it so a second
-  // application cannot commit against the same cursor. Setup holds it until it has confirmed
-  // the stream belongs to the snapshot's group.
+  // application cannot commit against the same cursor. Setup holds it until `run` has finished
+  // starting its subscription.
   private var applying = true
   private var setupHoldsPermit = true
   private var refused = false
@@ -369,18 +369,18 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
     applyBatch = apply
   }
 
-  /// Lets batches through once setup has confirmed the coordinator read the snapshot's group.
+  /// Lets batches through once `run` has finished starting its subscription.
   func open() { releaseSetupPermit() }
 
-  /// Refuses every later batch: the coordinator's stream is not the snapshot's group. A batch
-  /// already applying finishes.
+  /// Refuses every later batch: the session is stopping before it opened. A batch already
+  /// applying finishes.
   func refuse() {
     refused = true
     releaseSetupPermit()
   }
 
-  /// Refuses batches only while setup still holds the permit, so a stop before setup confirmed
-  /// the group frees a reader waiting on it. After `open()` it does nothing: a batch arriving
+  /// Refuses batches only while setup still holds the permit, so a stop before `run` finished
+  /// starting frees a reader waiting on it. After `open()` it does nothing: a batch arriving
   /// while the session stops is then an ordinary batch, not a failure.
   func stopBeforeOpen() {
     guard setupHoldsPermit else { return }

@@ -665,6 +665,9 @@ public actor ShapeSubscriptionCoordinator {
       transition(.stopping)
       if let handle { appendRelease(handle) }
       handle = nil
+      // A setup claim no start consumed, because none ran or it failed first.
+      if let setupClaim { appendRelease(setupClaim) }
+      setupClaim = nil
     }
     let create = startTask
     let renew = renewTask

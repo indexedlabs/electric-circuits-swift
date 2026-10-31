@@ -119,17 +119,19 @@ private let groupBatches = [
 private actor GroupStreamServer: HTTPTransport {
   private var batches: [String]
   private var nextOffset = 10
-  /// How many stream reads answer `410` before the scripted batches start.
+  /// How many stream reads answer `goneStatus` before the scripted batches start.
   private var goneReads: Int
+  private let goneStatus: Int
   /// After the scripted batches, keep answering with one new `tag` row per read.
   private let endless: Bool
   private(set) var loads: [SubsetGroupRequest] = []
   private(set) var streamURLs: [URL] = []
   private(set) var releases: [URL] = []
 
-  init(batches: [String], goneReads: Int = 0, endless: Bool = false) {
+  init(batches: [String], goneReads: Int = 0, goneStatus: Int = 410, endless: Bool = false) {
     self.batches = batches
     self.goneReads = goneReads
+    self.goneStatus = goneStatus
     self.endless = endless
   }
 
@@ -143,7 +145,7 @@ private actor GroupStreamServer: HTTPTransport {
       streamURLs.append(request.url!)
       if goneReads > 0 {
         goneReads -= 1
-        return reply("gone", request: request, status: 410)
+        return reply("gone", request: request, status: goneStatus)
       }
       guard let body = takeBatch() else {
         try await Task.sleep(for: .seconds(3_600))
@@ -164,6 +166,13 @@ private actor GroupStreamServer: HTTPTransport {
     onBytes: @Sendable (Data) async throws -> Void
   ) async throws {
     streamURLs.append(request.url!)
+    if goneReads > 0 {
+      goneReads -= 1
+      try await onResponse(
+        HTTPURLResponse(
+          url: request.url!, statusCode: goneStatus, httpVersion: nil, headerFields: [:])!)
+      return
+    }
     try await onResponse(
       HTTPURLResponse(
         url: request.url!, statusCode: 200, httpVersion: nil,
@@ -217,9 +226,9 @@ private func makeSource(_ server: GroupStreamServer, mode: LiveReadMode)
 }
 
 private func waitUntil(_ condition: @Sendable () async -> Bool) async {
-  for _ in 0..<20_000 {
+  for _ in 0..<5_000 {
     if await condition() { return }
-    await Task.yield()
+    try? await Task.sleep(for: .milliseconds(2))
   }
 }
 
@@ -466,11 +475,14 @@ struct CircuitsSubsetGroupSourceTests {
     #expect(await server.releases.count == 1)
   }
 
-  @Test func aGroupReleasedBetweenSetupAndItsFirstReadRequiresReseed() async throws {
+  @Test(arguments: [LiveReadMode.longPoll, .sse], [410, 404])
+  func aGroupReleasedBetweenSetupAndItsFirstReadRequiresReseed(
+    mode: LiveReadMode, status: Int
+  ) async throws {
     // The group was released after setup's load, so its stream is gone. Nothing from it reaches
     // the store, and the caller loads again.
-    let server = GroupStreamServer(batches: groupBatches, goneReads: 1)
-    let session = try await makeSource(server, mode: .longPoll).materialize(
+    let server = GroupStreamServer(batches: groupBatches, goneReads: 1, goneStatus: status)
+    let session = try await makeSource(server, mode: mode).materialize(
       threeTableDemand(), materializationID: CollectionMaterializationID(rawValue: "scope-1"))
     let offered = GroupBatchLog()
 
@@ -508,8 +520,22 @@ struct CircuitsSubsetGroupSourceTests {
       #expect(finished, "run did not finish after cancellation")
       guard finished else { return }
       #expect(await server.loads.count == 1)
+      // A cancelled run hands its release to the session's stop, which outlives it.
+      await waitUntil { await !server.releases.isEmpty }
       #expect(await server.releases.contains { $0.path == "/v1/shapes/group-1" })
     }
+  }
+
+  @Test func aStopDuringSetupReleasesTheGroupAndAppliesNothing() async throws {
+    let server = GroupStreamServer(batches: groupBatches)
+    let session = try await makeSource(server, mode: .longPoll).materialize(
+      threeTableDemand(), materializationID: CollectionMaterializationID(rawValue: "scope-1"))
+
+    try await session.stop()
+
+    #expect(await server.loads.count == 1)
+    #expect(await server.releases.contains { $0.path == "/v1/shapes/group-1" })
+    #expect(await server.streamURLs.isEmpty)
   }
 
   @Test(arguments: [LiveReadMode.longPoll, .sse])

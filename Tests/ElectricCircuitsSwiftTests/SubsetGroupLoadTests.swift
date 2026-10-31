@@ -135,6 +135,72 @@ struct SubsetGroupLoadTests {
     }
   }
 
+  @Test func coordinatorStartsOnASetupClaimAndRenewsIt() async throws {
+    let transport = GroupRenewalTransport(shapeIDs: ["g-1", "g-1", "g-2"])
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://gateway.test/sync")!, transport: transport)
+    let setup = try await client.loadSubsetGroup(groupRequest())
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: client, transport: transport, groupRequest: groupRequest(),
+      materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0),
+      setupClaim: setup.handle)
+
+    // The setup's load is the only one, and its lease is the coordinator's to renew.
+    let handle = try await coordinator.start()
+    #expect(handle == setup.handle)
+    #expect(handle.response.leaseSeconds == 30)
+    #expect(await transport.loads == 1)
+
+    #expect(try await coordinator.renew() == handle)
+    #expect(await transport.loads == 2)
+
+    await #expect(throws: ShapeSubscriptionFailure.self) {
+      _ = try await coordinator.renew()
+    }
+    guard case .reseedRequired(let outcome) = await coordinator.state else {
+      Issue.record("expected reseedRequired after a replaced group")
+      try await coordinator.stop()
+      return
+    }
+    #expect(outcome.reason == .replacement(previousShapeID: "g-1", replacementShapeID: "g-2"))
+    try await coordinator.stop()
+  }
+
+  @Test func stoppingBeforeStartReleasesTheSetupClaim() async throws {
+    let transport = GroupRenewalTransport(shapeIDs: ["g-1"])
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://gateway.test/sync")!, transport: transport)
+    let setup = try await client.loadSubsetGroup(groupRequest())
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: client, transport: transport, groupRequest: groupRequest(),
+      materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0),
+      setupClaim: setup.handle)
+
+    try await coordinator.stop()
+
+    #expect(await transport.loads == 1)
+    #expect(await transport.releasedPaths.count == 1)
+  }
+
+  @Test func aRefusedStartStillLeavesTheSetupClaimForStopToRelease() async throws {
+    let transport = GroupRenewalTransport(shapeIDs: ["g-1"])
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://gateway.test/sync")!, transport: transport)
+    let setup = try await client.loadSubsetGroup(groupRequest())
+    let capacity = ShapeSubscriptionCapacity(maximumActiveSubscriptions: 1)
+    _ = try await capacity.acquire()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: client, transport: transport, groupRequest: groupRequest(),
+      materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0),
+      capacity: capacity, setupClaim: setup.handle)
+
+    await #expect(throws: (any Error).self) { _ = try await coordinator.start() }
+    try await coordinator.stop()
+
+    #expect(await transport.loads == 1)
+    #expect(await transport.releasedPaths.count == 1)
+  }
+
   @Test func groupCoordinatorRenewsTheSameGroupAndReseedsOnReplacement() async throws {
     let transport = GroupRenewalTransport(shapeIDs: ["g-1", "g-1", "g-2"])
     let coordinator = ShapeSubscriptionCoordinator(

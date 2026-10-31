@@ -8,7 +8,8 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 - Fix: setting up a group loaded its snapshot twice, once for the rows and again when its
   subscription started. `ShapeSubscriptionCoordinator(groupRequest:setupClaim:)` starts on the
   setup's load, and `CircuitsSubsetGroupSource` passes it, so setup makes one
-  `POST v1/subsets/load`.
+  `POST v1/subsets/load`. A group released between setup and the first read now ends the stream
+  with a terminal response and requires a reseed, rather than reporting a replacement at setup.
 
 ## 0.9.0
 
@@ -21,10 +22,11 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   to a `CollectionGroupStore` as one `CollectionGroupChangeBatch` with the group's one cursor.
   `InMemoryCollectionGroupStore` is the reference provider. The single-table source, coordinator
   and `CollectionStore` are unchanged.
-- Known limitation: the group route has only the load call, so every lease renewal re-reads the
-  group's snapshot. The engine does that read and the response carries the rows, though the client
-  decodes only the claim. A group whose rows grow past `ResponseDecodingLimits` after setup fails at
-  its next renewal. Don't enable groups for users until a rows-free renewal lands (OTTO-10739).
+- Known limitation: the group route has only the load call, so setup loads the group twice and
+  every lease renewal re-reads the group's snapshot. The engine does that read and the response
+  carries the rows, though the client decodes only the claim. A group whose rows grow past
+  `ResponseDecodingLimits` after setup fails at its next renewal. Don't enable groups for users
+  until a rows-free renewal lands (OTTO-10739).
 
 ## 0.8.0
 
