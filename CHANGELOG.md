@@ -17,16 +17,13 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   `CircuitsSubsetGroupSourceError.mustRefetch(groupID:resumeLSN:)`, and the caller loads the group
   again and replaces its rows with the new snapshot.
 - Source-breaking: `StreamError` and `CircuitsSubsetGroupSourceError` each gain a case, so an
-  exhaustive `switch` over either needs one more arm. Release this as the next 0.x minor (0.11.0)
-  with that note, per the pre-1.0 rule in `Policies/SEMVER.md`.
-
+  exhaustive `switch` over either needs one more arm. Under the pre-1.0 rule in
+  `Policies/SEMVER.md` that makes the next tag a minor bump (0.12.0).
 - Fix: setting up a group loaded its snapshot twice, once for the rows and again when its
   subscription started. `ShapeSubscriptionCoordinator(groupRequest:setupClaim:)` starts on the
   setup's load, and `CircuitsSubsetGroupSource` passes it, so setup makes one
   `POST v1/subsets/load`. A group released between setup and the first read now ends the stream
   with a terminal response and requires a reseed, rather than reporting a replacement at setup.
-
-## 0.10.0
 
 ## 0.10.0
 

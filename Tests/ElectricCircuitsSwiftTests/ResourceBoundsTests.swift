@@ -85,6 +85,38 @@ private func boundsResponse(
 private let oneChange =
   #"[{"type":"public.items","key":"1","value":{"id":1},"headers":{"operation":"upsert"}}]"#
 
+/// One SSE response: each body as its own data frame, then a control frame with the next offset.
+private actor FramedSSETransport: HTTPTransport {
+  private let frames: [String]
+  private let nextOffset: String
+
+  init(frames: [String], nextOffset: String) {
+    self.frames = frames
+    self.nextOffset = nextOffset
+  }
+
+  func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes: @Sendable (Data) async throws -> Void
+  ) async throws {
+    try await onResponse(
+      HTTPURLResponse(
+        url: request.url!, statusCode: 200, httpVersion: nil,
+        headerFields: ["Content-Type": "text/event-stream"])!)
+    for frame in frames {
+      try await onBytes(Data("event: data\ndata: \(frame)\n\n".utf8))
+    }
+    try await onBytes(
+      Data("event: control\ndata: {\"streamNextOffset\":\"\(nextOffset)\"}\n\n".utf8))
+  }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    Issue.record("Long-poll fallback was unexpectedly used")
+    throw CancellationError()
+  }
+}
+
 @Suite("Decoded response and stream batch admission bounds")
 struct ResourceBoundsTests {
   @Test func immutableLimitsClampInvalidInputsAndHaveFiniteDefaults() {
@@ -183,6 +215,26 @@ struct ResourceBoundsTests {
       materializer: materializer, startingAt: prior,
       responseDecodingLimits: .init(
         maximumDecodedResponseBytes: 10_000, maximumChangeEventsPerStreamBatch: 1))
+    await #expect(throws: StreamError.batchTooLarge(limit: 1, observed: 2)) {
+      try await reader.run()
+    }
+    #expect(try await materializer.currentCursor() == prior)
+    #expect(await materializer.applications == 0)
+  }
+
+  @Test func aControlCountsAgainstTheEventLimitAcrossSSEDataFrames() async throws {
+    let prior = StreamCursor(offset: "41")
+    let control =
+      #"[{"type":"__circuits.control","key":"must-refetch","value":{"control":"must-refetch"},"#
+      + #""headers":{"operation":"control"}}]"#
+    let transport = FramedSSETransport(frames: [oneChange, control], nextOffset: "42")
+    let materializer = BoundsMaterializer(rows: ["old": ["id": .int(0)]], cursor: prior)
+    let reader = ShapeStreamReader(
+      streamURL: URL(string: "https://streams.test/shape/s1")!, transport: transport,
+      materializer: materializer, startingAt: prior,
+      responseDecodingLimits: .init(
+        maximumDecodedResponseBytes: 10_000, maximumChangeEventsPerStreamBatch: 1),
+      configuration: .init(liveReadMode: .sse))
     await #expect(throws: StreamError.batchTooLarge(limit: 1, observed: 2)) {
       try await reader.run()
     }

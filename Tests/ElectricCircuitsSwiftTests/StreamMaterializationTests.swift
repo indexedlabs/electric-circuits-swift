@@ -113,7 +113,8 @@ struct StreamMaterializationTests {
     let json =
       #"[{"type":"public.items","key":"1","value":{"id":"1"},"headers":{"operation":"upsert"}},"#
       + #"{"type":"__circuits.control","key":"must-refetch","value":{"control":"must-refetch","#
-      + #""reason":"group-detached","groupId":"shape/group-7","resumeLsn":"0/18","throughLsn":"0/40"},"#
+      + #""reason":"group-detached","groupId":"shape/group-7","#
+      + #""resumeLsn":"0/18","throughLsn":"0/40"},"#
       + #""headers":{"operation":"control","last":true}}]"#
     let batch = try JSONDecoder().decode(ChangeBatch.self, from: Data(json.utf8))
     #expect(batch.envelopes.map(\.key) == ["1"])
