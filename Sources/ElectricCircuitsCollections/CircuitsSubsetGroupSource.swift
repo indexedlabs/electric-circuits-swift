@@ -87,11 +87,12 @@ public struct CircuitsSubsetGroupSource: Sendable {
           table: $0.table, where: $0.sourcePredicate, columns: $0.columns, key: $0.table)
       },
       subscription: materializationID.rawValue)
+    // The lease begins somewhere inside the load, so its age counts from before the request.
+    let loadStarted = ContinuousClock.now
     let load = try await recreatePolicy.recreatingOnGone(clock: clock) {
       try await client.loadSubsetGroup(request)
     }
     let handle = load.handle
-    let loadedAt = ContinuousClock.now
 
     do {
       let routes = try GroupRoutes(demand: demand, load: load)
@@ -151,7 +152,7 @@ public struct CircuitsSubsetGroupSource: Sendable {
             telemetry: telemetry,
             recreatePolicy: recreatePolicy,
             setupClaim: handle,
-            setupClaimAge: ContinuousClock.now - loadedAt
+            setupClaimAge: ContinuousClock.now - loadStarted
           )
           try await lifecycle.install(coordinator, materializer: materializer)
           let states = await coordinator.stateUpdates
