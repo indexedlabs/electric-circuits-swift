@@ -753,7 +753,8 @@ struct CircuitsSubsetGroupSourceTests {
       threeTableDemand(), materializationID: id)
     try await store.replaceGroupSnapshot(reloaded.snapshot, materializationID: id, demand: identity)
     #expect(await server.loads.count == 2)
-    #expect(await server.loads.allSatisfy { $0.subscription == "scope-1" })
+    let subscriptions = await server.loads.map(\.subscription)
+    #expect(subscriptions == ["scope-1", "scope-1"])
     #expect(reloaded.snapshot.cursor.offset == "20")
     #expect(
       await store.rows(

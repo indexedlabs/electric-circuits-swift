@@ -124,7 +124,8 @@ struct StreamMaterializationTests {
           control: "must-refetch", reason: "group-detached", groupID: "shape/group-7",
           resumeLSN: "0/18", throughLSN: "0/40")
       ])
-    #expect(batch.controls.allSatisfy { $0.isMustRefetch })
+    let allMustRefetch = batch.controls.allSatisfy { $0.isMustRefetch }
+    #expect(allMustRefetch)
     #expect(!ChangeBatch(controls: batch.controls).isEmpty, "a control alone is not an empty batch")
     let again = try JSONDecoder().decode(ChangeBatch.self, from: JSONEncoder().encode(batch))
     #expect(again == batch)
