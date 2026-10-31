@@ -586,8 +586,8 @@ struct CircuitsSubsetGroupSourceTests {
     let run = Task { try await session.run { _ in } }
     await waitUntil { await !clock.sleeps.isEmpty }
     let first = try #require(await clock.sleeps.first)
-    #expect(first < .seconds(10))
-    #expect(first > .zero)
+    // The source reads a real clock, so the 50 ms above counts against the first interval.
+    #expect(first <= .seconds(10) - .milliseconds(50))
     #expect(await server.loads.count == 1)
 
     await clock.wake()
