@@ -87,6 +87,8 @@ public struct CircuitsSubsetGroupSource: Sendable {
           table: $0.table, where: $0.sourcePredicate, columns: $0.columns, key: $0.table)
       },
       subscription: materializationID.rawValue)
+    // The lease begins somewhere inside the load, so its age counts from before the request.
+    let loadStarted = ContinuousClock.now
     let load = try await recreatePolicy.recreatingOnGone(clock: clock) {
       try await client.loadSubsetGroup(request)
     }
@@ -135,8 +137,9 @@ public struct CircuitsSubsetGroupSource: Sendable {
           let materializer = CircuitsGroupTailMaterializer(
             members: demand.members, routes: routes, cursor: cursor,
             sourceVersion: snapshotVersion, apply: apply)
-          // The coordinator loads the same subscription and members again, which renews the group
-          // this setup created and reads its stream from the snapshot's cursor.
+          // The coordinator starts on the group this setup loaded and reads its stream from the
+          // snapshot's cursor. If the group was released in between (a retired table, a reset or
+          // a lapsed lease), its first read ends the stream and the caller reseeds.
           let coordinator = ShapeSubscriptionCoordinator(
             client: client,
             transport: transport,
@@ -147,26 +150,15 @@ public struct CircuitsSubsetGroupSource: Sendable {
             capacity: capacity,
             responseDecodingLimits: responseDecodingLimits,
             telemetry: telemetry,
-            recreatePolicy: recreatePolicy
+            recreatePolicy: recreatePolicy,
+            setupClaim: handle,
+            setupClaimAge: ContinuousClock.now - loadStarted
           )
           try await lifecycle.install(coordinator, materializer: materializer)
           let states = await coordinator.stateUpdates
           do {
             try await withTaskCancellationHandler {
-              // The coordinator's own load must renew the group the snapshot came from. A
-              // different group means the first was released in between (a retired table, a
-              // reset or a lapsed lease): its stream does not continue from this snapshot's
-              // cursor, so the caller reseeds, and no batch from it reaches the store.
-              let started = try await coordinator.start()
-              guard started.id == handle.id else {
-                await materializer.refuse()
-                throw CircuitsSubsetGroupSourceError.subscription(
-                  .reseedRequired(
-                    ShapeSubscriptionReseedRequired(
-                      reason: .replacement(
-                        previousShapeID: handle.id, replacementShapeID: started.id),
-                      previous: handle, replacement: started)))
-              }
+              try await coordinator.start()
               await materializer.open()
               await lifecycle.markCoordinatorStarted()
               for await state in states {
@@ -322,7 +314,7 @@ private actor CircuitsGroupSessionLifecycle {
     let client = client
     let initialHandle = initialHandle
     let task = Task<Void, Error> {
-      // A stop can come before setup confirmed the group, while the coordinator's reader waits
+      // A stop can come before `run` finished starting, while the coordinator's reader waits
       // on the setup permit; the coordinator's stop waits for that reader, so refuse it first.
       // Once setup has opened the tail, the coordinator's stop alone ends the reader.
       await materializer?.stopBeforeOpen()
@@ -349,8 +341,8 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
   private var passedSnapshotHorizon = false
   private var rowVersions: [GroupRowKey: CollectionSourceVersion] = [:]
   // Actors are reentrant across store application; hold this FIFO permit across it so a second
-  // application cannot commit against the same cursor. Setup holds it until it has confirmed
-  // the stream belongs to the snapshot's group.
+  // application cannot commit against the same cursor. Setup holds it until `run` has finished
+  // starting its subscription.
   private var applying = true
   private var setupHoldsPermit = true
   private var refused = false
@@ -380,18 +372,18 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
     applyBatch = apply
   }
 
-  /// Lets batches through once setup has confirmed the coordinator read the snapshot's group.
+  /// Lets batches through once `run` has finished starting its subscription.
   func open() { releaseSetupPermit() }
 
-  /// Refuses every later batch: the coordinator's stream is not the snapshot's group. A batch
-  /// already applying finishes.
+  /// Refuses every later batch: the session is stopping before it opened. A batch already
+  /// applying finishes.
   func refuse() {
     refused = true
     releaseSetupPermit()
   }
 
-  /// Refuses batches only while setup still holds the permit, so a stop before setup confirmed
-  /// the group frees a reader waiting on it. After `open()` it does nothing: a batch arriving
+  /// Refuses batches only while setup still holds the permit, so a stop before `run` finished
+  /// starting frees a reader waiting on it. After `open()` it does nothing: a batch arriving
   /// while the session stops is then an ordinary batch, not a failure.
   func stopBeforeOpen() {
     guard setupHoldsPermit else { return }

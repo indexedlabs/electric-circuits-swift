@@ -285,6 +285,9 @@ public actor ShapeSubscriptionCoordinator {
   private let recreatePolicy: ShapeSubscriptionRecreatePolicy
   private var continuation: AsyncStream<ShapeSubscriptionState>.Continuation?
   private var handle: ShapeHandle?
+  /// A claim the caller already holds, which the first start uses instead of creating one.
+  private var setupClaim: ShapeHandle?
+  private var setupClaimAge: Duration
   private var pendingRelease: [ShapeHandle] = []
   private var generation: UInt64 = 0
   private var stopping = false
@@ -341,6 +344,11 @@ public actor ShapeSubscriptionCoordinator {
   /// A coordinator for one shape group: it loads the group, reads the group's one stream and
   /// renews by loading the same subscription and members again.
   ///
+  /// `setupClaim` is the handle of a load the caller just made for its snapshot. The coordinator
+  /// starts on it instead of loading the group a second time, and takes over releasing it.
+  /// `setupClaimAge` is how long before this call that load was made: its lease began then, so
+  /// the first renewal comes that much sooner.
+  ///
   /// A renewal is a full group load: the engine re-reads every member's snapshot and the answer
   /// carries its rows, which are not decoded. The answer still counts against
   /// `ResponseDecodingLimits`, so a group whose rows outgrow the limit fails at its next renewal.
@@ -353,7 +361,9 @@ public actor ShapeSubscriptionCoordinator {
     capacity: ShapeSubscriptionCapacity? = nil,
     responseDecodingLimits: ResponseDecodingLimits = .default,
     telemetry: TelemetryReporter = .noop,
-    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init()
+    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init(),
+    setupClaim: ShapeHandle? = nil,
+    setupClaimAge: Duration = .zero
   ) {
     // Only a load that names its subscription renews the same group; without one, every
     // renewal would mint a new group and report a replacement.
@@ -363,7 +373,7 @@ public actor ShapeSubscriptionCoordinator {
       client: client, transport: transport, route: .subsetGroup(groupRequest),
       materializer: materializer, retryPolicy: retryPolicy, clock: clock, capacity: capacity,
       responseDecodingLimits: responseDecodingLimits, telemetry: telemetry,
-      recreatePolicy: recreatePolicy)
+      recreatePolicy: recreatePolicy, setupClaim: setupClaim, setupClaimAge: setupClaimAge)
   }
 
   private init(
@@ -371,8 +381,11 @@ public actor ShapeSubscriptionCoordinator {
     route: ShapeSubscriptionClaimRoute, materializer: any ShapeMaterializer,
     retryPolicy: ShapeSubscriptionRetryPolicy, clock: any ShapeSubscriptionClock,
     capacity: ShapeSubscriptionCapacity?, responseDecodingLimits: ResponseDecodingLimits,
-    telemetry: TelemetryReporter, recreatePolicy: ShapeSubscriptionRecreatePolicy
+    telemetry: TelemetryReporter, recreatePolicy: ShapeSubscriptionRecreatePolicy,
+    setupClaim: ShapeHandle? = nil, setupClaimAge: Duration = .zero
   ) {
+    self.setupClaim = setupClaim
+    self.setupClaimAge = setupClaimAge
     self.client = client
     self.transport = transport
     self.route = route
@@ -657,6 +670,9 @@ public actor ShapeSubscriptionCoordinator {
       transition(.stopping)
       if let handle { appendRelease(handle) }
       handle = nil
+      // A setup claim no start consumed, because none ran or it failed first.
+      if let setupClaim { appendRelease(setupClaim) }
+      setupClaim = nil
     }
     let create = startTask
     let renew = renewTask
@@ -691,8 +707,10 @@ public actor ShapeSubscriptionCoordinator {
     streamTask = Task { [weak self] in await self?.consume(handle: handle, generation: generation) }
     if let seconds = handle.response.leaseSeconds, seconds > 0 {
       let interval = max(Duration.seconds(Double(seconds) / 3), .seconds(1))
+      let firstDelay = max(interval - setupClaimAge, .zero)
+      setupClaimAge = .zero
       leaseTask = Task { [weak self] in
-        await self?.renewOnLease(interval: interval, generation: generation)
+        await self?.renewOnLease(interval: interval, firstDelay: firstDelay, generation: generation)
       }
     }
   }
@@ -747,10 +765,12 @@ public actor ShapeSubscriptionCoordinator {
     }
   }
 
-  private func renewOnLease(interval: Duration, generation: UInt64) async {
+  private func renewOnLease(interval: Duration, firstDelay: Duration, generation: UInt64) async {
+    var delay = firstDelay
     while isCurrent(generation) {
       do {
-        try await clock.sleep(for: interval)
+        if delay > .zero { try await clock.sleep(for: delay) }
+        delay = interval
         guard isCurrent(generation) else { return }
         _ = try await renew()
       } catch { return }
@@ -771,6 +791,10 @@ public actor ShapeSubscriptionCoordinator {
       throw MaterializerFailure()
     }
     try Task.checkCancellation()
+    if let claimed = setupClaim {
+      setupClaim = nil
+      return claimed
+    }
     return try await recreatingOnGone(operation: "create") {
       switch self.route {
       case .shape(let request):

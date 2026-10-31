@@ -122,10 +122,9 @@ one `CollectionGroupChangeBatch`: every member's changes and the group's one cur
 store commits in one transaction. A refused member, a `503` or a broken stream fails the whole
 group. `InMemoryCollectionGroupStore` is the reference provider.
 
-Groups are not ready to enable for users yet. The group route has only the load call, so setup
-loads the group twice and every lease renewal re-reads the whole group snapshot; the client decodes
-only the claim. A group whose rows grow past `ResponseDecodingLimits` after setup fails at its next
-renewal. A rows-free renewal (OTTO-10739) is needed first.
+Groups are not ready to enable for users yet. The group route has only the load call, so every
+lease renewal re-reads the whole group snapshot; the client decodes only the claim. A group whose
+rows grow past `ResponseDecodingLimits` after setup fails at its next renewal. A rows-free renewal (OTTO-10739) is needed first.
 
 ```swift
 let demand = CollectionGroupDemand(members: [
