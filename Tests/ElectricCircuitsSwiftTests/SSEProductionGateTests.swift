@@ -856,7 +856,8 @@ private actor SSEModeSwitchTransport: HTTPTransport {
     switchToSSE()
     return HTTPResponse(
       data: Data(),
-      response: HTTPURLResponse(url: request.url!, statusCode: 204, httpVersion: nil, headerFields: nil)!)
+      response: HTTPURLResponse(
+        url: request.url!, statusCode: 204, httpVersion: nil, headerFields: nil)!)
   }
 }
 
@@ -911,7 +912,8 @@ private actor SSEModeSwitchOffTransport: HTTPTransport {
     requests.append(request)
     return HTTPResponse(
       data: Data(),
-      response: HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
+      response: HTTPURLResponse(
+        url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
   }
 }
 
