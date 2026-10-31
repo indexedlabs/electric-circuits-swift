@@ -91,6 +91,7 @@ public struct CircuitsSubsetGroupSource: Sendable {
       try await client.loadSubsetGroup(request)
     }
     let handle = load.handle
+    let loadedAt = ContinuousClock.now
 
     do {
       let routes = try GroupRoutes(demand: demand, load: load)
@@ -149,7 +150,8 @@ public struct CircuitsSubsetGroupSource: Sendable {
             responseDecodingLimits: responseDecodingLimits,
             telemetry: telemetry,
             recreatePolicy: recreatePolicy,
-            setupClaim: handle
+            setupClaim: handle,
+            setupClaimAge: ContinuousClock.now - loadedAt
           )
           try await lifecycle.install(coordinator, materializer: materializer)
           let states = await coordinator.stateUpdates
@@ -311,7 +313,7 @@ private actor CircuitsGroupSessionLifecycle {
     let client = client
     let initialHandle = initialHandle
     let task = Task<Void, Error> {
-      // A stop can come before setup confirmed the group, while the coordinator's reader waits
+      // A stop can come before `run` finished starting, while the coordinator's reader waits
       // on the setup permit; the coordinator's stop waits for that reader, so refuse it first.
       // Once setup has opened the tail, the coordinator's stop alone ends the reader.
       await materializer?.stopBeforeOpen()
