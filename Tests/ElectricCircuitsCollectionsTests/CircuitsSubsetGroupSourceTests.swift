@@ -674,6 +674,32 @@ struct CircuitsSubsetGroupSourceTests {
     }
   }
 
+  /// OTTO-11131: a group that detached on the engine dropped output, then reattached behind a
+  /// must-refetch marker. The session applies nothing from the batch that carries it and ends
+  /// with `mustRefetch`, so the caller loads the group again and replaces its rows with the new
+  /// snapshot.
+  @Test(arguments: [LiveReadMode.longPoll, .sse])
+  func aMustRefetchMarkerEndsTheSessionForASnapshotReload(mode: LiveReadMode) async throws {
+    let server = GroupStreamServer(batches: [
+      #"[{"type":"public.record","key":"1","value":{"id":"1","title":"before the gap"},"#
+        + #""headers":{"operation":"update","lsn":"0/20"}},"#
+        + #"{"type":"__circuits.control","key":"must-refetch","value":{"control":"must-refetch","#
+        + #""reason":"group-detached","groupId":"shape/group-7","resumeLsn":"0/18","throughLsn":"0/40"},"#
+        + #""headers":{"operation":"control","last":true}}]"#
+    ])
+    let applied = GroupBatchLog()
+    let session = try await makeSource(server, mode: mode).materialize(
+      threeTableDemand(), materializationID: CollectionMaterializationID(rawValue: "scope-1"))
+    await #expect(
+      throws: CircuitsSubsetGroupSourceError.mustRefetch(
+        groupID: "shape/group-7", resumeLSN: "0/18")
+    ) {
+      try await session.run { batch in await applied.append(batch) }
+    }
+    #expect(await applied.batches.isEmpty, "a batch carrying the marker must not be applied")
+    #expect(await server.releases.count == 1)
+  }
+
   @Test func envelopeForATableOutsideTheGroupFailsTheGroup() async throws {
     let server = GroupStreamServer(batches: [
       #"[{"type":"public.calendar_event","key":"1","value":{"id":"1"},"headers":{"operation":"insert","lsn":"0/20"}}]"#

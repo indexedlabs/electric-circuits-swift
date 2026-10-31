@@ -109,6 +109,26 @@ private func upsertDeleteFixture() throws -> Data {
 
 @Suite("Durable stream materialization")
 struct StreamMaterializationTests {
+  @Test func aControlEntryDecodesApartFromRowChanges() throws {
+    let json =
+      #"[{"type":"public.items","key":"1","value":{"id":"1"},"headers":{"operation":"upsert"}},"#
+      + #"{"type":"__circuits.control","key":"must-refetch","value":{"control":"must-refetch","#
+      + #""reason":"group-detached","groupId":"shape/group-7","resumeLsn":"0/18","throughLsn":"0/40"},"#
+      + #""headers":{"operation":"control","last":true}}]"#
+    let batch = try JSONDecoder().decode(ChangeBatch.self, from: Data(json.utf8))
+    #expect(batch.envelopes.map(\.key) == ["1"])
+    #expect(
+      batch.controls == [
+        StreamControl(
+          control: "must-refetch", reason: "group-detached", groupID: "shape/group-7",
+          resumeLSN: "0/18", throughLSN: "0/40")
+      ])
+    #expect(batch.controls.allSatisfy(\.isMustRefetch))
+    #expect(!ChangeBatch(controls: batch.controls).isEmpty, "a control alone is not an empty batch")
+    let again = try JSONDecoder().decode(ChangeBatch.self, from: JSONEncoder().encode(batch))
+    #expect(again == batch)
+  }
+
   @Test func fixtureDecodesRustEnvelopeAndPreservesTransactionMetadata() throws {
     let batch = try JSONDecoder().decode(ChangeBatch.self, from: upsertDeleteFixture())
     #expect(batch.envelopes.count == 2)

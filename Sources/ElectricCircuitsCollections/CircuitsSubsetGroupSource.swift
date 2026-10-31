@@ -10,6 +10,10 @@ public enum CircuitsSubsetGroupSourceError: Error, Equatable, Sendable {
   case invalidLiveSourceVersion(String?)
   case release(ClientError)
   case subscription(ShapeSubscriptionFailure)
+  /// The group detached on the server and dropped output, then reattached: its stream carries a
+  /// must-refetch marker. The session ends without applying the batch that carries it; load the
+  /// group again (a new `materialize`) and replace its rows with the new snapshot.
+  case mustRefetch(groupID: String?, resumeLSN: String?)
 }
 
 /// The group's live session: its snapshot, and a tail that hands every stream batch to the
@@ -468,6 +472,12 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
     CollectionGroupChangeBatch, [GroupRowKey: CollectionSourceVersion], Bool,
     CollectionSourceVersion
   ) {
+    // A must-refetch marker means output before it was dropped: nothing in this batch can be
+    // trusted to complete the group, so the session ends and the caller reloads the snapshot.
+    if let control = batch.controls.first(where: \.isMustRefetch) {
+      throw CircuitsSubsetGroupSourceError.mustRefetch(
+        groupID: control.groupID, resumeLSN: control.resumeLSN)
+    }
     var wire = Array(repeating: [CollectionGroupMemberCodec.WireChange](), count: members.count)
     var nextRowVersions = rowVersions
     var passedHorizon = passedSnapshotHorizon

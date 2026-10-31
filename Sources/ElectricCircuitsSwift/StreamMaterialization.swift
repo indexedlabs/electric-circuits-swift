@@ -69,36 +69,106 @@ public struct ChangeEnvelope: Codable, Equatable, Sendable {
   }
 }
 
+/// A stream entry that is not a row change: the engine's instruction to the stream's readers. A
+/// shape group that fell behind and detached writes a `must-refetch` control when it reattaches;
+/// the output before it is incomplete, and its readers reload the group from a snapshot.
+public struct StreamControl: Codable, Equatable, Sendable {
+  /// The envelope `type` the engine writes controls under. It names no table.
+  public static let envelopeType = "__circuits.control"
+  public static let mustRefetch = "must-refetch"
+
+  public var control: String
+  public var reason: String?
+  /// The group that detached, and the commits whose output it dropped.
+  public var groupID: String?
+  public var resumeLSN: String?
+  public var throughLSN: String?
+
+  public init(
+    control: String, reason: String? = nil, groupID: String? = nil, resumeLSN: String? = nil,
+    throughLSN: String? = nil
+  ) {
+    self.control = control
+    self.reason = reason
+    self.groupID = groupID
+    self.resumeLSN = resumeLSN
+    self.throughLSN = throughLSN
+  }
+
+  public var isMustRefetch: Bool { control == Self.mustRefetch }
+
+  enum CodingKeys: String, CodingKey {
+    case control, reason
+    case groupID = "groupId"
+    case resumeLSN = "resumeLsn"
+    case throughLSN = "throughLsn"
+  }
+}
+
 /// The JSON body of one durable-stream read. Rust returns a JSON array, not an object containing
 /// metadata, so this wrapper encodes and decodes as that array while giving materializers a stable
-/// value type.
+/// value type. Entries of type `StreamControl.envelopeType` are not row changes; they decode into
+/// `controls` rather than `envelopes`.
 public struct ChangeBatch: Codable, Equatable, Sendable {
   public var envelopes: [ChangeEnvelope]
+  public var controls: [StreamControl]
 
-  public init(envelopes: [ChangeEnvelope] = []) {
+  public init(envelopes: [ChangeEnvelope] = [], controls: [StreamControl] = []) {
     self.envelopes = envelopes
+    self.controls = controls
   }
 
   public init(_ envelopes: [ChangeEnvelope]) {
     self.envelopes = envelopes
+    controls = []
   }
 
-  public var isEmpty: Bool { envelopes.isEmpty }
+  public var isEmpty: Bool { envelopes.isEmpty && controls.isEmpty }
 
   public func encode(to encoder: Encoder) throws {
     var container = encoder.unkeyedContainer()
     for envelope in envelopes {
       try container.encode(envelope)
     }
+    for control in controls {
+      try container.encode(ControlEnvelope(value: control))
+    }
   }
 
   public init(from decoder: Decoder) throws {
     var container = try decoder.unkeyedContainer()
     var decoded: [ChangeEnvelope] = []
+    var controls: [StreamControl] = []
     while !container.isAtEnd {
-      decoded.append(try container.decode(ChangeEnvelope.self))
+      let entry = try container.superDecoder()
+      let kind = try entry.container(keyedBy: EntryKind.CodingKeys.self)
+      if try kind.decodeIfPresent(String.self, forKey: .type) == StreamControl.envelopeType {
+        controls.append(try ControlEnvelope(from: entry).value)
+      } else {
+        decoded.append(try ChangeEnvelope(from: entry))
+      }
     }
     envelopes = decoded
+    self.controls = controls
+  }
+
+  private enum EntryKind {
+    enum CodingKeys: String, CodingKey { case type }
+  }
+
+  /// A control's wire form: an envelope whose `value` carries the control.
+  private struct ControlEnvelope: Codable {
+    var type = StreamControl.envelopeType
+    var key: String
+    var value: StreamControl
+    var headers = Headers()
+
+    struct Headers: Codable { var operation = "control" }
+
+    init(value: StreamControl) {
+      key = value.control
+      self.value = value
+    }
   }
 }
 
@@ -593,6 +663,7 @@ public struct ShapeStreamReader: Sendable {
               observed: limits.maximumChangeEventsPerStreamBatch + 1)
           }
           pending.envelopes.append(contentsOf: batch.envelopes)
+          pending.controls.append(contentsOf: batch.controls)
         case "control":
           let control: Control
           do { control = try JSONDecoder().decode(Control.self, from: event.data) } catch {
