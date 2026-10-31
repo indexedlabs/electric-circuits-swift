@@ -755,7 +755,7 @@ struct CircuitsSubsetGroupSourceTests {
     #expect(await server.loads.count == 2)
     let subscriptions = await server.loads.map(\.subscription)
     #expect(subscriptions == ["scope-1", "scope-1"])
-    #expect(reloaded.snapshot.cursor.offset == "20")
+    #expect(reloaded.snapshot.cursor?.offset == "20")
     #expect(
       await store.rows(
         in: assignments.id, scope: groupScope, as: GroupAssignment.self, key: String.self)

@@ -19,6 +19,9 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 - Source-breaking: `StreamError` and `CircuitsSubsetGroupSourceError` each gain a case, so an
   exhaustive `switch` over either needs one more arm. Under the pre-1.0 rule in
   `Policies/SEMVER.md` that makes the next tag a minor bump (0.12.0).
+
+## 0.11.0
+
 - Fix: setting up a group loaded its snapshot twice, once for the rows and again when its
   subscription started. `ShapeSubscriptionCoordinator(groupRequest:setupClaim:)` starts on the
   setup's load, and `CircuitsSubsetGroupSource` passes it, so setup makes one
