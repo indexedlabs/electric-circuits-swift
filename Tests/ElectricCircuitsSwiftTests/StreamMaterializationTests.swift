@@ -123,7 +123,7 @@ struct StreamMaterializationTests {
           control: "must-refetch", reason: "group-detached", groupID: "shape/group-7",
           resumeLSN: "0/18", throughLSN: "0/40")
       ])
-    #expect(batch.controls.allSatisfy(\.isMustRefetch))
+    #expect(batch.controls.allSatisfy { $0.isMustRefetch })
     #expect(!ChangeBatch(controls: batch.controls).isEmpty, "a control alone is not an empty batch")
     let again = try JSONDecoder().decode(ChangeBatch.self, from: JSONEncoder().encode(batch))
     #expect(again == batch)
@@ -218,6 +218,38 @@ struct StreamMaterializationTests {
     #expect(await materializer.cursor() == StreamCursor(offset: "42"))
     #expect(await transport.requests[0].url?.query?.contains("offset=41") == true)
     #expect(await transport.requests[0].url?.query?.contains("live=long-poll") == true)
+  }
+
+  /// A materializer that never reads `controls` still never commits past a must-refetch marker:
+  /// the reader refuses the batch before any apply and the cursor stays where it was.
+  @Test func aMustRefetchMarkerFailsClosedForEveryMaterializer() async throws {
+    let marker =
+      #"[{"type":"public.items","key":"7","value":{"id":"7"},"#
+      + #""headers":{"operation":"upsert","lsn":"0/41"}},"#
+      + #"{"type":"__circuits.control","key":"must-refetch","value":{"control":"must-refetch","#
+      + #""groupId":"shape/group-7","resumeLsn":"0/18"},"headers":{"operation":"control"}}]"#
+    let transport = ScriptedStreamTransport(responses: [
+      streamResponse(marker, headers: ["stream-next-offset": "42"])
+    ])
+    let materializer = InMemoryShapeMaterializer()
+    let start = StreamCursor(offset: "41")
+    try await materializer.apply(ChangeBatch(), expecting: nil, advancingTo: start)
+    let reader = ShapeStreamReader(
+      streamURL: URL(string: "https://streams.test/shape/s1")!,
+      transport: transport,
+      materializer: materializer,
+      startingAt: start)
+
+    await #expect(
+      throws: StreamError.mustRefetch(
+        path: "/shape/s1",
+        control: StreamControl(
+          control: "must-refetch", groupID: "shape/group-7", resumeLSN: "0/18"))
+    ) {
+      try await reader.run()
+    }
+    #expect(await materializer.rows().isEmpty, "the batch carrying the marker must not be applied")
+    #expect(try await materializer.currentCursor() == start)
   }
 
   @Test func idle204WithUnchangedOffsetDoesNotApply() async throws {

@@ -361,6 +361,10 @@ public enum StreamError: Error, Equatable, Sendable {
   /// The decoded batch was rejected before any provider apply. `observed` is capped at `limit + 1`.
   case batchTooLarge(limit: Int, observed: Int)
   case decoding(String)
+  /// The stream carries a must-refetch control: output before it was dropped, so the stream can
+  /// no longer complete what a reader holds. The reader fails closed without applying the batch
+  /// or advancing the cursor; reload from a snapshot.
+  case mustRefetch(path: String, control: StreamControl)
 }
 
 public typealias ShapeStreamError = StreamError
@@ -486,6 +490,11 @@ public struct ShapeStreamReader: Sendable {
     -> StreamCursor
   {
     try Task.checkCancellation()
+    // Every materializer fails closed here, whether or not it reads `controls`: committing past
+    // a must-refetch marker would move the cursor over output the stream dropped.
+    if let control = result.batch.controls.first(where: { $0.isMustRefetch }) {
+      throw StreamError.mustRefetch(path: streamURL.path, control: control)
+    }
     let span = telemetry.beginSpan(name: "electric.materializer.apply", kind: .internalSpan)
     let started = DispatchTime.now().uptimeNanoseconds
     do {
@@ -656,7 +665,9 @@ public struct ShapeStreamReader: Sendable {
           }
           lastActivity = clock.now
           guard
-            batch.envelopes.count <= limits.maximumChangeEventsPerStreamBatch - pending.envelopes.count
+            batch.envelopes.count + batch.controls.count
+              <= limits.maximumChangeEventsPerStreamBatch - pending.envelopes.count
+              - pending.controls.count
           else {
             throw StreamError.batchTooLarge(
               limit: limits.maximumChangeEventsPerStreamBatch,
@@ -798,12 +809,11 @@ public struct ShapeStreamReader: Sendable {
     } catch {
       throw StreamError.decoding(String(describing: error))
     }
-    guard batch.envelopes.count <= responseDecodingLimits.maximumChangeEventsPerStreamBatch else {
+    let entries = batch.envelopes.count + batch.controls.count
+    guard entries <= responseDecodingLimits.maximumChangeEventsPerStreamBatch else {
       throw StreamError.batchTooLarge(
         limit: responseDecodingLimits.maximumChangeEventsPerStreamBatch,
-        observed: min(
-          batch.envelopes.count,
-          responseDecodingLimits.maximumChangeEventsPerStreamBatch + 1))
+        observed: min(entries, responseDecodingLimits.maximumChangeEventsPerStreamBatch + 1))
     }
     guard !batch.isEmpty else {
       return emptyPollResult(nextOffset: nextOffset, preserving: cursor)
