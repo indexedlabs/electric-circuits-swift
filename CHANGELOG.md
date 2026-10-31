@@ -5,6 +5,15 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 
 ## Unreleased
 
+- Add `LiveDelivery`, how a live batch reached the reader, for measuring time to data.
+  `ShapeStreamReader` sets `LiveDelivery.current` around each live `ShapeMaterializer.apply`, so a
+  materializer, or the store a source hands the batch to, can read it. It carries the live mode, the
+  gateway's send time (SSE's `server-time:` field or a long-poll's `x-indexed-sync-server-time`
+  header), the receive time, whether this is the first batch since the tail started, and each
+  envelope's table and commit time. `CircuitsSubsetSource` and `CircuitsSubsetGroupSource` narrow
+  it to the envelopes their snapshot gate accepts, through `LiveDelivery.applying(changesAt:_:)`,
+  and a batch they drop entirely doesn't count as the first. `EnvelopeHeaders.commitTimestamp`
+  decodes the engine's `headers.commit_ts`. Readers and stores that don't read them are unchanged.
 - Fix: setting up a group loaded its snapshot twice, once for the rows and again when its
   subscription started. `ShapeSubscriptionCoordinator(groupRequest:setupClaim:)` starts on the
   setup's load, and `CircuitsSubsetGroupSource` passes it, so setup makes one

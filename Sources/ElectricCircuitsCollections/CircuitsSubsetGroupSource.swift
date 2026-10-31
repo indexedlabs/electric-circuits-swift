@@ -440,14 +440,15 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
     let nextRowVersions: [GroupRowKey: CollectionSourceVersion]
     let passedHorizon: Bool
     let latest: CollectionSourceVersion
+    let accepted: [Int]
     do {
-      (groupBatch, nextRowVersions, passedHorizon, latest) = try decode(
+      (groupBatch, nextRowVersions, passedHorizon, latest, accepted) = try decode(
         batch, expecting: expectedCursor, advancingTo: nextCursor)
     } catch {
       terminalFailure = error
       throw error
     }
-    try await applyBatch(groupBatch)
+    try await LiveDelivery.applying(changesAt: accepted) { try await applyBatch(groupBatch) }
     cursor = groupBatch.cursor
     sourceVersion = latest
     rowVersions = nextRowVersions
@@ -466,13 +467,15 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
     advancingTo nextCursor: StreamCursor
   ) throws -> (
     CollectionGroupChangeBatch, [GroupRowKey: CollectionSourceVersion], Bool,
-    CollectionSourceVersion
+    CollectionSourceVersion, [Int]
   ) {
     var wire = Array(repeating: [CollectionGroupMemberCodec.WireChange](), count: members.count)
     var nextRowVersions = rowVersions
     var passedHorizon = passedSnapshotHorizon
     var latest = sourceVersion
-    for envelope in batch.envelopes {
+    // The envelopes the snapshot gate lets through, for `LiveDelivery.applying(changesAt:_:)`.
+    var accepted: [Int] = []
+    for (index, envelope) in batch.envelopes.enumerated() {
       guard let member = routes.member(for: envelope.type) else {
         throw CircuitsSubsetGroupSourceError.tableOutsideGroup(envelope.type)
       }
@@ -500,6 +503,7 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
         guard version >= snapshotSourceVersion else { continue }
       }
       latest = max(latest, version)
+      accepted.append(index)
       if snapshotSourceVersion.snapshot != nil || passedHorizon {
         nextRowVersions[rowKey] = version
       }
@@ -517,7 +521,7 @@ private actor CircuitsGroupTailMaterializer: ShapeMaterializer {
         members: changes, expectedCursor: expectedCursor,
         cursor: StreamCursor(offset: nextCursor.offset, lsn: latest.rawValue),
         sourceVersion: latest),
-      nextRowVersions, passedHorizon, latest
+      nextRowVersions, passedHorizon, latest, accepted
     )
   }
 }

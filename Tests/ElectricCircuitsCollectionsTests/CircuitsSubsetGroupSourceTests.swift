@@ -285,6 +285,11 @@ private func waitUntil(_ condition: @Sendable () async -> Bool) async {
   }
 }
 
+private actor LiveDeliveryLog {
+  private(set) var values: [LiveDelivery?] = []
+  func append(_ delivery: LiveDelivery?) { values.append(delivery) }
+}
+
 @Suite("Native Circuits group source")
 struct CircuitsSubsetGroupSourceTests {
   @Test(arguments: [LiveReadMode.longPoll, .sse])
@@ -306,9 +311,11 @@ struct CircuitsSubsetGroupSourceTests {
     let store = InMemoryCollectionGroupStore()
     try await store.replaceGroupSnapshot(session.snapshot, materializationID: id, demand: identity)
     let log = GroupBatchLog()
+    let deliveries = LiveDeliveryLog()
     let run = Task {
       try await session.run { batch in
         try await store.applyGroup(batch, to: id)
+        await deliveries.append(LiveDelivery.current)
         await log.append(batch)
       }
     }
@@ -327,6 +334,13 @@ struct CircuitsSubsetGroupSourceTests {
     #expect(first.changes(in: tags.id, as: GroupTag.self, key: String.self)?.count == 1)
     #expect(first.expectedCursor == StreamCursor(offset: "10", lsn: "0/10"))
     #expect(first.cursor == StreamCursor(offset: "11", lsn: "0/20"))
+    // The store's apply runs under the batch's delivery, in the mode that read it.
+    let applied = await deliveries.values
+    #expect(applied.count == 2)
+    #expect(applied.allSatisfy { $0?.mode == mode })
+    #expect(applied.map { $0?.firstAfterReconnect } == [true, false])
+    // The snapshot already held "Grace", so the first batch's delivery lists the four applied.
+    #expect(applied.map { $0?.changes.count } == [4, 2])
 
     // Each row is in its own table: deleting key "1" in one table never touched the others.
     #expect(
