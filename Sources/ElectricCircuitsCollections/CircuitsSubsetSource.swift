@@ -494,10 +494,12 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
     }
     var changes: [CollectionChange<Model, Key>] = []
     var acceptedVersions: [CollectionSourceVersion] = []
+    // The envelopes the snapshot gate lets through, for `LiveDelivery.applying(changesAt:_:)`.
+    var accepted: [Int] = []
     var nextRowVersions = rowVersions
     var passedHorizon = passedSnapshotHorizon
     var latest = sourceVersion
-    for envelope in batch.envelopes {
+    for (index, envelope) in batch.envelopes.enumerated() {
       guard let rawVersion = envelope.headers.lsn,
         let lsn = CircuitsSubsetSource<Model, Key>.postgresLSN(rawVersion)
       else {
@@ -522,6 +524,7 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
       }
       latest = max(latest, version)
       acceptedVersions.append(version)
+      accepted.append(index)
       // A window never applies tail rows, so it does not decode them either: the feed covers the
       // whole predicate, including rows the page excludes (NULL sort keys among them), and a
       // model decoder is entitled to reject those. The page is the only source of window rows.
@@ -563,13 +566,13 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
       }
       committedWindowKeys = pageKeys
     }
-    try await applyBatch(
-      CollectionChangeBatch(
-        changes: changes,
-        expectedCursor: expectedCursor,
-        cursor: StreamCursor(offset: nextCursor.offset, lsn: latest.rawValue),
-        sourceVersion: latest
-      ))
+    let changeBatch = CollectionChangeBatch(
+      changes: changes,
+      expectedCursor: expectedCursor,
+      cursor: StreamCursor(offset: nextCursor.offset, lsn: latest.rawValue),
+      sourceVersion: latest
+    )
+    try await LiveDelivery.applying(changesAt: accepted) { try await applyBatch(changeBatch) }
     // Window membership, cursor and source version move together, only once the store has
     // applied the diff: a failed application leaves the held keys describing the store's rows.
     if let committedWindowKeys {

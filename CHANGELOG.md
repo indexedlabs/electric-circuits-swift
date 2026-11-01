@@ -18,7 +18,19 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   again and replaces its rows with the new snapshot.
 - Source-breaking: `StreamError` and `CircuitsSubsetGroupSourceError` each gain a case, so an
   exhaustive `switch` over either needs one more arm. Under the pre-1.0 rule in
-  `Policies/SEMVER.md` that makes the next tag a minor bump (0.12.0).
+  `Policies/SEMVER.md` that makes the next tag a minor bump (0.13.0).
+
+## 0.12.0
+
+- Add `LiveDelivery`, how a live batch reached the reader, for measuring time to data.
+  `ShapeStreamReader` sets `LiveDelivery.current` around each live `ShapeMaterializer.apply`, so a
+  materializer, or the store a source hands the batch to, can read it. It carries the live mode, the
+  gateway's send time (SSE's `server-time:` field or a long-poll's `x-indexed-sync-server-time`
+  header), the receive time, whether this is the first batch since the tail started, and each
+  envelope's table and commit time. `CircuitsSubsetSource` and `CircuitsSubsetGroupSource` narrow
+  it to the envelopes their snapshot gate accepts, through `LiveDelivery.applying(changesAt:_:)`,
+  and a batch they drop entirely doesn't count as the first. `EnvelopeHeaders.commitTimestamp`
+  decodes the engine's `headers.commit_ts`. Readers and stores that don't read them are unchanged.
 
 ## 0.11.0
 

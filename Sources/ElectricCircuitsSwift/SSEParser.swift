@@ -7,6 +7,8 @@ struct SSEParser {
   struct Event: Equatable, Sendable {
     let name: String
     let data: Data
+    /// The gateway's `server-time:` field (Unix milliseconds), when the event carried one.
+    var serverTime: Int64? = nil
   }
 
   private(set) var maximumEventBytes: Int
@@ -14,6 +16,7 @@ struct SSEParser {
   private let dataField = Array("data:".utf8)
   private var line = Data()
   private var name = ""
+  private var serverTime: Int64?
   private var data = Data()
   private var hasData = false
   private var skipLF = false
@@ -90,8 +93,11 @@ struct SSEParser {
       if line.starts(with: [0xEF, 0xBB, 0xBF]) { line.removeFirst(3) }
     }
     if line.isEmpty {
-      let event = hasData ? Event(name: name.isEmpty ? "message" : name, data: data) : nil
+      let event =
+        hasData
+        ? Event(name: name.isEmpty ? "message" : name, data: data, serverTime: serverTime) : nil
       name = ""
+      serverTime = nil
       data = Data()
       hasData = false
       lineFieldChecked = false
@@ -145,6 +151,7 @@ struct SSEParser {
     if value.first == " " { value = value.dropFirst() }
     switch field {
     case "event": name = String(value)
+    case "server-time": serverTime = Int64(value)
     case "data": break
     default: break
     }
