@@ -128,14 +128,22 @@ private actor GroupStreamServer: HTTPTransport {
   private let loadDelay: Duration
   /// After the scripted batches, keep answering with one new `tag` row per read.
   private let endless: Bool
+  /// Answers to successive loads; once used up, every load gets `groupLoadAnswer`.
+  private var loadAnswers: [String]
+  /// A batch served, never consumed, to every read at or before its offset: a stream position
+  /// that a reader resuming from an old cursor would reach again.
+  private let sticky: (offset: Int, body: String)?
   private(set) var loads: [SubsetGroupRequest] = []
   private(set) var streamURLs: [URL] = []
   private(set) var releases: [URL] = []
 
   init(
     batches: [String], goneReads: Int = 0, goneStatus: Int = 410, endless: Bool = false,
-    leaseSeconds: Int? = nil, loadDelay: Duration = .zero
+    leaseSeconds: Int? = nil, loadDelay: Duration = .zero, loadAnswers: [String] = [],
+    sticky: (offset: Int, body: String)? = nil
   ) {
+    self.loadAnswers = loadAnswers
+    self.sticky = sticky
     self.leaseSeconds = leaseSeconds
     self.loadDelay = loadDelay
     self.batches = batches
@@ -154,12 +162,17 @@ private actor GroupStreamServer: HTTPTransport {
         groupLoadAnswer.replacingOccurrences(
           of: #""streamPath":"#, with: #""leaseSeconds":\#($0),"streamPath":"#)
       }
+      if !loadAnswers.isEmpty { return reply(loadAnswers.removeFirst(), request: request) }
       return reply(answer ?? groupLoadAnswer, request: request)
     case ("GET", let path) where path.hasPrefix("/streams/"):
       streamURLs.append(request.url!)
       if goneReads > 0 {
         goneReads -= 1
         return reply("gone", request: request, status: goneStatus)
+      }
+      if let sticky = stickyBatch(for: request) {
+        return reply(
+          sticky.body, request: request, headers: ["stream-next-offset": "\(sticky.offset + 1)"])
       }
       guard let body = takeBatch() else {
         try await Task.sleep(for: .seconds(3_600))
@@ -191,6 +204,12 @@ private actor GroupStreamServer: HTTPTransport {
       HTTPURLResponse(
         url: request.url!, statusCode: 200, httpVersion: nil,
         headerFields: ["Content-Type": "text/event-stream"])!)
+    if let sticky = stickyBatch(for: request) {
+      try await onBytes(Data("event: data\ndata: \(sticky.body)\n\n".utf8))
+      try await onBytes(
+        Data("event: control\ndata: {\"streamNextOffset\":\"\(sticky.offset + 1)\"}\n\n".utf8))
+      return
+    }
     guard let body = takeBatch() else {
       try await Task.sleep(for: .seconds(3_600))
       throw CancellationError()
@@ -199,6 +218,15 @@ private actor GroupStreamServer: HTTPTransport {
     try await onBytes(Data("event: data\ndata: \(body)\n\n".utf8))
     try await onBytes(
       Data("event: control\ndata: {\"streamNextOffset\":\"\(nextOffset)\"}\n\n".utf8))
+  }
+
+  private func stickyBatch(for request: URLRequest) -> (offset: Int, body: String)? {
+    guard let sticky,
+      let offset = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+        .queryItems?.first(where: { $0.name == "offset" })?.value.flatMap(Int.init),
+      offset <= sticky.offset
+    else { return nil }
+    return sticky
   }
 
   private func takeBatch() -> String? {
@@ -686,6 +714,76 @@ struct CircuitsSubsetGroupSourceTests {
       }
       #expect(await server.releases.count == 1)
     }
+  }
+
+  /// OTTO-11131: a group that detached on the engine dropped output, then reattached behind a
+  /// must-refetch marker. The session applies nothing from the batch that carries it and ends
+  /// with `mustRefetch`, so the caller loads the group again and replaces its rows with the new
+  /// snapshot.
+  @Test(arguments: [LiveReadMode.longPoll, .sse])
+  func aMustRefetchMarkerEndsTheSessionForASnapshotReload(mode: LiveReadMode) async throws {
+    // The marker sits at offset 10, where the first load's frontier is; a reader that resumed
+    // from there would read it again. The reload answers a later frontier and other rows.
+    let marker =
+      #"[{"type":"public.record","key":"1","value":{"id":"1","title":"before the gap"},"#
+      + #""headers":{"operation":"update","lsn":"0/20"}},"#
+      + #"{"type":"__circuits.control","key":"must-refetch","value":{"control":"must-refetch","#
+      + #""reason":"group-detached","groupId":"shape/group-7","#
+      + #""resumeLsn":"0/18","throughLsn":"0/40"},"#
+      + #""headers":{"operation":"control","last":true}}]"#
+    let reloadAnswer = groupLoadAnswer
+      .replacingOccurrences(
+        of: #""offset":"10","lsn":"0/10""#, with: #""offset":"20","lsn":"0/40""#)
+      .replacingOccurrences(of: #""horizon":"0/15""#, with: #""horizon":"0/45""#)
+      .replacingOccurrences(
+        of: #""snapshot":"100:110:""#, with: #""snapshot":"130:140:""#)
+      .replacingOccurrences(
+        of: #"{"id":"2","person":"Grace"}"#, with: #"{"id":"3","person":"Linus"}"#)
+    let server = GroupStreamServer(
+      batches: [], loadAnswers: [groupLoadAnswer, reloadAnswer], sticky: (offset: 10, body: marker))
+    let store = InMemoryCollectionGroupStore()
+    let id = CollectionMaterializationID(rawValue: "scope-1")
+    let identity = threeTableDemand().identity(scope: groupScope)
+    let applied = GroupBatchLog()
+    let session = try await makeSource(server, mode: mode).materialize(
+      threeTableDemand(), materializationID: id)
+    try await store.replaceGroupSnapshot(session.snapshot, materializationID: id, demand: identity)
+    await #expect(
+      throws: CircuitsSubsetGroupSourceError.mustRefetch(
+        groupID: "shape/group-7", resumeLSN: "0/18")
+    ) {
+      try await session.run { batch in
+        try await store.applyGroup(batch, to: id)
+        await applied.append(batch)
+      }
+    }
+    #expect(await applied.batches.isEmpty, "a batch carrying the marker must not be applied")
+    #expect(
+      await server.releases.count == 1, "a session that ends at the marker releases its claim")
+
+    // The reload: a second load under the same subscription, whose snapshot and frontier replace
+    // the rows and the cursor, reading on past the marker.
+    let reloaded = try await makeSource(server, mode: mode).materialize(
+      threeTableDemand(), materializationID: id)
+    try await store.replaceGroupSnapshot(reloaded.snapshot, materializationID: id, demand: identity)
+    #expect(await server.loads.count == 2)
+    let subscriptions = await server.loads.map(\.subscription)
+    #expect(subscriptions == ["scope-1", "scope-1"])
+    #expect(reloaded.snapshot.cursor?.offset == "20")
+    #expect(
+      await store.rows(
+        in: assignments.id, scope: groupScope, as: GroupAssignment.self, key: String.self)
+        == [
+          "1": GroupAssignment(id: "1", person: "Ada"),
+          "3": GroupAssignment(id: "3", person: "Linus"),
+        ])
+    let run = Task { try await reloaded.run { batch in try await store.applyGroup(batch, to: id) } }
+    await waitUntil { await server.streamURLs.count >= 2 }
+    let reread = try #require(await server.streamURLs.last)
+    #expect(
+      reread.query?.contains("offset=20") == true, "the reload must read on from its own frontier")
+    try await reloaded.stop()
+    try await run.value
   }
 
   @Test func envelopeForATableOutsideTheGroupFailsTheGroup() async throws {

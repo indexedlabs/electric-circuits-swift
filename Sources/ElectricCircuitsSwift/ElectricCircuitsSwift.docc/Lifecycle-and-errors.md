@@ -38,5 +38,9 @@ route are terminal.
 
 ``ClientError`` retains a public HTTP status/classification without server response data. ``StreamError``
 distinguishes terminal stream results, malformed data, cursor conflicts, and unavailable local
-materializers. Treat an unclassified failure as an application decision point rather than parsing
+materializers. ``StreamError/mustRefetch(path:control:)`` means a shape group's stream dropped output
+and carries a must-refetch marker: nothing from that batch was applied and the cursor did not move.
+The marker does not end the group the way a terminal result does, but a session that stops at it
+releases its claim: load the group again under the same subscription and replace both the rows and
+the cursor with the new load's snapshot and frontier, or the next read reaches the marker again. Treat an unclassified failure as an application decision point rather than parsing
 error strings or relying on undocumented retry behavior.

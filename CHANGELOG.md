@@ -5,6 +5,23 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 
 ## Unreleased
 
+- Add `StreamControl` and `ChangeBatch.controls`. A stream entry of type `__circuits.control` is
+  an instruction to the stream's readers, not a row change, and decodes into `controls`; it counts
+  against the per-batch event limit, and a batch that carries only a control is not empty.
+- A stream reader fails closed at any control: a must-refetch control with
+  `StreamError.mustRefetch(path:control:)`, before any materializer applies the batch that carries
+  it and without moving the cursor, whatever the materializer; any other control kind as
+  `StreamError.decoding`. The engine writes the marker when a
+  shape group that fell behind and detached reattaches (OTTO-11131); output before it is
+  incomplete. `CircuitsSubsetGroupSource` ends the session with
+  `CircuitsSubsetGroupSourceError.mustRefetch(groupID:resumeLSN:)`, and the caller loads the group
+  again and replaces its rows with the new snapshot.
+- Source-breaking: `StreamError` and `CircuitsSubsetGroupSourceError` each gain a case, so an
+  exhaustive `switch` over either needs one more arm. Under the pre-1.0 rule in
+  `Policies/SEMVER.md` that makes the next tag a minor bump (0.13.0).
+
+## 0.12.0
+
 - Add `LiveDelivery`, how a live batch reached the reader, for measuring time to data.
   `ShapeStreamReader` sets `LiveDelivery.current` around each live `ShapeMaterializer.apply`, so a
   materializer, or the store a source hands the batch to, can read it. It carries the live mode, the
@@ -14,6 +31,9 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   it to the envelopes their snapshot gate accepts, through `LiveDelivery.applying(changesAt:_:)`,
   and a batch they drop entirely doesn't count as the first. `EnvelopeHeaders.commitTimestamp`
   decodes the engine's `headers.commit_ts`. Readers and stores that don't read them are unchanged.
+
+## 0.11.0
+
 - Fix: setting up a group loaded its snapshot twice, once for the rows and again when its
   subscription started. `ShapeSubscriptionCoordinator(groupRequest:setupClaim:)` starts on the
   setup's load, and `CircuitsSubsetGroupSource` passes it, so setup makes one
