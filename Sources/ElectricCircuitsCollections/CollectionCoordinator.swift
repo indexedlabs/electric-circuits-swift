@@ -166,6 +166,10 @@ public actor CollectionCoordinator<
 
   /// Runs the stale pass for this collection and scope until the calling task is cancelled.
   /// The app owns that task and cancels and awaits it when retiring a scope or generation.
+  /// Generations of one principal and authorization share stored copies by `cacheKey` and cannot
+  /// be ordered, so a retiring generation's pass could re-read, rebind or remove a copy a newer
+  /// generation is live on. The app must therefore cancel and await a retiring generation's pass
+  /// before any newer generation's coordinator starts its own.
   /// The gate starts closed; the app opens it after first paint while foreground and online.
   /// At most two unheld demands are re-run concurrently, smallest claim count first.
   ///
@@ -1084,8 +1088,11 @@ public actor CollectionCoordinator<
 
   /// Removes an inactive cached materialization. Acquires that arrive while the store operation is
   /// in flight are fenced behind it and receive a fresh source attempt after it completes. Only a
-  /// copy still bound to this generation's demand is removed: once another generation's snapshot
-  /// has bound the copy, it is that generation's, and a retired generation's eviction leaves it.
+  /// copy still bound to this coordinator's demand (its generation included) is removed: once
+  /// another generation's snapshot has bound the copy, it is that generation's, and a retired
+  /// generation's eviction leaves it. A copy an earlier launch stored and this launch has not
+  /// loaded is bound to the earlier launch's demand, so this does nothing for it; remove such
+  /// copies through the store, as an app's age-based eviction does.
   public func evict(_ demand: CollectionDemand<Model>) async throws {
     let identity = demand.identity(for: definition, scope: scope, columns: source.columns)
     if let task = evictionTasks[identity.cacheKey] {
