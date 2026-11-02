@@ -114,7 +114,10 @@ struct CollectionCacheKeyTests {
     let none = demand.identity(for: cacheRows, scope: scope(), columns: [])
     #expect(Set([all.cacheKey, star.cacheKey, none.cacheKey]).count == 3)
     // Every column keeps the storage key a demand had before columns were part of it.
-    #expect(all.storageKey.split(separator: "|").count == 5)
+    let fiveComponents = ["record", "user", "space", "launch-1", all.canonicalDemand]
+      .map { "\($0.utf8.count):\($0)" }
+      .joined(separator: "|")
+    #expect(all.storageKey == fiveComponents)
     #expect(all.storageKey != star.storageKey)
   }
 
