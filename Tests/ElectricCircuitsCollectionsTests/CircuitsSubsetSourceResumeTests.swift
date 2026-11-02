@@ -332,14 +332,19 @@ struct CircuitsSubsetSourceResumeTests {
     try await lease.release()
   }
 
-  @Test func aTerminalFirstResumedReadSnapshotsInTheSameAttempt() async throws {
+  /// A stored cursor the engine no longer serves is an ordinary reseed: the first resumed read's
+  /// terminal answer (410) stops the re-joined feed and the same attempt snapshots, so the lease
+  /// never fails and needs no refresh. Any other non-retryable refusal that is not an
+  /// authentication one (400) is a refused cursor too.
+  @Test(arguments: [410, 400])
+  func aRefusedFirstResumedReadSnapshotsInTheSameAttempt(status: Int) async throws {
     let transport = ResumeFeedTransport(queryBodies: [
       #"{"rows":[{"id":1,"title":"One"},{"id":3,"title":"Three"}],"lsn":"0/10"}"#,
       #"{"rows":[{"id":1,"title":"Fresh"}],"lsn":"0/40"}"#,
     ])
     let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
     _ = try await seedBySnapshot(transport, store: store)
-    await transport.script("shape-1", [.status(410)])
+    await transport.script("shape-1", [.status(status)])
 
     let lease = await relaunch(transport, store: store).acquire(openIssues)
     #expect(await eventually { await lease.state() == .live })
