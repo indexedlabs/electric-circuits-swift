@@ -152,6 +152,13 @@ public actor CollectionCoordinator<
   // this coordinator. These IDs are excluded when deciding whether a screen holds the demand.
   private var staleLeaseIDs: [CollectionMaterializationID: UUID] = [:]
 
+  /// Precondition: before a coordinator for a newer generation of the same principal and
+  /// authorization is created, every coordinator of the retiring generation has released its
+  /// leases and its stale pass has been cancelled and awaited. Generations share stored copies by
+  /// `cacheKey` and cannot be ordered, and a copy has one cursor: two generations live on one copy
+  /// at once would fail the older lease on its next batch, and a retiring generation's stale pass
+  /// could re-read, rebind or remove the copy the newer generation is live on. This precondition
+  /// rules both out. The coordinator does not enforce it; the app does.
   public init(
     definition: CollectionDefinition<Model, Key>,
     scope: CollectionScope,
@@ -166,10 +173,11 @@ public actor CollectionCoordinator<
 
   /// Runs the stale pass for this collection and scope until the calling task is cancelled.
   /// The app owns that task and cancels and awaits it when retiring a scope or generation.
-  /// Generations of one principal and authorization share stored copies by `cacheKey` and cannot
-  /// be ordered, so a retiring generation's pass could re-read, rebind or remove a copy a newer
-  /// generation is live on. The app must therefore cancel and await a retiring generation's pass
-  /// before any newer generation's coordinator starts its own.
+  /// Precondition (see `init`): a retiring generation releases its leases and cancels and awaits
+  /// this pass before a newer generation's coordinator is created. Generations of one principal
+  /// and authorization share stored copies by `cacheKey` and cannot be ordered, so a retiring
+  /// generation's pass could otherwise re-read, rebind or remove a copy a newer generation is live
+  /// on, and two generations live on one copy at once would fail the older lease on its next batch.
   /// The gate starts closed; the app opens it after first paint while foreground and online.
   /// At most two unheld demands are re-run concurrently, smallest claim count first.
   ///
@@ -181,7 +189,9 @@ public actor CollectionCoordinator<
   /// Claims released is the net decrease in the materialization's claims: for `refreshed`,
   /// max(0, claimCount read with the mark before the run - rows the snapshot returned).
   /// A run that both drops and gains rows reports only the net. For `unrebuildable`, it is
-  /// the claimCount read with the mark; for `held` and `failed`, it is zero.
+  /// the claimCount read with the mark; for `held`, zero; for `failed`, zero. When a `held` or
+  /// `refreshed` run finds the marked copy is not the copy it held or re-read (a second copy
+  /// under the key) and removes it, it is the claimCount read with the mark.
   public func startStaleRevalidation(
     clock: any ShapeSubscriptionClock = ContinuousShapeSubscriptionClock(),
     telemetry: TelemetryReporter = .noop

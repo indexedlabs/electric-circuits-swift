@@ -42,10 +42,13 @@ the copy. A mark clears only when the copy the pass held or re-read is the marke
 principals and authorization scopes are excluded.
 Idle listings run every five seconds; opening the gate, local snapshot/feed writes, completed
 runs and retry expiry wake the pass immediately. Cancel and await the task when
-retiring its scope or generation, and do so before any newer generation's coordinator starts its
-pass: generations of one principal and authorization share stored copies by `cacheKey` and cannot
-be ordered, so a retiring generation's pass could otherwise re-read, rebind or remove a copy a newer
-generation is live on. The store protocol is unchanged in 0.7.1.
+retiring its scope or generation. Precondition: a retiring generation releases its leases and
+cancels and awaits its stale pass before a newer generation's coordinator is created. Generations
+of one principal and authorization share stored copies by `cacheKey` and cannot be ordered, and a
+copy has one cursor, so two generations live on one copy at once would fail the older lease on its
+next batch, and a retiring generation's pass could re-read, rebind or remove a copy a newer
+generation is live on. The precondition rules both out; the app enforces it. The store protocol is
+unchanged in 0.7.1.
 
 For app-wide scheduling across collections, await `drainStaleRevalidation()` before opening the
 next collection's gate or starting an explicit repair read. Drain closes admission and lets

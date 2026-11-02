@@ -23,10 +23,14 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 - The coordinator's stale pass re-reads a copy an earlier generation stored under its own
   `cacheKey` and clears its mark; it no longer removes the copy it refreshed. It clears a mark only
   when the copy it held or re-read is the marked copy, and removes a second copy under the key
-  instead. Eviction fences are keyed by `cacheKey`. Generations share copies and cannot be
-  ordered, so a retiring generation's stale pass must be cancelled and awaited before a newer
-  generation's coordinator starts its pass; otherwise it could re-read, rebind or remove a copy
-  the newer generation is live on.
+  instead, reporting that copy's claim count as `sync.claims_released`. Eviction fences are keyed
+  by `cacheKey`.
+- Precondition, stated on `CollectionCoordinator.init` and `startStaleRevalidation`: a retiring
+  generation releases its leases and cancels and awaits its stale pass before a newer generation's
+  coordinator is created. Generations share copies and cannot be ordered, and a copy has one
+  cursor, so two generations live on one copy at once would fail the older lease on its next
+  batch, and a retiring generation's pass could re-read, rebind or remove a copy the newer
+  generation is live on. The app enforces the precondition; the coordinator does not.
 - `evict(_:)` removes a copy only while it is still bound to the calling coordinator's demand,
   generation included, so a retired generation's eviction leaves a copy a newer generation has
   bound. It therefore does nothing for a copy an earlier launch stored and this launch has not
