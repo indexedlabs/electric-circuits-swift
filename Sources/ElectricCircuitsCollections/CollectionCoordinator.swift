@@ -534,6 +534,8 @@ public actor CollectionCoordinator<
       // The copy may have been stored by an earlier generation. This generation's demand for it
       // has the same `cacheKey`, so it finds the same copy and its snapshot replaces that copy's
       // claims in place; the pass then clears the mark and never removes the copy it refreshed.
+      // A mark clears only when the copy held or re-read is the marked copy. A second copy under
+      // the same key, which a provider should never keep, is removed instead.
       let storedIdentity = mark.record.demand
       let activeIdentity = CollectionDemandIdentity(
         collection: storedIdentity.collection, scope: scope,
@@ -541,7 +543,12 @@ public actor CollectionCoordinator<
       if let entry = entries[activeIdentity], !entry.leases.isEmpty, entry.state == .live,
         activeIdentity.cacheKey == storedIdentity.cacheKey
       {
-        try await store.clearStale(id, ifMarkedAt: mark.markedAt)
+        if entry.materializationID == id {
+          try await store.clearStale(id, ifMarkedAt: mark.markedAt)
+        } else {
+          try await removeStaleMaterialization(storedIdentity, copy: id)
+          claimsReleased = mark.claimCount
+        }
         outcome = "held"
       } else if let demand = definition.rebuildDemand?(storedIdentity),
         demand.identity(for: definition, scope: scope, columns: source.columns) == activeIdentity,
@@ -550,16 +557,22 @@ public actor CollectionCoordinator<
         let lease = acquire(demand)
         staleLeaseIDs[id] = lease.id
         rowsReturned = try await staleSnapshotRowCount(for: lease, identity: activeIdentity)
+        let refreshedID = entries[activeIdentity]?.materializationID
         guard stalePassMayRun(token) else { throw CancellationError() }
         attemptedRelease = true
         try await lease.release()
         staleLeaseIDs.removeValue(forKey: id)
         guard stalePassMayRun(token) else { throw CancellationError() }
-        try await store.clearStale(id, ifMarkedAt: mark.markedAt)
+        if refreshedID == id {
+          try await store.clearStale(id, ifMarkedAt: mark.markedAt)
+          claimsReleased = max(0, mark.claimCount - rowsReturned)
+        } else {
+          try await removeStaleMaterialization(storedIdentity, copy: id)
+          claimsReleased = mark.claimCount
+        }
         outcome = "refreshed"
-        claimsReleased = max(0, mark.claimCount - rowsReturned)
       } else {
-        try await removeStaleMaterialization(storedIdentity)
+        try await removeStaleMaterialization(storedIdentity, copy: id)
         outcome = "unrebuildable"
         claimsReleased = mark.claimCount
       }
@@ -584,14 +597,16 @@ public actor CollectionCoordinator<
     }
   }
 
-  private func removeStaleMaterialization(_ identity: CollectionDemandIdentity) async throws {
+  private func removeStaleMaterialization(
+    _ identity: CollectionDemandIdentity, copy: CollectionMaterializationID
+  ) async throws {
     // Fence removal by the stored copy's key, so a demand acquired meanwhile waits for it and
     // then loads afresh rather than binding the copy being removed.
     let removal: Task<Void, Error>
     if let existing = evictionTasks[identity.cacheKey] {
       removal = existing
     } else {
-      removal = Task { try await self.performEviction(identity) }
+      removal = Task { try await self.performEviction(identity, copy: copy) }
       evictionTasks[identity.cacheKey] = removal
     }
     try await removal.value
@@ -1068,7 +1083,9 @@ public actor CollectionCoordinator<
   }
 
   /// Removes an inactive cached materialization. Acquires that arrive while the store operation is
-  /// in flight are fenced behind it and receive a fresh source attempt after it completes.
+  /// in flight are fenced behind it and receive a fresh source attempt after it completes. Only a
+  /// copy still bound to this generation's demand is removed: once another generation's snapshot
+  /// has bound the copy, it is that generation's, and a retired generation's eviction leaves it.
   public func evict(_ demand: CollectionDemand<Model>) async throws {
     let identity = demand.identity(for: definition, scope: scope, columns: source.columns)
     if let task = evictionTasks[identity.cacheKey] {
@@ -1084,9 +1101,17 @@ public actor CollectionCoordinator<
     try await task.value
   }
 
-  private func performEviction(_ identity: CollectionDemandIdentity) async throws {
+  /// Removes the copy `identity` names, only while the store still binds it to exactly `identity`
+  /// (generation included). With `copy`, only that materialization is removed: when the key finds
+  /// another copy or none, `copy` is a copy under the key that no lookup reaches.
+  private func performEviction(
+    _ identity: CollectionDemandIdentity, copy: CollectionMaterializationID? = nil
+  ) async throws {
     do {
-      if let record = try await store.materialization(for: identity) {
+      let record = try await store.materialization(for: identity)
+      if let copy, record?.id != copy {
+        try await store.removeMaterialization(copy)
+      } else if let record, record.demand == identity {
         try await store.removeMaterialization(record.id)
       }
       finishEviction(identity)

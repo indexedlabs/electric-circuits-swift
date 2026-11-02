@@ -21,8 +21,11 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   rows across generations of one principal and authorization. The shared store suite adds
   `laterGenerationBindsTheEarlierCopy`.
 - The coordinator's stale pass re-reads a copy an earlier generation stored under its own
-  `cacheKey` and clears its mark; it no longer removes the copy it refreshed. Eviction fences are
-  keyed by `cacheKey`.
+  `cacheKey` and clears its mark; it no longer removes the copy it refreshed. It clears a mark only
+  when the copy it held or re-read is the marked copy, and removes a second copy under the key
+  instead. Eviction fences are keyed by `cacheKey`, and `evict(_:)` and the pass's removals remove a
+  copy only while it is still bound to the demand they looked it up with, so a retired
+  generation never removes a copy a newer generation has bound.
 - `CircuitsSubsetSource` and `CircuitsSubsetGroupSource` name each server subscription from the
   materialization ID plus the scope's generation (the ID, a dot and a 16-digit digest of the
   generation), so a launch never joins a subscription an earlier launch opened.

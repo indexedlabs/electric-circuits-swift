@@ -195,4 +195,47 @@ struct CollectionCacheKeyTests {
     try await second.release()
     #expect(try await store.materialization(for: requests[1].identity) == record)
   }
+
+  @Test func evictingFromARetiredGenerationLeavesTheNewerLiveCopy() async throws {
+    let store = InMemoryCollectionStore<CacheRow, Int>(key: \.id)
+    let source = LaunchSource(snapshots: [[1, 2], [2, 3]])
+    let demand = CollectionDemand<CacheRow>(unsafePredicateIdentity: "day=1")
+    let retired = CollectionCoordinator(
+      definition: cacheRows, scope: scope(generation: "launch-1"), source: source, store: store)
+    let current = CollectionCoordinator(
+      definition: cacheRows, scope: scope(generation: "launch-2"), source: source, store: store)
+    let first = await retired.acquire(demand)
+    _ = await states(of: first, until: .live)
+    try await first.release()
+    let live = await current.acquire(demand)
+    _ = await states(of: live, until: .live)
+    let requests = await source.requests
+    let id = requests[1].materializationID
+    #expect(id == requests[0].materializationID)
+
+    // The retired generation holds no lease, so eviction is allowed, but the copy is now bound
+    // to the newer generation's demand and stays.
+    try await retired.evict(demand)
+
+    let record = try #require(try await store.materialization(for: requests[1].identity))
+    #expect(record.id == id)
+    #expect(record.demand == requests[1].identity)
+    #expect(await store.rowClaims(for: id) == [2, 3])
+    #expect(Set(await store.rows().keys) == [2, 3])
+    // The newer generation's next batch still applies to its copy.
+    try await store.apply(
+      .init(
+        changes: [.upsert(CacheRow(id: 4), sourceVersion: .init(rawValue: "0/3", order: 3))],
+        expectedCursor: record.cursor, cursor: .init(offset: "3"),
+        sourceVersion: .init(rawValue: "0/3", order: 3)),
+      to: id)
+    #expect(await store.rowClaims(for: id) == [2, 3, 4])
+    #expect(await live.state() == .live)
+
+    // The generation the copy is bound to can still evict it once its lease is gone.
+    try await live.release()
+    try await current.evict(demand)
+    #expect(try await store.materialization(for: requests[1].identity) == nil)
+    #expect(await store.rows().isEmpty)
+  }
 }

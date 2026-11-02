@@ -144,6 +144,10 @@ private actor StaleStore: CollectionStore {
   }
 
   let base = InMemoryCollectionStore<StaleRow, Int>(key: \.id)
+  /// Once `shadowLookups()` is called, lookups and writes reach this store, so a key's marked
+  /// copy in `base` and the copy a lease holds here are two copies under one `cacheKey`.
+  let shadow = InMemoryCollectionStore<StaleRow, Int>(key: \.id)
+  private var shadowing = false
   let source: StaleSource
   private(set) var clears: [Clear] = []
   private(set) var removals: [CollectionMaterializationID] = []
@@ -151,6 +155,8 @@ private actor StaleStore: CollectionStore {
   private var listingFailures = 0
 
   func failListings(_ count: Int) { listingFailures = count }
+  func shadowLookups() { shadowing = true }
+  private var current: InMemoryCollectionStore<StaleRow, Int> { shadowing ? shadow : base }
   private struct ListingFailure: Error {}
 
   init(source: StaleSource) { self.source = source }
@@ -158,7 +164,7 @@ private actor StaleStore: CollectionStore {
   func materialization(for demand: CollectionDemandIdentity) async throws
     -> CollectionMaterializationRecord?
   {
-    try await base.materialization(for: demand)
+    try await current.materialization(for: demand)
   }
 
   func staleMaterializations() async throws -> [CollectionStaleMaterialization] {
@@ -187,13 +193,14 @@ private actor StaleStore: CollectionStore {
     _ snapshot: CollectionSnapshot<StaleRow>, materializationID: CollectionMaterializationID,
     demand: CollectionDemandIdentity
   ) async throws {
-    try await base.replaceSnapshot(snapshot, materializationID: materializationID, demand: demand)
+    try await current.replaceSnapshot(
+      snapshot, materializationID: materializationID, demand: demand)
   }
 
   func apply(
     _ batch: CollectionChangeBatch<StaleRow, Int>, to materializationID: CollectionMaterializationID
   ) async throws {
-    try await base.apply(batch, to: materializationID)
+    try await current.apply(batch, to: materializationID)
   }
 
   func removeMaterialization(_ materializationID: CollectionMaterializationID) async throws {
@@ -1330,6 +1337,50 @@ struct CollectionCoordinatorStalePassTests {
       #expect(await current.store.removals.isEmpty)
       #expect(await current.store.base.rows().isEmpty)
       #expect(try await current.marks().isEmpty)
+    }
+    await old.telemetry.shutdown()
+  }
+
+  @Test(arguments: [true, false])
+  func secondCopyUnderOneKeyIsRemovedNotCleared(held: Bool) async throws {
+    let old = StaleFixture()
+    try await old.mark()
+    // A provider holding two copies under one key: this launch's lookups reach another copy.
+    await old.store.shadowLookups()
+    let current = StaleFixture(
+      scope: .init(principal: "user", authorization: "authorized", generation: "next-launch"),
+      source: old.source, store: old.store)
+    let screen: CollectionLease?
+    if held {
+      screen = await current.coordinator.acquire(current.demand("one"))
+      try #require(try await current.eventually { await current.source.requests.count == 1 })
+      await current.source.succeed(0)
+      try #require(try await current.eventually { await screen?.state() == .live })
+    } else {
+      screen = nil
+    }
+    try await current.withPass {
+      if !held {
+        try #require(
+          try await current.eventually(advancingClock: false) {
+            await current.source.requests.count == 1
+          })
+        await current.source.succeed(0)
+      }
+      try #require(
+        try await current.eventually(advancingClock: false) {
+          await current.store.removals == [old.id("one")]
+        })
+      // The mark belonged to a copy the pass neither held nor re-read, so it was not cleared.
+      #expect(await current.store.clears.isEmpty)
+      let other = await current.source.requests[0].materializationID
+      #expect(other != old.id("one"))
+      #expect(try await current.store.materialization(for: current.identity("one"))?.id == other)
+      #expect(try await current.marks().isEmpty)
+      #expect(await current.store.base.rowClaims(for: old.id("one")).isEmpty)
+      try await current.expectSpans(
+        [held ? "held" : "refreshed"], released: ["1"], returned: ["0"])
+      try await screen?.release()
     }
     await old.telemetry.shutdown()
   }
