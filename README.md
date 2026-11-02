@@ -35,12 +35,20 @@ only while foreground and online. The pass shares ordinary leases, re-runs at mo
 subscriptions at a time (smallest first), and retries failures with capped backoff. Held leases,
 including leases retained by the app's warm pool, clear without another request. A missing
 rebuilder, a nil result, or a rebuilt demand with a different normalized identity removes the
-stale materialization. Earlier-launch marks in the same principal and authorization are rebuilt
-in the current generation; after successful replacement, the old materialization is removed so
-its claims cannot retain stale rows. Other principals and authorization scopes are excluded.
+stale materialization. A mark an earlier launch's copy carries, in the same principal and
+authorization, is re-read under that copy's own `cacheKey`: this generation's demand finds the
+same copy, its snapshot replaces the copy's claims in place, and the pass clears the mark and keeps
+the copy. A mark clears only when the copy the pass held or re-read is the marked one. Other
+principals and authorization scopes are excluded.
 Idle listings run every five seconds; opening the gate, local snapshot/feed writes, completed
 runs and retry expiry wake the pass immediately. Cancel and await the task when
-retiring its scope or generation. The store protocol is unchanged in 0.7.1.
+retiring its scope or generation. Precondition: a retiring generation releases its leases and
+cancels and awaits its stale pass before a newer generation's coordinator is created. Generations
+of one principal and authorization share stored copies by `cacheKey` and cannot be ordered, and a
+copy has one cursor, so two generations live on one copy at once would fail the older lease on its
+next batch, and a retiring generation's pass could re-read, rebind or remove a copy a newer
+generation is live on. The precondition rules both out; the app enforces it. The store protocol is
+unchanged in 0.7.1.
 
 For app-wide scheduling across collections, await `drainStaleRevalidation()` before opening the
 next collection's gate or starting an explicit repair read. Drain closes admission and lets
@@ -83,6 +91,17 @@ these fields retain LSN positioning; an unparseable or missing feed txid also us
 below the horizon. It renews the same subset-feed claim through
 `ShapeSubscriptionCoordinator`, and the producer cannot advance its local cursor until the consumer's
 atomic store callback returns.
+
+Each demand has two keys. `CollectionDemandIdentity.cacheKey` names the stored copy: the
+principal, authorization, collection, canonical predicate, order, limit and the source's columns
+(`*` for every column), never the scope's generation. A `CollectionStore` keeps one
+materialization per `cacheKey`, so a later launch's demand finds the copy an earlier launch stored
+and its snapshot replaces that copy's claims in place; the stale pass re-reads a marked copy under
+its own key and clears the mark. `storageKey` adds the generation and names the in-memory lease, so
+two launches never share one. Each source names its server subscription from the materialization ID
+plus the generation, so the stored copy's ID is stable while every launch opens its own
+subscription. A `CollectionGroupMember`'s `identity(scope:)` has the `cacheKey` of the
+single-table demand for the same collection, predicate and columns.
 
 ```swift
 let definition = CollectionDefinition<Issue, Int64>(
@@ -136,9 +155,9 @@ let demand = CollectionGroupDemand(members: [
     predicate: AssignmentFields.recordID == recordID,
     decodeRow: Assignment.init(row:), decodeKey: { $0 }),
 ])
-let session = try await groupSource.materialize(demand, materializationID: id)
-try await store.replaceGroupSnapshot(
-  session.snapshot, materializationID: id, demand: demand.identity(scope: scope))
+let identity = demand.identity(scope: scope)
+let session = try await groupSource.materialize(demand, identity: identity, materializationID: id)
+try await store.replaceGroupSnapshot(session.snapshot, materializationID: id, demand: identity)
 try await session.run { batch in try await store.applyGroup(batch, to: id) }
 ```
 

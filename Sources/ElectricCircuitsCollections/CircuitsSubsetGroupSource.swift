@@ -45,8 +45,9 @@ public struct CollectionGroupSourceSession: Sendable {
 /// group's handle, its snapshot of every member and the stream frontier, and one subscription
 /// then reads the group's one stream. Each envelope goes to its member by its `type`, rows are
 /// keyed by table and key, and every stream batch reaches the store as one transaction with the
-/// group's one cursor. A refused member, a `503` or a broken stream fails the whole group. A stable
-/// materialization ID is also the server subscription claim.
+/// group's one cursor. A refused member, a `503` or a broken stream fails the whole group. The
+/// server subscription claim is the materialization ID plus the identity's generation, as in
+/// `CircuitsSubsetSource`, so a launch never joins a subscription an earlier launch opened.
 public struct CircuitsSubsetGroupSource: Sendable {
   private let client: ElectricCircuitsClient
   private let transport: any HTTPTransport
@@ -81,6 +82,7 @@ public struct CircuitsSubsetGroupSource: Sendable {
 
   public func materialize(
     _ demand: CollectionGroupDemand,
+    identity: CollectionGroupDemandIdentity,
     materializationID: CollectionMaterializationID
   ) async throws -> CollectionGroupSourceSession {
     try await pendingCleanup.retry(materializationID)
@@ -91,7 +93,7 @@ public struct CircuitsSubsetGroupSource: Sendable {
         SubsetGroupMember(
           table: $0.table, where: $0.sourcePredicate, columns: $0.columns, key: $0.table)
       },
-      subscription: materializationID.rawValue)
+      subscription: materializationID.subscription(generation: identity.scope.generation))
     // The lease begins somewhere inside the load, so its age counts from before the request.
     let loadStarted = ContinuousClock.now
     let load = try await recreatePolicy.recreatingOnGone(clock: clock) {

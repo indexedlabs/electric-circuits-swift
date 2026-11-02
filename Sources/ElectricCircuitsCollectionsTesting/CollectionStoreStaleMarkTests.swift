@@ -278,6 +278,33 @@ public struct CollectionStoreStaleMarkTests<Store: CollectionStore>: Sendable {
     try await expectMarks(store, owners: ["push"], at: 10)
   }
 
+  /// One materialization per `cacheKey`: a later generation's demand finds the copy an earlier
+  /// generation stored, and its snapshot replaces that copy's claims in place.
+  public func laterGenerationBindsTheEarlierCopy() async throws {
+    let store = try await makeStore()
+    let earlier = demand("deck")
+    let later = CollectionDemand<Store.Model>(unsafePredicateIdentity: "deck")
+      .identity(
+        for: definition,
+        scope: .init(
+          principal: scope.principal, authorization: scope.authorization,
+          generation: scope.generation + "-later"))
+    #expect(later.cacheKey == earlier.cacheKey)
+    try await snapshot(store, "deck", rows: [1, 2])
+    let stored = try #require(try await store.materialization(for: later))
+    #expect(stored.id == id("deck"))
+
+    try await snapshot(store, "deck", rows: [2], at: 10, demand: later)
+
+    let record = try #require(try await store.materialization(for: later))
+    #expect(record.id == id("deck"))
+    #expect(record.demand == later)
+    #expect(try await store.materialization(for: earlier) == record)
+    #expect(try await claimedKeys(store, id("deck")) == [key(2)])
+    #expect(try await storedKeys(store, later) == [key(2)])
+    #expect(try await store.staleMaterializations().isEmpty)
+  }
+
   private func id(_ owner: String) -> CollectionMaterializationID {
     .init(rawValue: owner)
   }

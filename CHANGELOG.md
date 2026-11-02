@@ -5,6 +5,45 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 
 ## Unreleased
 
+- One cache key per stored copy (OTTO-11415). `CollectionDemandIdentity.cacheKey` is framed from
+  the principal, authorization, collection, canonical demand (predicate, order and limit) and
+  columns (`*` for every column), never the generation; `storageKey` keeps the generation and
+  names the in-memory lease. `CollectionDemandIdentity` gains optional `columns`, which
+  `CollectionDemand.identity(for:scope:columns:)` and the new `CollectionSourceAdapter.columns`
+  (nil by default; `CircuitsSubsetSource` reports its own) fill in; an identity persisted before
+  decodes with every column, and its `storageKey` is unchanged.
+  `CollectionGroupMember.identity(scope:)` gives each table of a group the identity, and so the
+  `cacheKey`, of the single-table demand for it, and `CollectionGroupDemandIdentity.cacheKey` is
+  the group's key without the generation.
+- `CollectionStore.materialization(for:)` finds a copy by `cacheKey`, and a provider keeps one
+  materialization per key: a later generation's snapshot rebinds that copy to its demand and
+  replaces its claims in place. `InMemoryCollectionStore` keys records by `cacheKey` and shares
+  rows across generations of one principal and authorization. The shared store suite adds
+  `laterGenerationBindsTheEarlierCopy`.
+- The coordinator's stale pass re-reads a copy an earlier generation stored under its own
+  `cacheKey` and clears its mark; it no longer removes the copy it refreshed. It clears a mark only
+  when the copy it held or re-read is the marked copy, and removes a second copy under the key
+  instead, reporting that copy's claim count as `sync.claims_released`. Eviction fences are keyed
+  by `cacheKey`.
+- Precondition, stated on `CollectionCoordinator.init` and `startStaleRevalidation`: a retiring
+  generation releases its leases and cancels and awaits its stale pass before a newer generation's
+  coordinator is created. Generations share copies and cannot be ordered, and a copy has one
+  cursor, so two generations live on one copy at once would fail the older lease on its next
+  batch, and a retiring generation's pass could re-read, rebind or remove a copy the newer
+  generation is live on. The app enforces the precondition; the coordinator does not.
+- `evict(_:)` removes a copy only while it is still bound to the calling coordinator's demand,
+  generation included, so a retired generation's eviction leaves a copy a newer generation has
+  bound. It therefore does nothing for a copy an earlier launch stored and this launch has not
+  loaded; an app removes those through the store, as its age-based eviction does.
+- `CircuitsSubsetSource` and `CircuitsSubsetGroupSource` name each server subscription from the
+  materialization ID plus the scope's generation (the ID, a dot and a 16-digit digest of the
+  generation), so a launch never joins a subscription an earlier launch opened.
+- Source-breaking: `CircuitsSubsetGroupSource.materialize` takes the group's `identity:`, whose
+  generation names the subscription. Under the pre-1.0 rule in `Policies/SEMVER.md` that makes the
+  next tag a minor bump (0.14.0).
+
+## 0.13.0
+
 - Add `StreamControl` and `ChangeBatch.controls`. A stream entry of type `__circuits.control` is
   an instruction to the stream's readers, not a row change, and decodes into `controls`; it counts
   against the per-batch event limit, and a batch that carries only a control is not empty.
@@ -17,8 +56,8 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   `CircuitsSubsetGroupSourceError.mustRefetch(groupID:resumeLSN:)`, and the caller loads the group
   again and replaces its rows with the new snapshot.
 - Source-breaking: `StreamError` and `CircuitsSubsetGroupSourceError` each gain a case, so an
-  exhaustive `switch` over either needs one more arm. Under the pre-1.0 rule in
-  `Policies/SEMVER.md` that makes the next tag a minor bump (0.13.0).
+  exhaustive `switch` over either needs one more arm, a minor bump under the pre-1.0 rule in
+  `Policies/SEMVER.md`.
 
 ## 0.12.0
 

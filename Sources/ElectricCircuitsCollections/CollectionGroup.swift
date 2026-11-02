@@ -48,6 +48,17 @@ public struct CollectionGroupMember: Sendable {
       sourcePredicate: predicate.circuitsPredicate, columns: columns, decodeRow: decodeRow,
       decodeKey: decodeKey)
   }
+
+  /// This table's demand identity: the identity of a single-table demand for the same collection,
+  /// predicate and columns with no order and no limit, so the two share one `cacheKey` and one
+  /// stored copy.
+  public func identity(scope: CollectionScope) -> CollectionDemandIdentity {
+    CollectionDemandIdentity(
+      collection: collection, scope: scope,
+      canonicalDemand: CollectionDemand<Never>(unsafePredicateIdentity: predicateIdentity)
+        .canonicalIdentity(),
+      columns: columns)
+  }
 }
 
 /// Several tables loaded as one shape group: one subscription, one stream and one cursor. A
@@ -91,9 +102,19 @@ public struct CollectionGroupDemandIdentity: Codable, Equatable, Hashable, Senda
     self.canonicalDemand = canonicalDemand
   }
 
-  /// Length-prefixed, like `CollectionDemandIdentity.storageKey`.
+  /// Length-prefixed, like `CollectionDemandIdentity.storageKey`. It includes the generation and
+  /// names the in-memory lease.
   public var storageKey: String {
     [scope.principal, scope.authorization, scope.generation, canonicalDemand]
+      .map { "\($0.utf8.count):\($0)" }
+      .joined(separator: "|")
+  }
+
+  /// The group's demand without the generation, like `CollectionDemandIdentity.cacheKey`: every
+  /// launch's load of the same group has the same key. Each table's stored copy has its own key,
+  /// from `CollectionGroupMember.identity(scope:)`.
+  public var cacheKey: String {
+    [scope.principal, scope.authorization, canonicalDemand]
       .map { "\($0.utf8.count):\($0)" }
       .joined(separator: "|")
   }

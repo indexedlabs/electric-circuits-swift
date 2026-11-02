@@ -1,7 +1,8 @@
-import ElectricCircuitsCollections
 import ElectricCircuitsSwift
 import Foundation
 import Testing
+
+@testable import ElectricCircuitsCollections
 
 #if canImport(FoundationNetworking)
   import FoundationNetworking
@@ -65,6 +66,20 @@ private let tags = CollectionDefinition<GroupTag, String>(
 private let groupScope = CollectionScope(
   principal: "user-1", authorization: "space-1", generation: "generation-1")
 
+extension CircuitsSubsetGroupSource {
+  /// Every group here loads in `groupScope` unless a test names another identity.
+  fileprivate func materialize(
+    _ demand: CollectionGroupDemand, materializationID: CollectionMaterializationID
+  ) async throws -> CollectionGroupSourceSession {
+    try await materialize(
+      demand, identity: demand.identity(scope: groupScope), materializationID: materializationID)
+  }
+}
+
+/// The subscription a group in `groupScope` sends for `scope-1`.
+private let groupSubscription = CollectionMaterializationID(rawValue: "scope-1")
+  .subscription(generation: groupScope.generation)
+
 private func identityKey(_ key: String) -> String { key }
 
 private func threeTableDemand() -> CollectionGroupDemand {
@@ -86,7 +101,8 @@ private func threeTableDemand() -> CollectionGroupDemand {
 
 /// The group's snapshot: key "1" is a row in all three tables.
 private let groupLoadAnswer = #"""
-  {"groupId":"group-1","shapeId":"group-1","subscription":"scope-1","streamPath":"/streams/group-1",
+  {"groupId":"group-1","shapeId":"group-1","subscription":"\#(groupSubscription)",
+   "streamPath":"/streams/group-1",
    "streamUrl":"https://engine.test/streams/group-1","offset":"10","lsn":"0/10",
    "snapshot":"100:110:","horizon":"0/15",
    "rows":[{"table":"public.record","value":{"id":"1","title":"Record"}},
@@ -392,7 +408,7 @@ struct CircuitsSubsetGroupSourceTests {
     // Setup loads the group once, and the subscription starts on that load.
     let loads = await server.loads
     #expect(loads.count == 1)
-    #expect(loads.first?.subscription == "scope-1")
+    #expect(loads.first?.subscription == groupSubscription)
     #expect(
       loads.first?.members.map(\.table) == ["public.record", "public.assignment", "public.tag"])
     let live = await server.streamURLs.compactMap {
@@ -568,6 +584,28 @@ struct CircuitsSubsetGroupSourceTests {
           "2": GroupAssignment(id: "2", person: "Grace"),
         ])
     #expect(await server.releases.count == 1)
+  }
+
+  @Test func eachLaunchLoadsTheGroupUnderItsOwnSubscription() async throws {
+    // An answer without the subscription echo, so both launches' loads are accepted.
+    let answer = groupLoadAnswer.replacingOccurrences(
+      of: #""subscription":"\#(groupSubscription)","#, with: "")
+    let server = GroupStreamServer(batches: [], loadAnswers: [answer, answer])
+    let demand = threeTableDemand()
+    let id = CollectionMaterializationID(rawValue: "scope-1")
+    for generation in ["launch-1", "launch-2"] {
+      let scope = CollectionScope(
+        principal: groupScope.principal, authorization: groupScope.authorization,
+        generation: generation)
+      let session = try await makeSource(server, mode: .longPoll).materialize(
+        demand, identity: demand.identity(scope: scope), materializationID: id)
+      try await session.stop()
+    }
+
+    let names = await server.loads.map(\.subscription)
+    #expect(
+      names == [id.subscription(generation: "launch-1"), id.subscription(generation: "launch-2")])
+    #expect(Set(names).count == 2)
   }
 
   @Test(arguments: [LiveReadMode.longPoll, .sse], [410, 404])
@@ -768,7 +806,7 @@ struct CircuitsSubsetGroupSourceTests {
     try await store.replaceGroupSnapshot(reloaded.snapshot, materializationID: id, demand: identity)
     #expect(await server.loads.count == 2)
     let subscriptions = await server.loads.map(\.subscription)
-    #expect(subscriptions == ["scope-1", "scope-1"])
+    #expect(subscriptions == [groupSubscription, groupSubscription])
     #expect(reloaded.snapshot.cursor?.offset == "20")
     #expect(
       await store.rows(
