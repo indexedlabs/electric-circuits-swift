@@ -166,11 +166,14 @@ struct CollectionCacheKeyTests {
     let demand = CollectionDemand<CacheRow>(unsafePredicateIdentity: "day=1")
     let earlier = CollectionCoordinator(
       definition: cacheRows, scope: scope(generation: "launch-1"), source: source, store: store)
-    let later = CollectionCoordinator(
-      definition: cacheRows, scope: scope(generation: "launch-2"), source: source, store: store)
-
     let first = await earlier.acquire(demand)
     #expect(await states(of: first, until: .live).contains(.cached) == false)
+    // The precondition: the earlier generation releases its leases before a newer generation's
+    // coordinator is created.
+    try await first.release()
+
+    let later = CollectionCoordinator(
+      definition: cacheRows, scope: scope(generation: "launch-2"), source: source, store: store)
     let second = await later.acquire(demand)
     // The later launch draws the earlier launch's copy before its own snapshot.
     #expect(await states(of: second, until: .live) == [.unavailable, .cached, .refreshing, .live])
@@ -189,8 +192,11 @@ struct CollectionCacheKeyTests {
     #expect(await store.rowClaims(for: record.id) == [2])
     #expect(Set(await store.rows().keys) == [2])
 
-    // Each launch's lease keeps its own lifecycle.
-    try await first.release()
+    // Each launch has its own lease: a late callback on the earlier launch's lease reaches
+    // nothing, starts no request and leaves the later lease live.
+    await first.refresh()
+    #expect(await first.state() == .unavailable)
+    #expect(await source.requests.count == 2)
     #expect(await second.state() == .live)
     try await second.release()
     #expect(try await store.materialization(for: requests[1].identity) == record)
@@ -202,11 +208,13 @@ struct CollectionCacheKeyTests {
     let demand = CollectionDemand<CacheRow>(unsafePredicateIdentity: "day=1")
     let retired = CollectionCoordinator(
       definition: cacheRows, scope: scope(generation: "launch-1"), source: source, store: store)
-    let current = CollectionCoordinator(
-      definition: cacheRows, scope: scope(generation: "launch-2"), source: source, store: store)
     let first = await retired.acquire(demand)
     _ = await states(of: first, until: .live)
+    // The precondition: the retiring generation releases its leases before the newer
+    // generation's coordinator is created.
     try await first.release()
+    let current = CollectionCoordinator(
+      definition: cacheRows, scope: scope(generation: "launch-2"), source: source, store: store)
     let live = await current.acquire(demand)
     _ = await states(of: live, until: .live)
     let requests = await source.requests
