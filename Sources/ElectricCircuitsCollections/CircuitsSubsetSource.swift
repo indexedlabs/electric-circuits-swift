@@ -22,24 +22,26 @@ public enum CircuitsSubsetSourceError: Error, Equatable, Sendable {
 
 /// Native Electric Circuits source strategy for an on-demand demand: establish the changes-only
 /// feed, fence its durable frontier, query the subset snapshot, then consume the feed with awaited
-/// store application. A stable materialization ID is also the server subscription claim.
+/// store application. The server subscription claim is the materialization ID plus the scope's
+/// generation (`CollectionMaterializationID.subscription(generation:)`), so the stored copy's ID is
+/// stable across launches while each launch opens its own subscription.
 ///
 /// The snapshot fence names the stream it was taken from and the snapshot's transaction
 /// visibility (`subset-v2`), so a later acquire of the same cached demand can `resume`: re-join
 /// the identical feed request and, when the engine answers with the same stream URL, continue the
 /// tail from the stored cursor with no frontier read or snapshot query. Circuits shares shapes by
-/// `(table, canonical predicate, sorted columns, changes_only)`, a changes-only feed's stream is
-/// append-only until the engine retires it, and within one catalog a shape ID is never minted
-/// twice; the stream URL also names the catalog's namespace and generations, where shape IDs
-/// restart. So the same stream URL proves the stored offset is still a gap-free position in that
-/// stream (`Contracts/native-v1-contract-v1.md`, "Feed continuity").
+/// `(table, canonical predicate, sorted columns, changes_only)`, not by subscription, a
+/// changes-only feed's stream is append-only until the engine retires it, and within one catalog a
+/// shape ID is never minted twice; the stream URL also names the catalog's namespace and
+/// generations, where shape IDs restart. So the same stream URL proves the stored offset is still a
+/// gap-free position in that stream (`Contracts/native-v1-contract-v1.md`, "Feed continuity").
 public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   CollectionSourceAdapter
 {
   private let client: ElectricCircuitsClient
   private let transport: any HTTPTransport
   private let table: String
-  private let columns: [String]?
+  public let columns: [String]?
   private let decodeRow: @Sendable (ChangeRow) throws -> Model
   private let decodeKey: @Sendable (String) throws -> Key
   private let keyForRow: (@Sendable (Model) throws -> Key)?
@@ -99,7 +101,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       throw CircuitsSubsetSourceError.unsupportedOrderCount(demand.order.count)
     }
     try await pendingCleanup.retry(materializationID)
-    let feedRequest = feedRequest(for: demand, materializationID: materializationID)
+    let feedRequest = feedRequest(
+      for: demand, identity: identity, materializationID: materializationID)
     let feed: ShapeHandle
     let feedCreatedAt: ContinuousClock.Instant
     if let adopted = await pendingCleanup.takeAdoptable(materializationID) {
@@ -212,7 +215,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   /// serves for this request. Returns nil, so the coordinator snapshots, when:
   /// - the demand is a limited window (its live state is the page, which needs a query anyway);
   /// - the fence predates `subset-v2` and so does not name its feed, or the record has no cursor;
-  /// - the last resume from this same fence ended in a terminal or non-retryable stream outcome;
+  /// - the last resume from this same fence ended in a terminal stream outcome or a non-retryable
+  ///   failure other than an authentication refusal (`failureInvalidatesResume`);
   /// - the re-joined feed answers with a different stream URL. A replacement changes-only feed has
   ///   no history for the gap since the stored cursor, so only a new snapshot can close it. That
   ///   create is kept for the `materialize` call that follows on this source instance, so the
@@ -224,7 +228,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   /// once and issues no frontier `HEAD` and no `/subsets/query`.
   public func resume(
     _ demand: CollectionDemand<Model>,
-    identity _: CollectionDemandIdentity,
+    identity: CollectionDemandIdentity,
     materializationID: CollectionMaterializationID,
     record: CollectionMaterializationRecord
   ) async throws -> CollectionResumeSession<Model, Key>? {
@@ -239,7 +243,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     // drop a replaced-feed handle no `materialize` consumed: this create re-establishes the claim.
     try await pendingCleanup.retry(materializationID)
     try await pendingCleanup.releaseAdoptable(materializationID)
-    let feedRequest = feedRequest(for: demand, materializationID: materializationID)
+    let feedRequest = feedRequest(
+      for: demand, identity: identity, materializationID: materializationID)
     let createdAt = ContinuousClock.Instant.now
     let feed = try await createFeed(feedRequest)
     guard feed.response.streamURL.absoluteString == fencedStream else {
@@ -292,15 +297,18 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     try await pendingCleanup.releaseAdoptable(materializationID)
   }
 
+  /// The feed request for a demand: its predicate and this source's columns, claimed under this
+  /// launch's subscription for the materialization.
   private func feedRequest(
-    for demand: CollectionDemand<Model>, materializationID: CollectionMaterializationID
+    for demand: CollectionDemand<Model>, identity: CollectionDemandIdentity,
+    materializationID: CollectionMaterializationID
   ) -> ShapeRequest {
     ShapeRequest(
       table: table,
       where: demand.sourcePredicate,
       columns: columns,
       changesOnly: true,
-      subscription: materializationID.rawValue
+      subscription: materializationID.subscription(generation: identity.scope.generation)
     )
   }
 
@@ -355,8 +363,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       telemetry: telemetry,
       kind: .subsetFeed,
       recreatePolicy: recreatePolicy,
-      adopting: start.feed,
-      createdAt: start.createdAt
+      setupClaim: start.feed,
+      setupClaimAge: start.createdAt.duration(to: .now)
     )
     try await lifecycle.install(coordinator)
     let states = await coordinator.stateUpdates
@@ -427,7 +435,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     }
   }
 
-  fileprivate static func pageVersion(_ response: SubsetResponse) -> CollectionSourceVersion? {
+  static func pageVersion(_ response: SubsetResponse) -> CollectionSourceVersion? {
     guard let lsn = postgresLSN(response.lsn) else { return nil }
     return CollectionSourceVersion(
       rawValue: lsn.rawValue, order: lsn.order,
@@ -437,7 +445,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
 
   /// PostgreSQL LSNs are two unsigned hexadecimal 32-bit words. A `UInt64` sort key is portable
   /// to Indexed/GRDB stores and avoids trusting lexicographic wire strings.
-  fileprivate static func postgresLSN(_ value: String) -> CollectionSourceVersion? {
+  static func postgresLSN(_ value: String) -> CollectionSourceVersion? {
     let words = value.split(separator: "/", omittingEmptySubsequences: false)
     guard words.count == 2, !words[0].isEmpty, !words[1].isEmpty,
       let high = UInt64(words[0], radix: 16), let low = UInt64(words[1], radix: 16),
@@ -845,10 +853,12 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
     }
     var changes: [CollectionChange<Model, Key>] = []
     var acceptedVersions: [CollectionSourceVersion] = []
+    // The envelopes the snapshot gate lets through, for `LiveDelivery.applying(changesAt:_:)`.
+    var accepted: [Int] = []
     var nextRowVersions = rowVersions
     var passedHorizon = passedSnapshotHorizon
     var latest = sourceVersion
-    for envelope in batch.envelopes {
+    for (index, envelope) in batch.envelopes.enumerated() {
       guard let rawVersion = envelope.headers.lsn,
         let lsn = CircuitsSubsetSource<Model, Key>.postgresLSN(rawVersion)
       else {
@@ -873,6 +883,7 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
       }
       latest = max(latest, version)
       acceptedVersions.append(version)
+      accepted.append(index)
       // A window never applies tail rows, so it does not decode them either: the feed covers the
       // whole predicate, including rows the page excludes (NULL sort keys among them), and a
       // model decoder is entitled to reject those. The page is the only source of window rows.
@@ -914,13 +925,13 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
       }
       committedWindowKeys = pageKeys
     }
-    try await applyBatch(
-      CollectionChangeBatch(
-        changes: changes,
-        expectedCursor: expectedCursor,
-        cursor: StreamCursor(offset: nextCursor.offset, lsn: latest.rawValue),
-        sourceVersion: latest
-      ))
+    let changeBatch = CollectionChangeBatch(
+      changes: changes,
+      expectedCursor: expectedCursor,
+      cursor: StreamCursor(offset: nextCursor.offset, lsn: latest.rawValue),
+      sourceVersion: latest
+    )
+    try await LiveDelivery.applying(changesAt: accepted) { try await applyBatch(changeBatch) }
     // Window membership, cursor and source version move together, only once the store has
     // applied the diff: a failed application leaves the held keys describing the store's rows.
     if let committedWindowKeys {

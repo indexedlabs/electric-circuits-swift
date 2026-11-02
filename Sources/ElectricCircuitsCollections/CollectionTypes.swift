@@ -154,16 +154,22 @@ public struct CollectionDefinition<Model: Sendable, Key: Hashable & Sendable>: S
 
 /// Exact identity used for conservative demand de-duplication and persisted materializations.
 public struct CollectionDemandIdentity: Codable, Equatable, Hashable, Sendable {
-  private enum CodingKeys: String, CodingKey { case collection, scope, canonicalDemand }
+  private enum CodingKeys: String, CodingKey { case collection, scope, canonicalDemand, columns }
   public let collection: CollectionID
   public let scope: CollectionScope
   public let canonicalDemand: String
+  /// The columns the source requests, or nil for every column.
+  public let columns: [String]?
 
-  public init(collection: CollectionID, scope: CollectionScope, canonicalDemand: String) {
+  public init(
+    collection: CollectionID, scope: CollectionScope, canonicalDemand: String,
+    columns: [String]? = nil
+  ) {
     precondition(!canonicalDemand.isEmpty)
     self.collection = collection
     self.scope = scope
     self.canonicalDemand = canonicalDemand
+    self.columns = columns
   }
 
   public init(from decoder: Decoder) throws {
@@ -178,39 +184,67 @@ public struct CollectionDemandIdentity: Codable, Equatable, Hashable, Sendable {
     self.collection = collection
     self.scope = scope
     self.canonicalDemand = canonicalDemand
+    columns = try container.decodeIfPresent([String].self, forKey: .columns)
   }
 
-  /// Length-prefixing prevents ambiguous identities when application-controlled values contain
-  /// separators.
+  /// Names the in-memory lease. It includes the scope's generation, so demands from two launches
+  /// never share a lease. Length-prefixing prevents ambiguous identities when
+  /// application-controlled values contain separators. A demand that requests every column keeps
+  /// the five-component form; named columns add a sixth.
   public var storageKey: String {
-    [
+    var components = [
       collection.rawValue,
       scope.principal,
       scope.authorization,
       scope.generation,
       canonicalDemand,
     ]
-    .map { "\($0.utf8.count):\($0)" }
+    if let columns { components.append(Self.columnsIdentity(columns)) }
+    return components.map(Self.frame).joined(separator: "|")
+  }
+
+  /// Names the stored copy: the principal, authorization, collection, canonical demand
+  /// (predicate, order and limit) and columns (`*` for every column), never the generation. Every
+  /// later launch's demand for the same rows has the same key and finds the same copy, and a
+  /// group's table has the key of the single-table demand for it.
+  public var cacheKey: String {
+    [
+      collection.rawValue,
+      scope.principal,
+      scope.authorization,
+      canonicalDemand,
+      columns.map(Self.columnsIdentity) ?? "*",
+    ]
+    .map(Self.frame)
     .joined(separator: "|")
   }
+
+  /// Each column is framed, so a column named `*` never reads as every column.
+  static func columnsIdentity(_ columns: [String]) -> String {
+    columns.map(frame).joined()
+  }
+
+  private static func frame(_ value: String) -> String { "\(value.utf8.count):\(value)" }
 }
 
 extension CollectionDemand {
   public func identity<Key: Hashable & Sendable>(
     for definition: CollectionDefinition<Model, Key>,
-    scope: CollectionScope
+    scope: CollectionScope,
+    columns: [String]? = nil
   ) -> CollectionDemandIdentity {
     return CollectionDemandIdentity(
       collection: definition.id,
       scope: scope,
-      canonicalDemand: canonicalIdentity()
+      canonicalDemand: canonicalIdentity(),
+      columns: columns
     )
   }
 
   /// A typed, length-prefixed encoding rather than a delimiter protocol. Unsafe demand inputs are
   /// application controlled, so every component is framed independently and provider source names
   /// participate in identity as well as in the outbound query.
-  private func canonicalIdentity() -> String {
+  func canonicalIdentity() -> String {
     func component(_ tag: String, _ value: String) -> String {
       "\(tag)\(value.utf8.count):\(value)"
     }
@@ -248,6 +282,23 @@ public struct CollectionMaterializationID: RawRepresentable, Codable, Equatable,
         decoder, "CollectionMaterializationID.rawValue is empty")
     }
     self.rawValue = rawValue
+  }
+}
+
+extension CollectionMaterializationID {
+  /// The server subscription name for this copy in one launch: the ID, a dot, and the 64-bit
+  /// FNV-1a digest of the generation in 16 hexadecimal digits. The ID is stable across launches,
+  /// so the name is new on every launch and a launch never joins a subscription an earlier launch
+  /// opened. The fixed-length digest keeps the name unambiguous and within the engine's 128-byte
+  /// subscription limit for any ID up to 111 bytes.
+  func subscription(generation: String) -> String {
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    for byte in generation.utf8 {
+      hash ^= UInt64(byte)
+      hash &*= 0x0000_0100_0000_01b3
+    }
+    let digest = String(hash, radix: 16)
+    return rawValue + "." + String(repeating: "0", count: 16 - digest.count) + digest
   }
 }
 

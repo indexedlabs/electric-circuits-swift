@@ -17,10 +17,10 @@ idempotence and transactional guarantees.
 
 A successful `start` creates or renews a named claim, then starts a long-poll reader. `stop` cancels
 local work and releases the claim. A caller that already created the claim with the same request can
-pass that handle as `adopting:`; the first `start` then streams it without a second create, still
-taking a capacity permit and running the materializer preflight. Pass `createdAt:`, when that create
-was sent, so the first renewal falls a third of the lease after it rather than after the launch.
-The coordinator owns an adopted claim's release from construction. A terminal stream outcome may
+pass that handle as `setupClaim:`; the first `start` then streams it without a second create, still
+taking a capacity permit and running the materializer preflight. Pass `setupClaimAge:`, how long ago
+that create was sent, so the first renewal falls a third of the lease after it rather than after the
+launch. The coordinator owns an adopted claim's release from construction. A terminal stream outcome may
 require reseeding rather than an automatic retry; it is reported as
 ``ShapeSubscriptionReseedRequired``. A caller must choose how to acquire a new snapshot and replace
 its local materialization.
@@ -43,5 +43,9 @@ route are terminal.
 
 ``ClientError`` retains a public HTTP status/classification without server response data. ``StreamError``
 distinguishes terminal stream results, malformed data, cursor conflicts, and unavailable local
-materializers. Treat an unclassified failure as an application decision point rather than parsing
+materializers. ``StreamError/mustRefetch(path:control:)`` means a shape group's stream dropped output
+and carries a must-refetch marker: nothing from that batch was applied and the cursor did not move.
+The marker does not end the group the way a terminal result does, but a session that stops at it
+releases its claim: load the group again under the same subscription and replace both the rows and
+the cursor with the new load's snapshot and frontier, or the next read reaches the marker again. Treat an unclassified failure as an application decision point rather than parsing
 error strings or relying on undocumented retry behavior.

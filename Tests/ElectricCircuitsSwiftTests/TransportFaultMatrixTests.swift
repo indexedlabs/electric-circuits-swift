@@ -37,6 +37,72 @@ private actor FaultScriptTransport: HTTPTransport {
   }
 }
 
+private enum SSEFaultStep: Sendable {
+  case bytes([Data], thenFail: Bool)
+  case status(Int, contentType: String?)
+}
+
+private actor SSEFaultTransport: HTTPTransport {
+  private var streamSteps: [SSEFaultStep]
+  private(set) var streamRequests: [URLRequest] = []
+  private(set) var requests: [URLRequest] = []
+
+  init(_ streamSteps: [SSEFaultStep]) { self.streamSteps = streamSteps }
+
+  func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes: @Sendable (Data) async throws -> Void
+  ) async throws {
+    streamRequests.append(request)
+    guard !streamSteps.isEmpty else { throw CancellationError() }
+    switch streamSteps.removeFirst() {
+    case .bytes(let chunks, let thenFail):
+      try await onResponse(HTTPURLResponse(
+        url: request.url!, statusCode: 200, httpVersion: nil,
+        headerFields: ["Content-Type": "text/event-stream"])!)
+      for chunk in chunks { try await onBytes(chunk) }
+      if thenFail { throw URLError(.networkConnectionLost) }
+    case .status(let status, let contentType):
+      var headers: [String: String] = [:]
+      if let contentType { headers["Content-Type"] = contentType }
+      try await onResponse(HTTPURLResponse(
+        url: request.url!, statusCode: status, httpVersion: nil, headerFields: headers)!)
+    }
+  }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    switch request.httpMethod {
+    case "POST":
+      return HTTPResponse(
+        data: Data(transportFaultShape.utf8),
+        response: HTTPURLResponse(
+          url: request.url!, statusCode: 200, httpVersion: nil,
+          headerFields: ["Content-Type": "application/json"])!)
+    case "DELETE":
+      return HTTPResponse(
+        data: Data(), response: HTTPURLResponse(
+          url: request.url!, statusCode: 204, httpVersion: nil, headerFields: nil)!)
+    case "GET":
+      return HTTPResponse(
+        data: Data(), response: HTTPURLResponse(
+          url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
+    default:
+      throw CancellationError()
+    }
+  }
+}
+
+private func sseFaultData(_ key: String) -> Data {
+  Data(
+    "event: data\ndata: [{\"type\":\"public.items\",\"key\":\"\(key)\",\"value\":{\"id\":\"\(key)\"},\"headers\":{\"operation\":\"upsert\"}}]\n\n".utf8)
+}
+
+private func sseFaultControl(_ offset: String) -> Data {
+  Data("event: control\ndata: {\"streamNextOffset\":\"\(offset)\"}\n\n".utf8)
+}
+
 private actor RetryAfterGateClock: ShapeSubscriptionClock {
   private(set) var delays: [Duration] = []
   private var continuation: CheckedContinuation<Void, Error>?
@@ -487,5 +553,150 @@ struct TransportFaultMatrixTests {
     await #expect(throws: FailingApplyMaterializer.ProviderFailure.self) { try await task.value }
     #expect(await materializer.cursor == nil)
     #expect(await materializer.rows.isEmpty)
+  }
+
+  @Test func sseDroppedHeldResponseAndServerErrorReconnectOnSSE() async throws {
+    let transport = SSEFaultTransport([
+      .bytes([sseFaultData("1")], thenFail: true),
+      .status(503, contentType: nil),
+      .bytes([sseFaultData("1"), sseFaultControl("1")], thenFail: false),
+      .status(404, contentType: nil),
+    ])
+    let materializer = InMemoryShapeMaterializer()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport,
+        configuration: .init(liveReadMode: .sse)),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "claim"),
+      materializer: materializer,
+      retryPolicy: .init(maxRetries: 3, baseDelay: .zero, maximumDelay: .zero, jitterRatio: 0),
+      clock: ImmediateFaultClock())
+
+    _ = try await coordinator.start()
+    for _ in 0..<2_000 {
+      if case .reseedRequired = await coordinator.state { break }
+      await Task.yield()
+    }
+    let requests = await transport.streamRequests
+    #expect(requests.count == 4)
+    #expect(requests.allSatisfy { $0.url?.query?.contains("live=sse") == true })
+    #expect(await materializer.cursor() == StreamCursor(offset: "1"))
+    #expect(await materializer.rows().keys.sorted() == ["1"])
+    try await coordinator.stop()
+  }
+
+  @Test func sseReconnectsResumeFromCommittedOffsetWithoutDuplicatesOrGaps() async throws {
+    let transport = SSEFaultTransport([
+      .bytes([sseFaultData("1"), sseFaultControl("1")], thenFail: true),
+      .bytes([sseFaultData("2")], thenFail: true),
+      .bytes([sseFaultData("2"), sseFaultControl("2")], thenFail: false),
+      .status(404, contentType: nil),
+    ])
+    let materializer = InMemoryShapeMaterializer()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport,
+        configuration: .init(liveReadMode: .sse)),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "claim"),
+      materializer: materializer,
+      retryPolicy: .init(maxRetries: 2, baseDelay: .zero, maximumDelay: .zero, jitterRatio: 0),
+      clock: ImmediateFaultClock())
+
+    _ = try await coordinator.start()
+    for _ in 0..<2_000 {
+      if case .reseedRequired = await coordinator.state { break }
+      await Task.yield()
+    }
+    let requests = await transport.streamRequests
+    #expect(requests.count == 4)
+    if requests.count == 4 {
+      #expect(URLComponents(url: requests[0].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "-1")
+      #expect(URLComponents(url: requests[1].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "1")
+      #expect(URLComponents(url: requests[2].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "1")
+      #expect(URLComponents(url: requests[3].url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "offset" })?.value == "2")
+    }
+    #expect(await materializer.cursor() == StreamCursor(offset: "2"))
+    #expect(await materializer.rows().keys.sorted() == ["1", "2"])
+    try await coordinator.stop()
+  }
+
+  @Test func sseFallsBackOnlyWhenServerRefusesSSE() async throws {
+    let transport = SSEFaultTransport([.status(400, contentType: nil)])
+    let reader = ShapeStreamReader(
+      streamURL: URL(string: "https://streams.test/s1")!, transport: transport,
+      materializer: InMemoryShapeMaterializer(), configuration: .init(liveReadMode: .sse))
+
+    await #expect(throws: StreamError.terminal(
+      path: "/s1", status: 404, reason: .notFound)) {
+      try await reader.run()
+    }
+    let streamRequests = await transport.streamRequests
+    let requests = await transport.requests
+    #expect(streamRequests.count == 1)
+    #expect(streamRequests[0].url?.query?.contains("live=sse") == true)
+    #expect(requests.count == 1)
+    #expect(requests[0].url?.query?.contains("live=long-poll") == true)
+
+    let goneTransport = SSEFaultTransport([.status(410, contentType: nil)])
+    let goneReader = ShapeStreamReader(
+      streamURL: URL(string: "https://streams.test/s1")!, transport: goneTransport,
+      materializer: InMemoryShapeMaterializer(), configuration: .init(liveReadMode: .sse))
+    await #expect(throws: StreamError.terminal(path: "/s1", status: 410, reason: .gone)) {
+      try await goneReader.run()
+    }
+    #expect(await goneTransport.streamRequests.count == 1)
+    #expect(await goneTransport.requests.isEmpty)
+
+    let transientTransport = SSEFaultTransport([
+      .status(503, contentType: nil),
+      .bytes([sseFaultData("dropped")], thenFail: true),
+      .status(400, contentType: nil),
+    ])
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transientTransport,
+        configuration: .init(liveReadMode: .sse)),
+      transport: transientTransport,
+      request: ShapeRequest(table: "public.items", subscription: "claim"),
+      materializer: InMemoryShapeMaterializer(),
+      retryPolicy: .init(maxRetries: 3, baseDelay: .zero, maximumDelay: .zero, jitterRatio: 0),
+      clock: ImmediateFaultClock())
+    _ = try await coordinator.start()
+    for _ in 0..<2_000 {
+      if case .reseedRequired = await coordinator.state { break }
+      await Task.yield()
+    }
+    let transientStreams = await transientTransport.streamRequests
+    #expect(transientStreams.count == 3)
+    #expect(transientStreams.allSatisfy { $0.url?.query?.contains("live=sse") == true })
+    let transientPolls = await transientTransport.requests.filter {
+      $0.url?.query?.contains("live=long-poll") == true
+    }
+    #expect(transientPolls.count == 1)
+    try await coordinator.stop()
+  }
+
+  @Test func sendOnlyTransportFallsBackToLongPoll() async throws {
+    let transport = FaultScriptTransport([
+      HTTPResponse(
+        data: Data(),
+        response: HTTPURLResponse(
+          url: URL(string: "https://streams.test/s1")!, statusCode: 404,
+          httpVersion: nil, headerFields: nil)!)
+    ])
+    let reader = ShapeStreamReader(
+      streamURL: URL(string: "https://streams.test/s1")!, transport: transport,
+      materializer: InMemoryShapeMaterializer(), configuration: .init(liveReadMode: .sse))
+
+    await #expect(throws: StreamError.terminal(
+      path: "/s1", status: 404, reason: .notFound)) {
+      try await reader.run()
+    }
+    let requests = await transport.requests
+    #expect(requests.count == 1)
+    #expect(requests[0].url?.query?.contains("live=long-poll") == true)
+    #expect(requests[0].value(forHTTPHeaderField: "Accept") == "application/json")
   }
 }

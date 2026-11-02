@@ -144,6 +144,10 @@ private actor StaleStore: CollectionStore {
   }
 
   let base = InMemoryCollectionStore<StaleRow, Int>(key: \.id)
+  /// Once `shadowLookups()` is called, lookups and writes reach this store, so a key's marked
+  /// copy in `base` and the copy a lease holds here are two copies under one `cacheKey`.
+  let shadow = InMemoryCollectionStore<StaleRow, Int>(key: \.id)
+  private var shadowing = false
   let source: StaleSource
   private(set) var clears: [Clear] = []
   private(set) var removals: [CollectionMaterializationID] = []
@@ -151,6 +155,8 @@ private actor StaleStore: CollectionStore {
   private var listingFailures = 0
 
   func failListings(_ count: Int) { listingFailures = count }
+  func shadowLookups() { shadowing = true }
+  private var current: InMemoryCollectionStore<StaleRow, Int> { shadowing ? shadow : base }
   private struct ListingFailure: Error {}
 
   init(source: StaleSource) { self.source = source }
@@ -158,7 +164,7 @@ private actor StaleStore: CollectionStore {
   func materialization(for demand: CollectionDemandIdentity) async throws
     -> CollectionMaterializationRecord?
   {
-    try await base.materialization(for: demand)
+    try await current.materialization(for: demand)
   }
 
   func staleMaterializations() async throws -> [CollectionStaleMaterialization] {
@@ -187,13 +193,14 @@ private actor StaleStore: CollectionStore {
     _ snapshot: CollectionSnapshot<StaleRow>, materializationID: CollectionMaterializationID,
     demand: CollectionDemandIdentity
   ) async throws {
-    try await base.replaceSnapshot(snapshot, materializationID: materializationID, demand: demand)
+    try await current.replaceSnapshot(
+      snapshot, materializationID: materializationID, demand: demand)
   }
 
   func apply(
     _ batch: CollectionChangeBatch<StaleRow, Int>, to materializationID: CollectionMaterializationID
   ) async throws {
-    try await base.apply(batch, to: materializationID)
+    try await current.apply(batch, to: materializationID)
   }
 
   func removeMaterialization(_ materializationID: CollectionMaterializationID) async throws {
@@ -1228,34 +1235,44 @@ struct CollectionCoordinatorStalePassTests {
     }
   }
 
-  @Test func earlierLaunchRefreshUsesCurrentScopeAndReleasesOldClaim() async throws {
+  @Test func earlierLaunchRefreshKeepsTheCopyUnderItsCacheKeyAndClearsTheMark() async throws {
     let old = StaleFixture()
     try await old.mark()
     let current = StaleFixture(
       scope: .init(principal: "user", authorization: "authorized", generation: "next-launch"),
       source: old.source, store: old.store)
+    #expect(old.identity("one").cacheKey == current.identity("one").cacheKey)
+    #expect(old.identity("one").storageKey != current.identity("one").storageKey)
     try await current.withPass {
       try #require(
         try await current.eventually(advancingClock: false) {
           await current.source.requests.count == 1
         })
+      // This launch's demand finds the earlier launch's copy and re-reads it under its own id.
       #expect(await current.source.requests[0].identity == current.identity("one"))
-      #expect(await current.source.requests[0].materializationID != old.id("one"))
+      #expect(await current.source.requests[0].materializationID == old.id("one"))
       await current.source.succeed(0)
       try #require(
         try await current.eventually(advancingClock: false) {
-          await current.store.removals.contains(old.id("one"))
+          await current.store.clears.count == 1
         })
-      #expect(try await current.store.materialization(for: old.identity("one")) == nil)
-      #expect(try await current.store.materialization(for: current.identity("one")) != nil)
+      #expect(await current.store.removals.isEmpty)
+      let record = try #require(
+        try await current.store.materialization(for: current.identity("one")))
+      #expect(record.id == old.id("one"))
+      #expect(record.demand == current.identity("one"))
+      #expect(try await current.store.materialization(for: old.identity("one")) == record)
+      // The empty snapshot replaced the copy's claims in place, so its only row left.
+      #expect(await current.store.base.rowClaims(for: old.id("one")).isEmpty)
       #expect(await current.store.base.rows().isEmpty)
       #expect(try await current.marks().isEmpty)
       #expect(await current.source.stopped == [0])
+      try await current.expectSpans(["refreshed"], released: ["1"], returned: ["0"])
     }
     await old.telemetry.shutdown()
   }
 
-  @Test func earlierLaunchHeldDemandUsesCurrentEntryWithoutAnotherRequest() async throws {
+  @Test func earlierLaunchHeldDemandClearsTheMarkOfTheCopyItRefreshed() async throws {
     let old = StaleFixture()
     try await old.mark()
     let current = StaleFixture(
@@ -1264,17 +1281,24 @@ struct CollectionCoordinatorStalePassTests {
       source: old.source, store: old.store)
     let screen = await current.coordinator.acquire(current.demand("one"))
     try #require(try await current.eventually { await current.source.requests.count == 1 })
+    #expect(await current.source.requests[0].materializationID == old.id("one"))
     await current.source.succeed(0)
     try #require(try await current.eventually { await screen.state() == .live })
+    // A snapshot never clears a mark; the held copy keeps it until the pass sees it held.
+    #expect(try await current.marks().map(\.record.id) == [old.id("one")])
     try await current.withPass {
       try #require(
         try await current.eventually(advancingClock: false) {
-          await current.store.removals == [old.id("one")]
+          await current.store.clears.count == 1
         })
+      #expect(await current.store.removals.isEmpty)
       #expect(await current.source.requests.count == 1)
       #expect(await current.source.stopped.isEmpty)
       #expect(await screen.state() == .live)
-      #expect(await current.store.base.rows().isEmpty)
+      #expect(try await current.marks().isEmpty)
+      #expect(
+        try await current.store.materialization(for: current.identity("one"))?.id
+          == old.id("one"))
       try await current.expectSpans(["held"], released: ["0"], returned: ["0"])
       try await screen.release()
     }
@@ -1308,9 +1332,55 @@ struct CollectionCoordinatorStalePassTests {
       await current.source.succeed(1)
       try #require(
         try await current.eventually(advancingClock: false) {
+          await current.store.clears.count == 1
+        })
+      #expect(await current.store.removals.isEmpty)
+      #expect(await current.store.base.rows().isEmpty)
+      #expect(try await current.marks().isEmpty)
+    }
+    await old.telemetry.shutdown()
+  }
+
+  @Test(arguments: [true, false])
+  func secondCopyUnderOneKeyIsRemovedNotCleared(held: Bool) async throws {
+    let old = StaleFixture()
+    try await old.mark()
+    // A provider holding two copies under one key: this launch's lookups reach another copy.
+    await old.store.shadowLookups()
+    let current = StaleFixture(
+      scope: .init(principal: "user", authorization: "authorized", generation: "next-launch"),
+      source: old.source, store: old.store)
+    let screen: CollectionLease?
+    if held {
+      screen = await current.coordinator.acquire(current.demand("one"))
+      try #require(try await current.eventually { await current.source.requests.count == 1 })
+      await current.source.succeed(0)
+      try #require(try await current.eventually { await screen?.state() == .live })
+    } else {
+      screen = nil
+    }
+    try await current.withPass {
+      if !held {
+        try #require(
+          try await current.eventually(advancingClock: false) {
+            await current.source.requests.count == 1
+          })
+        await current.source.succeed(0)
+      }
+      try #require(
+        try await current.eventually(advancingClock: false) {
           await current.store.removals == [old.id("one")]
         })
-      #expect(await current.store.base.rows().isEmpty)
+      // The mark belonged to a copy the pass neither held nor re-read, so it was not cleared.
+      #expect(await current.store.clears.isEmpty)
+      let other = await current.source.requests[0].materializationID
+      #expect(other != old.id("one"))
+      #expect(try await current.store.materialization(for: current.identity("one"))?.id == other)
+      #expect(try await current.marks().isEmpty)
+      #expect(await current.store.base.rowClaims(for: old.id("one")).isEmpty)
+      try await current.expectSpans(
+        [held ? "held" : "refreshed"], released: ["1"], returned: ["0"])
+      try await screen?.release()
     }
     await old.telemetry.shutdown()
   }

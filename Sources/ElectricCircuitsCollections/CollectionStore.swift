@@ -22,6 +22,8 @@ public protocol CollectionStore<Model, Key>: Sendable {
   associatedtype Model: Sendable
   associatedtype Key: Hashable & Sendable
 
+  /// The stored copy for the demand's `cacheKey`, whatever generation stored it. A provider keeps
+  /// at most one materialization per `cacheKey` and never binds one by the generation.
   func materialization(for demand: CollectionDemandIdentity) async throws
     -> CollectionMaterializationRecord?
 
@@ -34,7 +36,9 @@ public protocol CollectionStore<Model, Key>: Sendable {
     _ materializationID: CollectionMaterializationID, ifMarkedAt position: CollectionSourceVersion
   ) async throws
 
-  /// Replaces this request's claims. Each omitted, previously held row marks every other
+  /// Replaces this request's claims, binding the materialization to `demand.cacheKey` and recording
+  /// `demand` as its current demand. A snapshot for a key already stored replaces that copy's
+  /// claims in place. Each omitted, previously held row marks every other
   /// materialization still claiming it in the same transaction, at the snapshot's source version.
   /// Marking ignores request limits, subqueries and liveness, and preserves other holders' claims.
   /// Later drops advance marks using source-version ordering. Snapshots never clear marks.
@@ -77,14 +81,16 @@ public enum CollectionStoreError: Error, Equatable, Sendable {
 
 /// Reference store for contract tests, previews and applications that do not require disk-backed
 /// offline state. It models the same one-domain-table plus shared row-claim topology required of a
-/// durable provider.
+/// durable provider. A domain is one collection for one principal and authorization, shared by every
+/// generation, and each `cacheKey` has at most one materialization.
 public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
   CollectionStore
 {
   private let key: @Sendable (Model) -> Key
   private struct Domain: Hashable, Sendable {
     let collection: CollectionID
-    let scope: CollectionScope
+    let principal: String
+    let authorization: String
   }
   private struct CanonicalKey: Hashable, Sendable {
     let domain: Domain
@@ -93,13 +99,15 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
   /// A nil row is a versioned tombstone. It prevents an older overlapping feed from resurrecting a
   /// key after a later delete while retaining no application-visible row.
   private var canonicalRows: [CanonicalKey: (row: Model?, version: CollectionSourceVersion)] = [:]
-  private var recordsByDemand: [CollectionDemandIdentity: CollectionMaterializationRecord] = [:]
+  private var recordsByKey: [String: CollectionMaterializationRecord] = [:]
   private var demandByMaterialization: [CollectionMaterializationID: CollectionDemandIdentity] = [:]
   private var claims: [CollectionMaterializationID: Set<Key>] = [:]
   private var staleMarks: [CollectionMaterializationID: CollectionSourceVersion] = [:]
 
   private func domain(for demand: CollectionDemandIdentity) -> Domain {
-    Domain(collection: demand.collection, scope: demand.scope)
+    Domain(
+      collection: demand.collection, principal: demand.scope.principal,
+      authorization: demand.scope.authorization)
   }
 
   public init(key: @escaping @Sendable (Model) -> Key) {
@@ -109,11 +117,11 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
   public func materialization(for demand: CollectionDemandIdentity) async throws
     -> CollectionMaterializationRecord?
   {
-    recordsByDemand[demand]
+    recordsByKey[demand.cacheKey]
   }
 
   public func staleMaterializations() async throws -> [CollectionStaleMaterialization] {
-    recordsByDemand.values.compactMap { record in
+    recordsByKey.values.compactMap { record in
       guard let position = staleMarks[record.id] else { return nil }
       return .init(record: record, markedAt: position, claimCount: claims[record.id]?.count ?? 0)
     }
@@ -132,15 +140,17 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     materializationID: CollectionMaterializationID,
     demand: CollectionDemandIdentity
   ) async throws {
-    if let existingDemand = demandByMaterialization[materializationID], existingDemand != demand {
+    if let existingDemand = demandByMaterialization[materializationID],
+      existingDemand.cacheKey != demand.cacheKey
+    {
       throw CollectionStoreError.materializationBoundToDifferentDemand(
         materializationID: materializationID, existing: existingDemand, requested: demand)
     }
-    if let existing = recordsByDemand[demand], existing.id != materializationID {
+    if let existing = recordsByKey[demand.cacheKey], existing.id != materializationID {
       throw CollectionStoreError.demandBoundToDifferentMaterialization(
         demand: demand, existing: existing.id, requested: materializationID)
     }
-    if let current = recordsByDemand[demand], snapshot.sourceVersion < current.sourceVersion {
+    if let current = recordsByKey[demand.cacheKey], snapshot.sourceVersion < current.sourceVersion {
       throw CollectionStoreError.staleSnapshot(
         current: current.sourceVersion, received: snapshot.sourceVersion)
     }
@@ -149,7 +159,7 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     let domain = domain(for: demand)
     var nextRows = canonicalRows
     var nextClaims = claims
-    var nextRecords = recordsByDemand
+    var nextRecords = recordsByKey
     var nextMarks = staleMarks
     var nextDemandByMaterialization = demandByMaterialization
     nextDemandByMaterialization[materializationID] = demand
@@ -181,11 +191,11 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
       sourceVersion: snapshot.sourceVersion,
       cursor: snapshot.cursor
     )
-    nextRecords[demand] = record
+    nextRecords[demand.cacheKey] = record
     pruneTombstones(&nextRows, using: nextRecords)
     canonicalRows = nextRows
     claims = nextClaims
-    recordsByDemand = nextRecords
+    recordsByKey = nextRecords
     demandByMaterialization = nextDemandByMaterialization
     staleMarks = nextMarks
   }
@@ -195,7 +205,7 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     to materializationID: CollectionMaterializationID
   ) async throws {
     guard let demand = demandByMaterialization[materializationID],
-      let record = recordsByDemand[demand]
+      let record = recordsByKey[demand.cacheKey]
     else {
       throw CollectionStoreError.missingMaterialization(materializationID)
     }
@@ -211,7 +221,7 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     let domain = domain(for: demand)
     var nextRows = canonicalRows
     var nextClaims = claims
-    var nextRecords = recordsByDemand
+    var nextRecords = recordsByKey
     var nextMarks = staleMarks
     var materializationClaims = nextClaims[materializationID] ?? []
     // Claims are membership facts, not a row-byte version. An older overlapping feed cannot
@@ -253,11 +263,11 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
       sourceVersion: later(of: record.sourceVersion, and: batch.sourceVersion),
       cursor: batch.cursor
     )
-    nextRecords[demand] = nextRecord
+    nextRecords[demand.cacheKey] = nextRecord
     pruneTombstones(&nextRows, using: nextRecords)
     canonicalRows = nextRows
     claims = nextClaims
-    recordsByDemand = nextRecords
+    recordsByKey = nextRecords
     staleMarks = nextMarks
   }
 
@@ -266,7 +276,7 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
   func seedClaimWithoutMaterialization(
     _ rowKey: Key, owner: CollectionMaterializationID, demand: CollectionDemandIdentity
   ) {
-    precondition(demandByMaterialization[owner] == nil && recordsByDemand[demand] == nil)
+    precondition(demandByMaterialization[owner] == nil && recordsByKey[demand.cacheKey] == nil)
     demandByMaterialization[owner] = demand
     claims[owner] = [rowKey]
   }
@@ -308,10 +318,12 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     let domain = domain(for: demand)
     var nextRows = canonicalRows
     var nextClaims = claims
-    var nextRecords = recordsByDemand
+    var nextRecords = recordsByKey
     var nextDemandByMaterialization = demandByMaterialization
     let oldClaims = nextClaims.removeValue(forKey: materializationID) ?? []
-    nextRecords.removeValue(forKey: demand)
+    if nextRecords[demand.cacheKey]?.id == materializationID {
+      nextRecords.removeValue(forKey: demand.cacheKey)
+    }
     nextDemandByMaterialization.removeValue(forKey: materializationID)
     for rowKey in oldClaims
     where !isClaimed(rowKey, in: nextClaims, domain: domain, bindings: nextDemandByMaterialization)
@@ -322,7 +334,7 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     pruneTombstones(&nextRows, using: nextRecords)
     canonicalRows = nextRows
     claims = nextClaims
-    recordsByDemand = nextRecords
+    recordsByKey = nextRecords
     demandByMaterialization = nextDemandByMaterialization
   }
 
@@ -330,12 +342,12 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
   /// source frontier. Once that holds, no remaining stream can lawfully deliver an older row.
   private func pruneTombstones(
     _ rows: inout [CanonicalKey: (row: Model?, version: CollectionSourceVersion)],
-    using records: [CollectionDemandIdentity: CollectionMaterializationRecord]
+    using records: [String: CollectionMaterializationRecord]
   ) {
     rows = rows.filter { canonicalKey, value in
       guard value.row == nil else { return true }
-      return records.contains { demand, record in
-        domain(for: demand) == canonicalKey.domain
+      return records.values.contains { record in
+        domain(for: record.demand) == canonicalKey.domain
           && !record.sourceVersion.supersedes(value.version)
       }
     }
@@ -352,8 +364,8 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     domain: Domain, at position: CollectionSourceVersion,
     marks: inout [CollectionMaterializationID: CollectionSourceVersion]
   ) {
-    for (demand, record) in recordsByDemand
-    where record.id != materializationID && self.domain(for: demand) == domain
+    for record in recordsByKey.values
+    where record.id != materializationID && self.domain(for: record.demand) == domain
       && claims[record.id]?.contains(rowKey) == true
     {
       marks[record.id] = marks[record.id].map { later(of: $0, and: position) } ?? position

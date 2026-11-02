@@ -86,6 +86,10 @@ public protocol CollectionSourceAdapter<Model, Key>: Sendable {
   associatedtype Model: Sendable
   associatedtype Key: Hashable & Sendable
 
+  /// The columns this source requests, or nil for every column. They enter each demand's
+  /// `cacheKey`, so a copy stored with other columns is never found for this source.
+  var columns: [String]? { get }
+
   func materialize(
     _ demand: CollectionDemand<Model>,
     identity: CollectionDemandIdentity,
@@ -113,6 +117,8 @@ public protocol CollectionSourceAdapter<Model, Key>: Sendable {
 }
 
 extension CollectionSourceAdapter {
+  public var columns: [String]? { nil }
+
   public func resume(
     _: CollectionDemand<Model>,
     identity _: CollectionDemandIdentity,

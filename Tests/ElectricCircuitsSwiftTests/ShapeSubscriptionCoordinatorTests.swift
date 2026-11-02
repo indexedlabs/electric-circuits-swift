@@ -32,6 +32,35 @@ private actor CoordinatorTransport: HTTPTransport {
   }
 }
 
+private actor SSEBlipBurstTransport: HTTPTransport {
+  private var failures = 2
+  private(set) var streamRequests: [URLRequest] = []
+  private(set) var requests: [URLRequest] = []
+
+  func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes _: @Sendable (Data) async throws -> Void
+  ) async throws {
+    streamRequests.append(request)
+    if failures > 0 {
+      failures -= 1
+      throw URLError(.networkConnectionLost)
+    }
+    try await onResponse(HTTPURLResponse(
+      url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
+  }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    switch request.httpMethod {
+    case "POST": return shapeResponse()
+    case "DELETE": return response("", status: 204)
+    default: return response("", status: 404)
+    }
+  }
+}
+
 /// Holds the terminal stream response until the test explicitly releases it. This models a
 /// terminal result that has not crossed the transport boundary yet; task yields cannot establish
 /// that boundary.
@@ -358,6 +387,83 @@ private actor GatedMaterializer: ShapeMaterializer {
   func releaseApply() { released = true }
 }
 
+/// Holds the next committed-cursor read once armed, so a test can stop the coordinator while
+/// the stream's post-failure progress check is suspended.
+private actor HeldCursorReadMaterializer: ShapeMaterializer {
+  private var cursor: StreamCursor?
+  private var holdNextRead = false
+  private var readHeld = false
+  private var released = false
+  func apply(
+    _ batch: ChangeBatch,
+    expecting expectedCursor: StreamCursor?,
+    advancingTo cursor: StreamCursor
+  ) async throws {
+    if self.cursor == cursor { return }
+    guard self.cursor == expectedCursor else {
+      throw StreamError.cursorConflict(
+        expected: expectedCursor, actual: self.cursor, advancingTo: cursor)
+    }
+    self.cursor = cursor
+  }
+  func currentCursor() async throws -> StreamCursor? {
+    if holdNextRead {
+      holdNextRead = false
+      readHeld = true
+      while !released { await Task.yield() }
+    }
+    return cursor
+  }
+  func holdNextCursorRead() { holdNextRead = true }
+  func isReadHeld() -> Bool { readHeld }
+  func releaseRead() { released = true }
+}
+
+/// Resumes from a stored checkpoint, but every even-numbered cursor read fails until `failures`
+/// reads have failed. After the coordinator's opening availability read, that fails each stream
+/// attempt's first read while its post-failure read succeeds.
+private actor AlternatingCursorReadMaterializer: ShapeMaterializer {
+  private let cursor = StreamCursor(offset: "5")
+  private var reads = 0
+  private var failures: Int
+  init(failures: Int) { self.failures = failures }
+  func currentCursor() async throws -> StreamCursor? {
+    reads += 1
+    if failures > 0, reads.isMultiple(of: 2) {
+      failures -= 1
+      throw UnavailableStore.locked
+    }
+    return cursor
+  }
+  func apply(
+    _: ChangeBatch,
+    expecting _: StreamCursor?,
+    advancingTo _: StreamCursor
+  ) async throws {}
+}
+
+/// Serves a shape, then one retryable poll failure that arms the materializer's next cursor read,
+/// which is the stream's post-failure progress check. Later requests (the release) get a 404.
+private actor PollFailureArmingTransport: HTTPTransport {
+  private let materializer: HeldCursorReadMaterializer
+  private(set) var requests: [URLRequest] = []
+
+  init(materializer: HeldCursorReadMaterializer) { self.materializer = materializer }
+
+  func send(_ request: URLRequest) async throws -> HTTPResponse {
+    requests.append(request)
+    switch requests.count {
+    case 1:
+      return shapeResponse()
+    case 2:
+      await materializer.holdNextCursorRead()
+      return response("temporary", status: 503)
+    default:
+      return response("", status: 404)
+    }
+  }
+}
+
 private enum UnavailableStore: Error, Sendable {
   case locked
 }
@@ -555,7 +661,7 @@ struct ShapeSubscriptionCoordinatorTests {
     let coordinator = ShapeSubscriptionCoordinator(
       client: client, transport: transport, request: request,
       materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0), clock: clock,
-      adopting: adopted)
+      setupClaim: adopted)
 
     #expect(try await coordinator.start() == adopted)
     for _ in 0..<1_000 {
@@ -586,15 +692,17 @@ struct ShapeSubscriptionCoordinatorTests {
     let coordinator = ShapeSubscriptionCoordinator(
       client: client, transport: transport, request: request,
       materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0), clock: clock,
-      adopting: adopted, createdAt: .now - .seconds(5))
+      setupClaim: adopted, setupClaimAge: .seconds(5))
 
     #expect(try await coordinator.start() == adopted)
     for _ in 0..<1_000 {
       if await clock.delays.count == 1 { break }
       await Task.yield()
     }
-    // A 6-second lease renews every 2 seconds; 5 have passed since the create.
-    #expect(await clock.delays == [.zero])
+    // A 6-second lease renews every 2 seconds; 5 had passed since the create, so the first
+    // renewal goes out at once and only the next one waits the interval.
+    #expect(await clock.delays == [.seconds(2)])
+    #expect(await transport.requests.filter { $0.httpMethod == "POST" }.count == 2)
 
     try await coordinator.stop()
   }
@@ -610,7 +718,7 @@ struct ShapeSubscriptionCoordinatorTests {
     let coordinator = ShapeSubscriptionCoordinator(
       client: client, transport: transport, request: request,
       materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0),
-      clock: RecordingClock(), adopting: adopted)
+      clock: RecordingClock(), setupClaim: adopted)
 
     try await coordinator.stop()
 
@@ -636,7 +744,7 @@ struct ShapeSubscriptionCoordinatorTests {
     let coordinator = ShapeSubscriptionCoordinator(
       client: client, transport: transport, request: request,
       materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0),
-      clock: RecordingClock(), capacity: capacity, adopting: adopted)
+      clock: RecordingClock(), capacity: capacity, setupClaim: adopted)
 
     await #expect(throws: ShapeSubscriptionFailure.capacityExceeded(limit: 1)) {
       _ = try await coordinator.start()
@@ -886,6 +994,199 @@ struct ShapeSubscriptionCoordinatorTests {
     #expect(requests[2].url?.query?.contains("offset=-1") == true)
     #expect(requests[3].url?.query?.contains("offset=7") == true)
     try await coordinator.stop()
+  }
+
+  @Test func sseBlipBurstBacksOffAndStaysOnSSE() async throws {
+    let transport = SSEBlipBurstTransport()
+    let clock = RecordingClock()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport,
+        configuration: .init(liveReadMode: .sse)),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "claim"),
+      materializer: InMemoryShapeMaterializer(),
+      retryPolicy: .init(
+        maxRetries: 2, baseDelay: .seconds(1), maximumDelay: .seconds(2), jitterRatio: 0),
+      clock: clock)
+
+    _ = try await coordinator.start()
+    for _ in 0..<2_000 {
+      if case .reseedRequired = await coordinator.state { break }
+      await Task.yield()
+    }
+    #expect(await clock.delays == [.seconds(1), .seconds(2)])
+    let streamRequests = await transport.streamRequests
+    #expect(streamRequests.count == 3)
+    #expect(streamRequests.allSatisfy { $0.url?.query?.contains("live=sse") == true })
+    try await coordinator.stop()
+  }
+
+  @Test func progressResetsStreamRetryBudgetBeforeTheNextFailure() async throws {
+    let transport = CoordinatorTransport(responses: [
+      shapeResponse(),
+      response("temporary-1", status: 503),
+      response(oneRow, headers: ["stream-next-offset": "1"]),
+      response("temporary-2", status: 503),
+      response(oneRow, headers: ["stream-next-offset": "2"]),
+      response("temporary-3", status: 503),
+      response(oneRow, headers: ["stream-next-offset": "3"]),
+      response("gone", status: 404),
+      response("", status: 404),
+    ])
+    let clock = RecordingClock()
+    let materializer = InMemoryShapeMaterializer()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "claim"),
+      materializer: materializer,
+      retryPolicy: .init(
+        maxRetries: 2, baseDelay: .seconds(1), maximumDelay: .seconds(2), jitterRatio: 0,
+        randomUnit: { 0.5 }),
+      clock: clock)
+
+    _ = try await coordinator.start()
+    for _ in 0..<1_000 {
+      if await transport.requests.count >= 9 { break }
+      await Task.yield()
+    }
+    for _ in 0..<1_000 {
+      if case .reseedRequired = await coordinator.state { break }
+      await Task.yield()
+    }
+
+    let requestCount = await transport.requests.count
+    let cursor = await materializer.cursor()
+    let delays = await clock.delays
+    let state = await coordinator.state
+    #expect(requestCount == 9)
+    #expect(cursor == StreamCursor(offset: "3"))
+    #expect(delays == [.seconds(1), .seconds(1), .seconds(1)])
+    #expect(
+      state
+        == .reseedRequired(
+          .init(
+            reason: .terminal(.notFound),
+            previous: ShapeHandle(
+              response: ShapeResponse(
+                shapeId: "s1", table: "public.items", streamPath: "/v1/streams/s1",
+                streamURL: URL(string: "https://streams.test/s1")!, subscription: "claim")))))
+    try await coordinator.stop()
+  }
+
+  @Test func consecutiveStreamFailuresStillExhaustRetryBudget() async throws {
+    let transport = CoordinatorTransport(responses: [
+      shapeResponse(),
+      response("temporary-1", status: 503),
+      response("temporary-2", status: 503),
+      response("temporary-3", status: 503),
+      response("", status: 404),
+    ])
+    let clock = RecordingClock()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "claim"),
+      materializer: InMemoryShapeMaterializer(),
+      retryPolicy: .init(
+        maxRetries: 2, baseDelay: .seconds(1), maximumDelay: .seconds(2), jitterRatio: 0,
+        randomUnit: { 0.5 }),
+      clock: clock)
+
+    _ = try await coordinator.start()
+    for _ in 0..<1_000 {
+      if case .failed = await coordinator.state { break }
+      await Task.yield()
+    }
+
+    let state = await coordinator.state
+    #expect(
+      state
+        == .failed(
+          .retryExhausted(operation: "stream", attempts: 3, cause: .http(status: 503))))
+    #expect(await clock.delays == [.seconds(1), .seconds(2)])
+    try await coordinator.stop()
+  }
+
+  @Test func failedAttemptCursorReadDoesNotCountAsProgress() async throws {
+    let transport = CoordinatorTransport(responses: [
+      shapeResponse(),
+      response("", status: 404),
+      response("", status: 404),
+    ])
+    let clock = RecordingClock()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "claim"),
+      materializer: AlternatingCursorReadMaterializer(failures: 4),
+      retryPolicy: .init(
+        maxRetries: 2, baseDelay: .seconds(1), maximumDelay: .seconds(2), jitterRatio: 0,
+        randomUnit: { 0.5 }),
+      clock: clock)
+
+    _ = try await coordinator.start()
+    for _ in 0..<1_000 {
+      let state = await coordinator.state
+      if case .failed = state { break }
+      if case .reseedRequired = state { break }
+      await Task.yield()
+    }
+
+    let state = await coordinator.state
+    #expect(
+      state
+        == .failed(
+          .retryExhausted(operation: "stream", attempts: 3, cause: .transport(.unknown))))
+    #expect(await clock.delays == [.seconds(1), .seconds(2)])
+    #expect(await transport.requests.count == 1)
+    try await coordinator.stop()
+  }
+
+  @Test func stopDuringPostFailureCursorReadPublishesNoRetryState() async throws {
+    let materializer = HeldCursorReadMaterializer()
+    let transport = PollFailureArmingTransport(materializer: materializer)
+    let clock = RecordingClock()
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport,
+      request: ShapeRequest(table: "public.items", subscription: "stable-claim"),
+      materializer: materializer,
+      retryPolicy: .init(
+        maxRetries: 1, baseDelay: .seconds(1), maximumDelay: .seconds(1), jitterRatio: 0),
+      clock: clock)
+    let stateUpdates = await coordinator.stateUpdates
+    let published = Task { () -> [ShapeSubscriptionState] in
+      var states: [ShapeSubscriptionState] = []
+      for await state in stateUpdates { states.append(state) }
+      return states
+    }
+
+    _ = try await coordinator.start()
+    for _ in 0..<1_000 {
+      if await materializer.isReadHeld() { break }
+      await Task.yield()
+    }
+    #expect(await materializer.isReadHeld())
+    let stop = Task { try await coordinator.stop() }
+    for _ in 0..<1_000 {
+      if await coordinator.state == .stopping { break }
+      await Task.yield()
+    }
+    #expect(await coordinator.state == .stopping)
+    await materializer.releaseRead()
+    try await stop.value
+
+    let states = await published.value
+    let afterStopping = states.drop(while: { $0 != .stopping })
+    #expect(Array(afterStopping) == [.stopping, .stopped])
+    #expect(await clock.delays.isEmpty)
+    #expect(await coordinator.state == .stopped)
   }
 
   @Test func epochResetIsTerminalAndIsNotRetried() async throws {

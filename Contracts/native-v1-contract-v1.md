@@ -83,6 +83,19 @@ ignored for forward compatibility. A missing required envelope member, invalid o
 JSON, or a missing required next-offset is malformed and fails closed without advancing the local
 cursor.
 
+An entry whose `type` is `__circuits.control` is not a row change: it is an instruction to the
+stream's readers, `{ type, key, value: { control, reason?, groupId?, resumeLsn?, throughLsn? },
+headers: { operation: "control" } }`. The engine writes `control: "must-refetch"` on a shape
+group's stream when the group fell behind, detached and dropped output, ahead of anything it writes
+after reattaching. A reader fails closed at it with `StreamError.mustRefetch`: the batch that carries
+it is not applied and the cursor does not move. The caller reloads the group from a snapshot (a new
+group load) and replaces its rows. A control of any other kind fails closed as malformed, without
+applying its batch or advancing the cursor. A control counts against the per-batch event limit.
+The marker itself does not end the group, unlike a terminal `404`/`410`/`stream-closed`, but a
+session that ends at it releases its claim, so the reload is a new group load under the same
+subscription. A reader that keeps its own materialization must replace its cursor along with its
+rows, since the cursor it holds still sits before the marker and the next read would hit it again.
+
 `404`, `410`, and `stream-closed: true` are terminal generation results. Recreate only after
 discarding the retired generation's materialization scope and cursor; never reuse its offset. Other
 transport/nonterminal HTTP failures are retryable only under the caller/coordinator's bounded retry

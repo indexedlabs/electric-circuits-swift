@@ -141,7 +141,8 @@ private let resumeScope = CollectionScope(principal: "u", authorization: "a", ge
 private let openIssues = CollectionDemand<ResumeIssue>(
   unsafePredicateIdentity: "status=open",
   sourcePredicate: .leaf(column: "status", op: .eq, value: .string("open")))
-private let openIdentity = openIssues.identity(for: resumeIssues, scope: resumeScope)
+private let openIdentity = openIssues.identity(
+  for: resumeIssues, scope: resumeScope, columns: ["id", "title"])
 
 private func makeSource(
   _ transport: ResumeFeedTransport, keyForRow: (@Sendable (ResumeIssue) throws -> Int64)? = nil

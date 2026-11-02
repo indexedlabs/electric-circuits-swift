@@ -3,41 +3,159 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
-## 0.8.0
+## Unreleased
 
-- Add `ShapeSubscriptionCoordinator(..., adopting:, createdAt:)`. A caller that already created the
-  claim with the same request hands its `ShapeHandle` over; the first `start()` streams it without a
-  second create, still taking a capacity permit and running the materializer preflight. The
-  coordinator owns the adopted claim's release from construction, and renews it a third of the lease
-  after `createdAt`, when the caller sent its create, rather than after the launch, so a frontier
-  read and snapshot in between cannot let the claim lapse. `CircuitsSubsetSource` uses it, so
-  materializing a demand POSTs `/v1/subset-feeds` once, not twice.
+- `ShapeSubscriptionCoordinator`'s shape and subset-feed initializer takes `setupClaim:` and
+  `setupClaimAge:`, as the group initializer does. The first `start()` streams a claim the caller
+  already created with the same request instead of creating it again, still taking a capacity permit
+  and running the materializer preflight, and the first renewal falls a third of the lease after
+  that create rather than after the launch. `CircuitsSubsetSource` uses it, so materializing a
+  demand POSTs `/v1/subset-feeds` once, not twice.
 - Add `CollectionResumeSession`, `CollectionResumeInvalidated` and a defaulted
-  `CollectionSourceAdapter.resume` requirement. When the store holds an exact record,
-  `CollectionCoordinator` asks the source to continue it from the stored cursor before
-  materializing. A resumed attempt skips `replaceSnapshot`, stays `.cached`, and reports `.live`
-  once the tail commits a batch or answers an idle poll. A nil result takes the snapshot path
-  unchanged; adapters that do not implement `resume` snapshot on every acquire as before. Stale
-  revalidation always snapshots, and restarts a resumed attempt it joins, including one that already
-  reports `.live`. A session whose feed refuses the stored cursor throws
-  `CollectionResumeInvalidated`; until the tail goes live, the same attempt snapshots instead, so no
-  lease sees a failure. A transient failure fails the attempt, and the next attempt resumes again.
+  `CollectionSourceAdapter.resume` requirement. When the store holds a copy bound to the demand,
+  generation included, `CollectionCoordinator` asks the source to continue it from the stored cursor
+  before materializing. A copy an earlier generation stored snapshots instead, which rebinds it
+  (0.14.0). A resumed attempt skips `replaceSnapshot`, stays `.cached`, and reports `.live` once the
+  tail commits a batch or answers an idle poll. A nil result takes the snapshot path unchanged;
+  adapters that do not implement `resume` snapshot on every acquire as before. Stale revalidation
+  always snapshots, and restarts a resumed attempt it joins, including one that already reports
+  `.live`. A session whose feed refuses the stored cursor throws `CollectionResumeInvalidated`;
+  until the tail goes live, the same attempt snapshots instead, so no lease sees a failure. A
+  transient failure fails the attempt, and the next attempt resumes again.
 - `CircuitsSubsetSource` writes `subset-v2|<streamUrl>|<offset>|<lsn>|<snapshot>|<horizon>` snapshot
-  fences and implements `resume`: it re-joins the identical feed request and, when the engine
-  answers with the fenced stream URL, tails the same append-only stream from the stored cursor and
-  source version with no frontier `HEAD` and no `/v1/subsets/query`. The stream URL, not the shape
-  ID, names the feed: shape IDs restart in a new engine query or store generation
-  (`Contracts/native-v1-contract-v1.md`, "Feed continuity"). The fence carries the snapshot's
-  transaction visibility, so a store that keeps only a version's LSN still resumes with the
-  snapshot's own overlap gate and admits a commit that was in progress when it was taken. Limited
-  windows, `subset-v1` fences, records without a cursor, a different stream URL, and a fence whose
-  last session ended in a terminal or non-retryable stream outcome snapshot instead. A replaced
-  feed's create is kept for the snapshot that follows on the same source instance, so the fallback
-  still POSTs once; an adapter that snapshots through another instance first calls
+  fences and implements `resume`: it re-joins the identical feed request under this launch's
+  subscription and, when the engine answers with the fenced stream URL, tails the same append-only
+  stream from the stored cursor and source version with no frontier `HEAD` and no
+  `/v1/subsets/query`. The stream URL, not the shape ID, names the feed: shape IDs restart in a new
+  engine query or store generation (`Contracts/native-v1-contract-v1.md`, "Feed continuity"). The
+  fence carries the snapshot's transaction visibility, so a store that keeps only a version's LSN
+  still resumes with the snapshot's own overlap gate and admits a commit that was in progress when
+  it was taken. Limited windows, `subset-v1` fences, records without a cursor and a different stream
+  URL snapshot instead, and so does a fence whose last session ended in a terminal stream outcome or
+  a non-retryable failure other than an authentication refusal (401, 403, 407). Transport loss,
+  exhausted retries and authentication refusals leave the fence resumable. A replaced feed's create
+  is kept for the snapshot that follows on the same source instance, so the fallback still POSTs
+  once; an adapter that snapshots through another instance first calls
   `cleanupAbandonedMaterialization`, which releases it. Existing v1 fences decode and are rewritten
   by the next snapshot.
-- This minor release preserves source compatibility with 0.7.0 and introduces no store protocol,
-  persisted schema, or HTTP changes; snapshot fences remain opaque strings to stores.
+- Additive: no store protocol, persisted schema or HTTP changes, and snapshot fences remain opaque
+  strings to stores. The next tag is 0.15.0, a minor bump under the pre-1.0 rule in
+  `Policies/SEMVER.md`.
+
+## 0.14.0
+
+- One cache key per stored copy (OTTO-11415). `CollectionDemandIdentity.cacheKey` is framed from
+  the principal, authorization, collection, canonical demand (predicate, order and limit) and
+  columns (`*` for every column), never the generation; `storageKey` keeps the generation and
+  names the in-memory lease. `CollectionDemandIdentity` gains optional `columns`, which
+  `CollectionDemand.identity(for:scope:columns:)` and the new `CollectionSourceAdapter.columns`
+  (nil by default; `CircuitsSubsetSource` reports its own) fill in; an identity persisted before
+  decodes with every column, and its `storageKey` is unchanged.
+  `CollectionGroupMember.identity(scope:)` gives each table of a group the identity, and so the
+  `cacheKey`, of the single-table demand for it, and `CollectionGroupDemandIdentity.cacheKey` is
+  the group's key without the generation.
+- `CollectionStore.materialization(for:)` finds a copy by `cacheKey`, and a provider keeps one
+  materialization per key: a later generation's snapshot rebinds that copy to its demand and
+  replaces its claims in place. `InMemoryCollectionStore` keys records by `cacheKey` and shares
+  rows across generations of one principal and authorization. The shared store suite adds
+  `laterGenerationBindsTheEarlierCopy`.
+- The coordinator's stale pass re-reads a copy an earlier generation stored under its own
+  `cacheKey` and clears its mark; it no longer removes the copy it refreshed. It clears a mark only
+  when the copy it held or re-read is the marked copy, and removes a second copy under the key
+  instead, reporting that copy's claim count as `sync.claims_released`. Eviction fences are keyed
+  by `cacheKey`.
+- Precondition, stated on `CollectionCoordinator.init` and `startStaleRevalidation`: a retiring
+  generation releases its leases and cancels and awaits its stale pass before a newer generation's
+  coordinator is created. Generations share copies and cannot be ordered, and a copy has one
+  cursor, so two generations live on one copy at once would fail the older lease on its next
+  batch, and a retiring generation's pass could re-read, rebind or remove a copy the newer
+  generation is live on. The app enforces the precondition; the coordinator does not.
+- `evict(_:)` removes a copy only while it is still bound to the calling coordinator's demand,
+  generation included, so a retired generation's eviction leaves a copy a newer generation has
+  bound. It therefore does nothing for a copy an earlier launch stored and this launch has not
+  loaded; an app removes those through the store, as its age-based eviction does.
+- `CircuitsSubsetSource` and `CircuitsSubsetGroupSource` name each server subscription from the
+  materialization ID plus the scope's generation (the ID, a dot and a 16-digit digest of the
+  generation), so a launch never joins a subscription an earlier launch opened.
+- Source-breaking: `CircuitsSubsetGroupSource.materialize` takes the group's `identity:`, whose
+  generation names the subscription. Under the pre-1.0 rule in `Policies/SEMVER.md` that makes the
+  next tag a minor bump (0.14.0).
+
+## 0.13.0
+
+- Add `StreamControl` and `ChangeBatch.controls`. A stream entry of type `__circuits.control` is
+  an instruction to the stream's readers, not a row change, and decodes into `controls`; it counts
+  against the per-batch event limit, and a batch that carries only a control is not empty.
+- A stream reader fails closed at any control: a must-refetch control with
+  `StreamError.mustRefetch(path:control:)`, before any materializer applies the batch that carries
+  it and without moving the cursor, whatever the materializer; any other control kind as
+  `StreamError.decoding`. The engine writes the marker when a
+  shape group that fell behind and detached reattaches (OTTO-11131); output before it is
+  incomplete. `CircuitsSubsetGroupSource` ends the session with
+  `CircuitsSubsetGroupSourceError.mustRefetch(groupID:resumeLSN:)`, and the caller loads the group
+  again and replaces its rows with the new snapshot.
+- Source-breaking: `StreamError` and `CircuitsSubsetGroupSourceError` each gain a case, so an
+  exhaustive `switch` over either needs one more arm, a minor bump under the pre-1.0 rule in
+  `Policies/SEMVER.md`.
+
+## 0.12.0
+
+- Add `LiveDelivery`, how a live batch reached the reader, for measuring time to data.
+  `ShapeStreamReader` sets `LiveDelivery.current` around each live `ShapeMaterializer.apply`, so a
+  materializer, or the store a source hands the batch to, can read it. It carries the live mode, the
+  gateway's send time (SSE's `server-time:` field or a long-poll's `x-indexed-sync-server-time`
+  header), the receive time, whether this is the first batch since the tail started, and each
+  envelope's table and commit time. `CircuitsSubsetSource` and `CircuitsSubsetGroupSource` narrow
+  it to the envelopes their snapshot gate accepts, through `LiveDelivery.applying(changesAt:_:)`,
+  and a batch they drop entirely doesn't count as the first. `EnvelopeHeaders.commitTimestamp`
+  decodes the engine's `headers.commit_ts`. Readers and stores that don't read them are unchanged.
+
+## 0.11.0
+
+- Fix: setting up a group loaded its snapshot twice, once for the rows and again when its
+  subscription started. `ShapeSubscriptionCoordinator(groupRequest:setupClaim:)` starts on the
+  setup's load, and `CircuitsSubsetGroupSource` passes it, so setup makes one
+  `POST v1/subsets/load`. A group released between setup and the first read now ends the stream
+  with a terminal response and requires a reseed, rather than reporting a replacement at setup.
+
+## 0.10.0
+
+- Add `ElectricCircuitsClient.Configuration(liveReadMode:)` taking a closure. A stream reader asks
+  it before each live read, so a reader that is already streaming takes a changed mode at its next
+  read instead of keeping the mode it started with. A reader that fell back from SSE stays on
+  long-poll for its lifetime. `Configuration` equality compares the modes both resolve to now.
+
+## 0.9.0
+
+- Add shape group loads. `ElectricCircuitsClient.loadSubsetGroup(_:)` posts one subscription and
+  every member to `POST v1/subsets/load` and returns one handle, one stream, one snapshot position
+  and table-tagged rows; an answer that doesn't list the requested members fails the load.
+  `ShapeSubscriptionCoordinator(groupRequest:)` renews a group by loading it again.
+- Add `CircuitsSubsetGroupSource` in `ElectricCircuitsCollections`. It reads a group's one stream,
+  routes each envelope to its member by `type`, keys rows by table and key, and hands every batch
+  to a `CollectionGroupStore` as one `CollectionGroupChangeBatch` with the group's one cursor.
+  `InMemoryCollectionGroupStore` is the reference provider. The single-table source, coordinator
+  and `CollectionStore` are unchanged.
+- Known limitation: the group route has only the load call, so setup loads the group twice and
+  every lease renewal re-reads the group's snapshot. The engine does that read and the response
+  carries the rows, though the client decodes only the claim. A group whose rows grow past
+  `ResponseDecodingLimits` after setup fails at its next renewal. Don't enable groups for users
+  until a rows-free renewal lands (OTTO-10739).
+
+## 0.8.0
+
+- Add opt-in SSE live reads through `ElectricCircuitsClient.Configuration`. The reader holds one
+  response per stream, commits data frames with each control offset, resumes after clean response
+  ends, and falls back to long-poll only when the server refuses SSE with a non-event-stream
+  response or a nonterminal 4xx, or when the configured `HTTPTransport` cannot stream. Transport
+  failures and retryable responses stay on SSE and use the shared retry policy. Long-poll remains
+  the default.
+
+## 0.7.1
+
+- Fix stream retry state to count consecutive poll failures. A committed cursor advance resets
+  retry backoff and budget, while failures without progress still exhaust the configured policy.
+  This patch changes no public API, provider schema, or native-v1 contract.
 
 ## 0.7.0
 

@@ -232,6 +232,14 @@ public enum ShapeSubscriptionKind: Equatable, Sendable {
   case subsetFeed
 }
 
+/// The request a coordinator creates and renews its claim with. A group load renews by posting
+/// the same subscription and members again.
+private enum ShapeSubscriptionClaimRoute: Sendable {
+  case shape(ShapeRequest)
+  case subsetFeed(ShapeRequest)
+  case subsetGroup(SubsetGroupRequest)
+}
+
 private struct MaterializerFailure: Error, Sendable {}
 private struct CoordinatedMaterializer: ShapeMaterializer {
   let base: any ShapeMaterializer
@@ -267,22 +275,19 @@ public actor ShapeSubscriptionCoordinator {
 
   private let client: ElectricCircuitsClient
   private let transport: any HTTPTransport
-  private let request: ShapeRequest
+  private let route: ShapeSubscriptionClaimRoute
   private let materializer: any ShapeMaterializer
   private let retryPolicy: ShapeSubscriptionRetryPolicy
   private let clock: any ShapeSubscriptionClock
   private let capacity: ShapeSubscriptionCapacity?
   private let responseDecodingLimits: ResponseDecodingLimits
   private let telemetry: TelemetryReporter
-  private let kind: ShapeSubscriptionKind
   private let recreatePolicy: ShapeSubscriptionRecreatePolicy
   private var continuation: AsyncStream<ShapeSubscriptionState>.Continuation?
   private var handle: ShapeHandle?
-  // A claim the caller created with this same request before the coordinator existed. The first
-  // successful start adopts it instead of POSTing again; until then stop() releases it.
-  private var adoptableHandle: ShapeHandle?
-  /// The handle the caller created and when it sent that create: the claim's lease runs from then.
-  private let adoptedClaim: (handle: ShapeHandle, createdAt: ContinuousClock.Instant)?
+  /// A claim the caller already holds, which the first start uses instead of creating one.
+  private var setupClaim: ShapeHandle?
+  private var setupClaimAge: Duration
   private var pendingRelease: [ShapeHandle] = []
   private var generation: UInt64 = 0
   private var stopping = false
@@ -314,15 +319,12 @@ public actor ShapeSubscriptionCoordinator {
     private var startReturnGates: [UInt64: CheckedContinuation<Void, Never>] = [:]
   #endif
 
-  /// `adopting` hands the coordinator a claim the caller already created with this same
-  /// `request` and `kind` (for example a source's initial subset-feed create before its snapshot).
-  /// The first successful `start()` adopts that handle instead of creating again: it still takes a
-  /// capacity permit and runs the materializer preflight, then streams it and renews it on the
-  /// handle's normal lease schedule. The coordinator owns the adopted claim's release from
-  /// construction, so `stop()` releases it whether or not a start adopted it. Later starts after
-  /// a reseed create normally. `createdAt` is when the caller sent that create: the first renewal
-  /// is due a third of the lease after it rather than after the launch, so a frontier read and a
-  /// snapshot in between cannot let the claim lapse.
+  /// `setupClaim` is the handle of a create the caller already made with this same `request` and
+  /// `kind`, such as a subset source's feed create before its snapshot. The first start uses it
+  /// instead of creating again, still taking a capacity permit and running the materializer
+  /// preflight, and the coordinator takes over releasing it. `setupClaimAge` is how long before
+  /// this call that create was sent: its lease began then, so the first renewal comes that much
+  /// sooner.
   public init(
     client: ElectricCircuitsClient, transport: any HTTPTransport, request: ShapeRequest,
     materializer: any ShapeMaterializer, retryPolicy: ShapeSubscriptionRetryPolicy = .init(),
@@ -332,22 +334,76 @@ public actor ShapeSubscriptionCoordinator {
     telemetry: TelemetryReporter = .noop,
     kind: ShapeSubscriptionKind = .shape,
     recreatePolicy: ShapeSubscriptionRecreatePolicy = .init(),
-    adopting initialHandle: ShapeHandle? = nil,
-    createdAt: ContinuousClock.Instant? = nil
+    setupClaim: ShapeHandle? = nil,
+    setupClaimAge: Duration = .zero
   ) {
+    let route: ShapeSubscriptionClaimRoute =
+      switch kind {
+      case .shape: .shape(request)
+      case .subsetFeed: .subsetFeed(request)
+      }
+    self.init(
+      client: client, transport: transport, route: route, materializer: materializer,
+      retryPolicy: retryPolicy, clock: clock, capacity: capacity,
+      responseDecodingLimits: responseDecodingLimits, telemetry: telemetry,
+      recreatePolicy: recreatePolicy, setupClaim: setupClaim, setupClaimAge: setupClaimAge)
+  }
+
+  /// A coordinator for one shape group: it loads the group, reads the group's one stream and
+  /// renews by loading the same subscription and members again.
+  ///
+  /// `setupClaim` is the handle of a load the caller just made for its snapshot. The coordinator
+  /// starts on it instead of loading the group a second time, and takes over releasing it.
+  /// `setupClaimAge` is how long before this call that load was made: its lease began then, so
+  /// the first renewal comes that much sooner.
+  ///
+  /// A renewal is a full group load: the engine re-reads every member's snapshot and the answer
+  /// carries its rows, which are not decoded. The answer still counts against
+  /// `ResponseDecodingLimits`, so a group whose rows outgrow the limit fails at its next renewal.
+  /// A rows-free renewal is OTTO-10739; don't enable groups for users before it lands.
+  public init(
+    client: ElectricCircuitsClient, transport: any HTTPTransport,
+    groupRequest: SubsetGroupRequest, materializer: any ShapeMaterializer,
+    retryPolicy: ShapeSubscriptionRetryPolicy = .init(),
+    clock: any ShapeSubscriptionClock = ContinuousShapeSubscriptionClock(),
+    capacity: ShapeSubscriptionCapacity? = nil,
+    responseDecodingLimits: ResponseDecodingLimits = .default,
+    telemetry: TelemetryReporter = .noop,
+    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init(),
+    setupClaim: ShapeHandle? = nil,
+    setupClaimAge: Duration = .zero
+  ) {
+    // Only a load that names its subscription renews the same group; without one, every
+    // renewal would mint a new group and report a replacement.
+    precondition(
+      groupRequest.subscription != nil, "a group coordinator needs a stable subscription")
+    self.init(
+      client: client, transport: transport, route: .subsetGroup(groupRequest),
+      materializer: materializer, retryPolicy: retryPolicy, clock: clock, capacity: capacity,
+      responseDecodingLimits: responseDecodingLimits, telemetry: telemetry,
+      recreatePolicy: recreatePolicy, setupClaim: setupClaim, setupClaimAge: setupClaimAge)
+  }
+
+  private init(
+    client: ElectricCircuitsClient, transport: any HTTPTransport,
+    route: ShapeSubscriptionClaimRoute, materializer: any ShapeMaterializer,
+    retryPolicy: ShapeSubscriptionRetryPolicy, clock: any ShapeSubscriptionClock,
+    capacity: ShapeSubscriptionCapacity?, responseDecodingLimits: ResponseDecodingLimits,
+    telemetry: TelemetryReporter, recreatePolicy: ShapeSubscriptionRecreatePolicy,
+    setupClaim: ShapeHandle? = nil, setupClaimAge: Duration = .zero
+  ) {
+    self.setupClaim = setupClaim
+    self.setupClaimAge = setupClaimAge
     self.client = client
     self.transport = transport
-    self.request = request
+    self.route = route
     self.materializer = materializer
     self.retryPolicy = retryPolicy
     self.clock = clock
     self.capacity = capacity
     self.responseDecodingLimits = responseDecodingLimits
     self.telemetry = telemetry
-    self.kind = kind
     self.recreatePolicy = recreatePolicy
-    adoptableHandle = initialHandle
-    adoptedClaim = initialHandle.flatMap { handle in createdAt.map { (handle, $0) } }
     let updates = AsyncStream<ShapeSubscriptionState>.makeStream()
     stateUpdates = updates.stream
     continuation = updates.continuation
@@ -622,10 +678,9 @@ public actor ShapeSubscriptionCoordinator {
       transition(.stopping)
       if let handle { appendRelease(handle) }
       handle = nil
-      // An adopted claim that no start consumed is still owned here. A start task suspended in
-      // preflight is cancelled below and can no longer take it.
-      if let adoptableHandle { appendRelease(adoptableHandle) }
-      adoptableHandle = nil
+      // A setup claim no start consumed, because none ran or it failed first.
+      if let setupClaim { appendRelease(setupClaim) }
+      setupClaim = nil
     }
     let create = startTask
     let renew = renewTask
@@ -660,27 +715,30 @@ public actor ShapeSubscriptionCoordinator {
     streamTask = Task { [weak self] in await self?.consume(handle: handle, generation: generation) }
     if let seconds = handle.response.leaseSeconds, seconds > 0 {
       let interval = max(Duration.seconds(Double(seconds) / 3), .seconds(1))
-      let first =
-        if let adoptedClaim, adoptedClaim.handle == handle {
-          max(interval - adoptedClaim.createdAt.duration(to: .now), .zero)
-        } else {
-          interval
-        }
+      let firstDelay = max(interval - setupClaimAge, .zero)
+      setupClaimAge = .zero
       leaseTask = Task { [weak self] in
-        await self?.renewOnLease(first: first, interval: interval, generation: generation)
+        await self?.renewOnLease(interval: interval, firstDelay: firstDelay, generation: generation)
       }
     }
   }
 
   private func consume(handle streamHandle: ShapeHandle, generation: UInt64) async {
+    // Keep this reader across retries so a stream's SSE fallback lasts until source setup.
+    let configuration = client.configuration
+    let reader = ShapeStreamReader(
+      streamURL: streamHandle.stream.url, transport: transport,
+      materializer: CoordinatedMaterializer(base: materializer), telemetry: telemetry,
+      responseDecodingLimits: responseDecodingLimits, configuration: configuration)
     var retries = 0
     while isCurrent(generation) {
+      // Unknown until this attempt's own read succeeds: a failed read must not leave the previous
+      // attempt's cursor as the baseline, or the post-failure read would look like progress.
+      var cursorAtAttempt: StreamCursor?
       do {
-        transition(.streaming(try await committedCursor()))
-        let reader = ShapeStreamReader(
-          streamURL: streamHandle.stream.url, transport: transport,
-          materializer: CoordinatedMaterializer(base: materializer), telemetry: telemetry,
-          responseDecodingLimits: responseDecodingLimits)
+        let attemptCursor = try await committedCursor()
+        cursorAtAttempt = attemptCursor
+        transition(.streaming(attemptCursor))
         try await reader.run()
         return
       } catch {
@@ -690,6 +748,18 @@ public actor ShapeSubscriptionCoordinator {
             reason: .terminal(reason), previous: streamHandle)
           do { try await requireReseed(outcome) } catch { transition(.failed(failure(for: error))) }
           return
+        }
+        // A reader can commit one or more batches before a later poll fails. Retry budget and
+        // backoff count consecutive failures, so progress since this attempt began starts a fresh
+        // budget rather than carrying failures from the prior cursor forward.
+        let committedAfterFailure = try? await committedCursor()
+        // The read suspends this actor, so stop() or a replacement renew may have retired this
+        // stream meanwhile; a retired stream must not publish another retry or failure state.
+        guard isCurrent(generation), !Task.isCancelled else { return }
+        if let cursorAtAttempt, let committedAfterFailure,
+          committedAfterFailure.offset != cursorAtAttempt.offset
+        {
+          retries = 0
         }
         guard isRetryable(error), retries < retryPolicy.maxRetries else {
           transition(.failed(exhaustedOrFailure(error, retries: retries, operation: "stream")))
@@ -703,11 +773,11 @@ public actor ShapeSubscriptionCoordinator {
     }
   }
 
-  private func renewOnLease(first: Duration, interval: Duration, generation: UInt64) async {
-    var delay = first
+  private func renewOnLease(interval: Duration, firstDelay: Duration, generation: UInt64) async {
+    var delay = firstDelay
     while isCurrent(generation) {
       do {
-        try await clock.sleep(for: delay)
+        if delay > .zero { try await clock.sleep(for: delay) }
         delay = interval
         guard isCurrent(generation) else { return }
         _ = try await renew()
@@ -729,18 +799,18 @@ public actor ShapeSubscriptionCoordinator {
       throw MaterializerFailure()
     }
     try Task.checkCancellation()
-    if let adopted = adoptableHandle {
-      // The caller's create already established this claim; creating again would only repeat the
-      // same POST. A start that fails before this point leaves it adoptable by a later start.
-      adoptableHandle = nil
-      return adopted
+    if let claimed = setupClaim {
+      setupClaim = nil
+      return claimed
     }
     return try await recreatingOnGone(operation: "create") {
-      switch self.kind {
-      case .shape:
-        try await self.client.createShape(self.request)
-      case .subsetFeed:
-        try await self.client.createSubsetFeed(self.request)
+      switch self.route {
+      case .shape(let request):
+        try await self.client.createShape(request)
+      case .subsetFeed(let request):
+        try await self.client.createSubsetFeed(request)
+      case .subsetGroup(let request):
+        try await self.client.claimSubsetGroup(request)
       }
     }
   }
@@ -818,11 +888,15 @@ public actor ShapeSubscriptionCoordinator {
   /// fresh scope instead of inheriting two live server claims.
   private func renewWithRetry() async throws -> ShapeHandle {
     try await recreatingOnGone(operation: "renew") {
-      switch self.kind {
-      case .shape:
-        try await self.client.renewShape(self.request)
-      case .subsetFeed:
-        try await self.client.createSubsetFeed(self.request)
+      switch self.route {
+      case .shape(let request):
+        try await self.client.renewShape(request)
+      case .subsetFeed(let request):
+        try await self.client.createSubsetFeed(request)
+      case .subsetGroup(let request):
+        // A renewal is the same load and still carries the group's rows; only its claim is
+        // decoded. A rows-free renewal needs a server route (OTTO-10739).
+        try await self.client.claimSubsetGroup(request)
       }
     }
   }

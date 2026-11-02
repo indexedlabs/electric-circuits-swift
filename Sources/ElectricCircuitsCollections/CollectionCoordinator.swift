@@ -97,6 +97,8 @@ private struct CollectionStoreApplyFailure: Error, Sendable {}
 
 /// Coordinates exact-demand sharing and store-backed lifecycle for one collection definition and
 /// principal/generation scope. Coverage proofs intentionally begin with exact identity only.
+/// Leases are keyed by `storageKey`, which includes the generation; stored copies are found by
+/// `cacheKey`, so a later generation's coordinator finds and refreshes an earlier one's copy.
 public actor CollectionCoordinator<
   Model: Sendable,
   Key: Hashable & Sendable,
@@ -130,7 +132,8 @@ public actor CollectionCoordinator<
   private let store: Store
   private var entries: [CollectionDemandIdentity: Entry] = [:]
   private var demandByLease: [UUID: CollectionDemandIdentity] = [:]
-  private var evictionTasks: [CollectionDemandIdentity: Task<Void, Error>] = [:]
+  /// Keyed by `cacheKey`: a removal fences every generation's demand for the same stored copy.
+  private var evictionTasks: [String: Task<Void, Error>] = [:]
 
   private struct StaleObservation {
     let position: CollectionSourceVersion
@@ -154,6 +157,13 @@ public actor CollectionCoordinator<
   // this coordinator. These IDs are excluded when deciding whether a screen holds the demand.
   private var staleLeaseIDs: [CollectionMaterializationID: UUID] = [:]
 
+  /// Precondition: before a coordinator for a newer generation of the same principal and
+  /// authorization is created, every coordinator of the retiring generation has released its
+  /// leases and its stale pass has been cancelled and awaited. Generations share stored copies by
+  /// `cacheKey` and cannot be ordered, and a copy has one cursor: two generations live on one copy
+  /// at once would fail the older lease on its next batch, and a retiring generation's stale pass
+  /// could re-read, rebind or remove the copy the newer generation is live on. This precondition
+  /// rules both out. The coordinator does not enforce it; the app does.
   public init(
     definition: CollectionDefinition<Model, Key>,
     scope: CollectionScope,
@@ -168,6 +178,11 @@ public actor CollectionCoordinator<
 
   /// Runs the stale pass for this collection and scope until the calling task is cancelled.
   /// The app owns that task and cancels and awaits it when retiring a scope or generation.
+  /// Precondition (see `init`): a retiring generation releases its leases and cancels and awaits
+  /// this pass before a newer generation's coordinator is created. Generations of one principal
+  /// and authorization share stored copies by `cacheKey` and cannot be ordered, so a retiring
+  /// generation's pass could otherwise re-read, rebind or remove a copy a newer generation is live
+  /// on, and two generations live on one copy at once would fail the older lease on its next batch.
   /// The gate starts closed; the app opens it after first paint while foreground and online.
   /// At most two unheld demands are re-run concurrently, smallest claim count first.
   ///
@@ -179,7 +194,9 @@ public actor CollectionCoordinator<
   /// Claims released is the net decrease in the materialization's claims: for `refreshed`,
   /// max(0, claimCount read with the mark before the run - rows the snapshot returned).
   /// A run that both drops and gains rows reports only the net. For `unrebuildable`, it is
-  /// the claimCount read with the mark; for `held` and `failed`, it is zero.
+  /// the claimCount read with the mark; for `held`, zero; for `failed`, zero. When a `held` or
+  /// `refreshed` run finds the marked copy is not the copy it held or re-read (a second copy
+  /// under the key) and removes it, it is the claimCount read with the mark.
   public func startStaleRevalidation(
     clock: any ShapeSubscriptionClock = ContinuousShapeSubscriptionClock(),
     telemetry: TelemetryReporter = .noop
@@ -407,7 +424,8 @@ public actor CollectionCoordinator<
       guard Set(staleRuns.keys).union(staleLeaseIDs.keys).count < 2 else { break }
       let id = mark.record.id
       guard !occupiedAtRead.contains(id), staleRuns[id] == nil, staleRetries[id] == nil,
-        evictionTasks[mark.record.demand] == nil, let observation = staleObservations[id]
+        evictionTasks[mark.record.demand.cacheKey] == nil,
+        let observation = staleObservations[id]
       else { continue }
       staleRuns[id] = Task {
         await self.revalidate(
@@ -532,26 +550,33 @@ public actor CollectionCoordinator<
         attemptedRelease = false
       }
       guard stalePassMayRun(token) else { throw CancellationError() }
+      // The copy may have been stored by an earlier generation. This generation's demand for it
+      // has the same `cacheKey`, so it finds the same copy and its snapshot replaces that copy's
+      // claims in place; the pass then clears the mark and never removes the copy it refreshed.
+      // A mark clears only when the copy held or re-read is the marked copy. A second copy under
+      // the same key, which a provider should never keep, is removed instead.
       let storedIdentity = mark.record.demand
       let activeIdentity = CollectionDemandIdentity(
         collection: storedIdentity.collection, scope: scope,
-        canonicalDemand: storedIdentity.canonicalDemand)
+        canonicalDemand: storedIdentity.canonicalDemand, columns: source.columns)
       // A held live copy maintains its own claims from the feed, once its snapshot established
       // them. A resumed tail does not count: it never re-read the source, which is what the mark
       // asks for, so it revalidates through a snapshot like an unheld copy, below.
       let held = entries[activeIdentity].flatMap { entry in
-        !entry.leases.isEmpty && entry.state == .live ? entry : nil
+        !entry.leases.isEmpty && entry.state == .live
+          && activeIdentity.cacheKey == storedIdentity.cacheKey ? entry : nil
       }
       if let entry = held, entry.resumingAttempt != entry.attempt {
-        if storedIdentity != activeIdentity {
-          // The current live copy owns its own claims; an earlier launch's claims must
-          // actually leave the store, not merely lose their stale flag.
-          try await removeStaleMaterialization(storedIdentity)
-        } else {
+        if entry.materializationID == id {
           try await store.clearStale(id, ifMarkedAt: mark.markedAt)
+        } else {
+          try await removeStaleMaterialization(storedIdentity, copy: id)
+          claimsReleased = mark.claimCount
         }
         outcome = "held"
-      } else if let demand = held?.demand ?? rebuiltDemand(storedIdentity, active: activeIdentity) {
+      } else if let demand = held?.demand ?? rebuiltDemand(storedIdentity, active: activeIdentity),
+        activeIdentity.cacheKey == storedIdentity.cacheKey
+      {
         // Revalidation is a fresh snapshot: a resumed tail neither reports a row count nor
         // proves, once this lease releases it, that it reached the drop position.
         let lease = acquire(demand, requiringSnapshot: true)
@@ -562,22 +587,22 @@ public actor CollectionCoordinator<
           await lease.refresh()
         }
         rowsReturned = try await staleSnapshotRowCount(for: lease, identity: activeIdentity)
+        let refreshedID = entries[activeIdentity]?.materializationID
         guard stalePassMayRun(token) else { throw CancellationError() }
         attemptedRelease = true
         try await lease.release()
         staleLeaseIDs.removeValue(forKey: id)
         guard stalePassMayRun(token) else { throw CancellationError() }
-        if storedIdentity != activeIdentity {
-          // Retire the superseded generation only after the current snapshot and release
-          // succeed. Its replacement retains its own marks, including concurrent drops.
-          try await removeStaleMaterialization(storedIdentity)
-        } else {
+        if refreshedID == id {
           try await store.clearStale(id, ifMarkedAt: mark.markedAt)
+          claimsReleased = max(0, mark.claimCount - rowsReturned)
+        } else {
+          try await removeStaleMaterialization(storedIdentity, copy: id)
+          claimsReleased = mark.claimCount
         }
         outcome = "refreshed"
-        claimsReleased = max(0, mark.claimCount - rowsReturned)
       } else {
-        try await removeStaleMaterialization(storedIdentity)
+        try await removeStaleMaterialization(storedIdentity, copy: id)
         outcome = "unrebuildable"
         claimsReleased = mark.claimCount
       }
@@ -607,20 +632,22 @@ public actor CollectionCoordinator<
     _ stored: CollectionDemandIdentity, active: CollectionDemandIdentity
   ) -> CollectionDemand<Model>? {
     guard let demand = definition.rebuildDemand?(stored),
-      demand.identity(for: definition, scope: scope) == active
+      demand.identity(for: definition, scope: scope, columns: source.columns) == active
     else { return nil }
     return demand
   }
 
-  private func removeStaleMaterialization(_ identity: CollectionDemandIdentity) async throws {
-    // Fence removal using the stored identity, including its original generation. Acquiring
-    // the replacement must never cause eviction to target that replacement's materialization.
+  private func removeStaleMaterialization(
+    _ identity: CollectionDemandIdentity, copy: CollectionMaterializationID
+  ) async throws {
+    // Fence removal by the stored copy's key, so a demand acquired meanwhile waits for it and
+    // then loads afresh rather than binding the copy being removed.
     let removal: Task<Void, Error>
-    if let existing = evictionTasks[identity] {
+    if let existing = evictionTasks[identity.cacheKey] {
       removal = existing
     } else {
-      removal = Task { try await self.performEviction(identity) }
-      evictionTasks[identity] = removal
+      removal = Task { try await self.performEviction(identity, copy: copy) }
+      evictionTasks[identity.cacheKey] = removal
     }
     try await removal.value
   }
@@ -637,7 +664,7 @@ public actor CollectionCoordinator<
   private func acquire(
     _ demand: CollectionDemand<Model>, requiringSnapshot: Bool
   ) -> CollectionLease {
-    let identity = demand.identity(for: definition, scope: scope)
+    let identity = demand.identity(for: definition, scope: scope, columns: source.columns)
     let leaseID = UUID()
     let updates = AsyncStream<CollectionLoadState>.makeStream(
       bufferingPolicy: .bufferingNewest(16))
@@ -674,12 +701,12 @@ public actor CollectionCoordinator<
         refreshTask: nil,
         releaseToken: nil,
         releaseTask: nil,
-        awaitsEviction: evictionTasks[identity] != nil,
+        awaitsEviction: evictionTasks[identity.cacheKey] != nil,
         snapshotRowCount: nil,
         requiresSnapshot: requiringSnapshot
       )
       updates.continuation.yield(.unavailable)
-      if evictionTasks[identity] == nil {
+      if evictionTasks[identity.cacheKey] == nil {
         startAttempt(for: identity, attempt: attempt)
       }
     }
@@ -739,7 +766,10 @@ public actor CollectionCoordinator<
       guard updateEntry(identity: identity, attempt: attempt, state: .cached) else { return }
       guard var entry = entries[identity], entry.attempt == attempt else { return }
       entry.materializationID = cached.id
-      let resumes = !entry.requiresSnapshot
+      // Only a snapshot rebinds a copy an earlier generation stored to this demand
+      // (`replaceSnapshot`); a resumed tail would leave it bound to that generation, which
+      // `evict(_:)` and the stale pass key on. So only a copy already bound here resumes.
+      let resumes = !entry.requiresSnapshot && cached.demand == identity
       if resumes { entry.resumingAttempt = attempt }
       entries[identity] = entry
       if resumes, await runResumed(from: cached, identity: identity, attempt: attempt) { return }
@@ -1243,10 +1273,15 @@ public actor CollectionCoordinator<
   }
 
   /// Removes an inactive cached materialization. Acquires that arrive while the store operation is
-  /// in flight are fenced behind it and receive a fresh source attempt after it completes.
+  /// in flight are fenced behind it and receive a fresh source attempt after it completes. Only a
+  /// copy still bound to this coordinator's demand (its generation included) is removed: once
+  /// another generation's snapshot has bound the copy, it is that generation's, and a retired
+  /// generation's eviction leaves it. A copy an earlier launch stored and this launch has not
+  /// loaded is bound to the earlier launch's demand, so this does nothing for it; remove such
+  /// copies through the store, as an app's age-based eviction does.
   public func evict(_ demand: CollectionDemand<Model>) async throws {
-    let identity = demand.identity(for: definition, scope: scope)
-    if let task = evictionTasks[identity] {
+    let identity = demand.identity(for: definition, scope: scope, columns: source.columns)
+    if let task = evictionTasks[identity.cacheKey] {
       try await task.value
       return
     }
@@ -1255,13 +1290,21 @@ public actor CollectionCoordinator<
       guard let self else { return }
       try await self.performEviction(identity)
     }
-    evictionTasks[identity] = task
+    evictionTasks[identity.cacheKey] = task
     try await task.value
   }
 
-  private func performEviction(_ identity: CollectionDemandIdentity) async throws {
+  /// Removes the copy `identity` names, only while the store still binds it to exactly `identity`
+  /// (generation included). With `copy`, only that materialization is removed: when the key finds
+  /// another copy or none, `copy` is a copy under the key that no lookup reaches.
+  private func performEviction(
+    _ identity: CollectionDemandIdentity, copy: CollectionMaterializationID? = nil
+  ) async throws {
     do {
-      if let record = try await store.materialization(for: identity) {
+      let record = try await store.materialization(for: identity)
+      if let copy, record?.id != copy {
+        try await store.removeMaterialization(copy)
+      } else if let record, record.demand == identity {
         try await store.removeMaterialization(record.id)
       }
       finishEviction(identity)
@@ -1272,10 +1315,14 @@ public actor CollectionCoordinator<
   }
 
   private func finishEviction(_ identity: CollectionDemandIdentity) {
-    evictionTasks.removeValue(forKey: identity)
-    guard var entry = entries[identity], entry.awaitsEviction, !entry.leases.isEmpty else { return }
-    entry.awaitsEviction = false
-    entries[identity] = entry
-    startAttempt(for: identity, attempt: entry.attempt)
+    evictionTasks.removeValue(forKey: identity.cacheKey)
+    // The fenced entry is this generation's demand for the same key, whatever generation the
+    // removed copy was stored under.
+    for (waiting, var entry) in entries
+    where waiting.cacheKey == identity.cacheKey && entry.awaitsEviction && !entry.leases.isEmpty {
+      entry.awaitsEviction = false
+      entries[waiting] = entry
+      startAttempt(for: waiting, attempt: entry.attempt)
+    }
   }
 }

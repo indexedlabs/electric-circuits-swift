@@ -27,6 +27,28 @@ public struct EnvelopeHeaders: Codable, Equatable, Sendable {
   public var lsn: String?
   public var seq: UInt64?
   public var last: Bool?
+  /// The change's Postgres commit time in milliseconds since the Unix epoch, on the source's
+  /// clock (`headers.commit_ts`). The engine stamps it on live changes only; it is telemetry, for
+  /// measuring time to data, and nothing orders on it.
+  public var commitTimestamp: Int64?
+
+  private enum CodingKeys: String, CodingKey {
+    case operation, txid, offset, lsn, seq, last
+    case commitTimestamp = "commit_ts"
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    operation = try container.decode(ChangeOperation.self, forKey: .operation)
+    txid = try container.decodeIfPresent(String.self, forKey: .txid)
+    offset = try container.decodeIfPresent(String.self, forKey: .offset)
+    lsn = try container.decodeIfPresent(String.self, forKey: .lsn)
+    seq = try container.decodeIfPresent(UInt64.self, forKey: .seq)
+    last = try container.decodeIfPresent(Bool.self, forKey: .last)
+    // Telemetry only: a malformed value is dropped rather than failing the batch, so it can
+    // never stop a stream.
+    commitTimestamp = (try? container.decodeIfPresent(Int64.self, forKey: .commitTimestamp)) ?? nil
+  }
 
   public init(
     operation: ChangeOperation,
@@ -34,7 +56,8 @@ public struct EnvelopeHeaders: Codable, Equatable, Sendable {
     offset: String? = nil,
     lsn: String? = nil,
     seq: UInt64? = nil,
-    last: Bool? = nil
+    last: Bool? = nil,
+    commitTimestamp: Int64? = nil
   ) {
     self.operation = operation
     self.txid = txid
@@ -42,7 +65,92 @@ public struct EnvelopeHeaders: Codable, Equatable, Sendable {
     self.lsn = lsn
     self.seq = seq
     self.last = last
+    self.commitTimestamp = commitTimestamp
   }
+}
+
+/// How one live batch reached the reader, for measuring time to data. During
+/// `ShapeMaterializer.apply` of a live batch, `LiveDelivery.current` holds it, so a materializer
+/// (and the store a source hands the batch to) can read it without a protocol change. Times are
+/// milliseconds since the Unix epoch: `serverSentAt` on the gateway's clock, `receivedAt` on this
+/// device's.
+public struct LiveDelivery: Equatable, Sendable {
+  /// One envelope of the batch: its `type` and its `headers.commit_ts`, when the engine sent one.
+  public struct Change: Equatable, Sendable {
+    public let table: String
+    public let commitTimestamp: Int64?
+
+    public init(table: String, commitTimestamp: Int64?) {
+      self.table = table
+      self.commitTimestamp = commitTimestamp
+    }
+  }
+
+  /// The mode of the read that delivered the batch.
+  public let mode: LiveReadMode
+  /// The gateway's send time: SSE's `server-time:` field on the batch's last `data` event, or a
+  /// long-poll response's `x-indexed-sync-server-time` header. `nil` when the server sent none.
+  public let serverSentAt: Int64?
+  /// When the reader held the complete batch, before it applied it.
+  public let receivedAt: Int64
+  /// Whether no earlier batch since the reader's tail started (after its snapshot or after a
+  /// retry) applied a change. A long-poll's next request and SSE's routine reconnection are not a
+  /// new start, and a batch whose every envelope a source dropped doesn't count as applied.
+  public let firstAfterReconnect: Bool
+  /// The batch's envelopes in stream order; inside `applying(changesAt:_:)`, only those a source
+  /// accepted. For a limited (windowed) demand these are the accepted feed changes that made the
+  /// source re-query its page, not the page rows the store receives.
+  public let changes: [Change]
+
+  public init(
+    mode: LiveReadMode, serverSentAt: Int64?, receivedAt: Int64, firstAfterReconnect: Bool,
+    changes: [Change]
+  ) {
+    self.mode = mode
+    self.serverSentAt = serverSentAt
+    self.receivedAt = receivedAt
+    self.firstAfterReconnect = firstAfterReconnect
+    self.changes = changes
+  }
+
+  /// The delivery of the live batch being applied, set by `ShapeStreamReader` around
+  /// `ShapeMaterializer.apply`. `nil` outside a live apply.
+  @TaskLocal public static var current: LiveDelivery?
+
+  /// Runs `operation`, a materializer's store apply, with `current` narrowed to the envelopes at
+  /// `indices`: the ones a source accepted after dropping those its snapshot already holds. With
+  /// none accepted, `current` is `nil`, and the batch doesn't count as the first applied after a
+  /// reconnect. A materializer that never calls this is taken to have applied every envelope.
+  public static func applying<R>(
+    changesAt indices: [Int],
+    isolation: isolated (any Actor)? = #isolation,
+    _ operation: () async throws -> R
+  ) async rethrows -> R {
+    applyReport?.record(applied: indices.count)
+    let narrowed: LiveDelivery? = current.flatMap { delivery in
+      indices.isEmpty
+        ? nil
+        : LiveDelivery(
+          mode: delivery.mode, serverSentAt: delivery.serverSentAt,
+          receivedAt: delivery.receivedAt, firstAfterReconnect: delivery.firstAfterReconnect,
+          changes: indices.map { delivery.changes[$0] })
+    }
+    return try await $current.withValue(narrowed, operation: operation)
+  }
+
+  /// How many envelopes the materializer reported applying, through `applying(changesAt:_:)`.
+  final class ApplyReport: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count: Int?
+    func record(applied: Int) { lock.withLock { count = (count ?? 0) + applied } }
+    var applied: Int? { lock.withLock { count } }
+  }
+  @TaskLocal static var applyReport: ApplyReport?
+
+  /// The gateway's response header carrying its wall-clock time in Unix milliseconds.
+  public static let serverTimeHeader = "x-indexed-sync-server-time"
+
+  static func now() -> Int64 { Int64((Date().timeIntervalSince1970 * 1000).rounded(.down)) }
 }
 
 /// One State-Protocol change event from a native shape stream.
@@ -69,36 +177,106 @@ public struct ChangeEnvelope: Codable, Equatable, Sendable {
   }
 }
 
+/// A stream entry that is not a row change: the engine's instruction to the stream's readers. A
+/// shape group that fell behind and detached writes a `must-refetch` control when it reattaches;
+/// the output before it is incomplete, and its readers reload the group from a snapshot.
+public struct StreamControl: Codable, Equatable, Sendable {
+  /// The envelope `type` the engine writes controls under. It names no table.
+  public static let envelopeType = "__circuits.control"
+  public static let mustRefetch = "must-refetch"
+
+  public var control: String
+  public var reason: String?
+  /// The group that detached, and the commits whose output it dropped.
+  public var groupID: String?
+  public var resumeLSN: String?
+  public var throughLSN: String?
+
+  public init(
+    control: String, reason: String? = nil, groupID: String? = nil, resumeLSN: String? = nil,
+    throughLSN: String? = nil
+  ) {
+    self.control = control
+    self.reason = reason
+    self.groupID = groupID
+    self.resumeLSN = resumeLSN
+    self.throughLSN = throughLSN
+  }
+
+  public var isMustRefetch: Bool { control == Self.mustRefetch }
+
+  enum CodingKeys: String, CodingKey {
+    case control, reason
+    case groupID = "groupId"
+    case resumeLSN = "resumeLsn"
+    case throughLSN = "throughLsn"
+  }
+}
+
 /// The JSON body of one durable-stream read. Rust returns a JSON array, not an object containing
 /// metadata, so this wrapper encodes and decodes as that array while giving materializers a stable
-/// value type.
+/// value type. Entries of type `StreamControl.envelopeType` are not row changes; they decode into
+/// `controls` rather than `envelopes`.
 public struct ChangeBatch: Codable, Equatable, Sendable {
   public var envelopes: [ChangeEnvelope]
+  public var controls: [StreamControl]
 
-  public init(envelopes: [ChangeEnvelope] = []) {
+  public init(envelopes: [ChangeEnvelope] = [], controls: [StreamControl] = []) {
     self.envelopes = envelopes
+    self.controls = controls
   }
 
   public init(_ envelopes: [ChangeEnvelope]) {
     self.envelopes = envelopes
+    controls = []
   }
 
-  public var isEmpty: Bool { envelopes.isEmpty }
+  public var isEmpty: Bool { envelopes.isEmpty && controls.isEmpty }
 
   public func encode(to encoder: Encoder) throws {
     var container = encoder.unkeyedContainer()
     for envelope in envelopes {
       try container.encode(envelope)
     }
+    for control in controls {
+      try container.encode(ControlEnvelope(value: control))
+    }
   }
 
   public init(from decoder: Decoder) throws {
     var container = try decoder.unkeyedContainer()
     var decoded: [ChangeEnvelope] = []
+    var controls: [StreamControl] = []
     while !container.isAtEnd {
-      decoded.append(try container.decode(ChangeEnvelope.self))
+      let entry = try container.superDecoder()
+      let kind = try entry.container(keyedBy: EntryKind.CodingKeys.self)
+      if try kind.decodeIfPresent(String.self, forKey: .type) == StreamControl.envelopeType {
+        controls.append(try ControlEnvelope(from: entry).value)
+      } else {
+        decoded.append(try ChangeEnvelope(from: entry))
+      }
     }
     envelopes = decoded
+    self.controls = controls
+  }
+
+  private enum EntryKind {
+    enum CodingKeys: String, CodingKey { case type }
+  }
+
+  /// A control's wire form: an envelope whose `value` carries the control.
+  private struct ControlEnvelope: Codable {
+    var type = StreamControl.envelopeType
+    var key: String
+    var value: StreamControl
+    var headers = Headers()
+
+    struct Headers: Codable { var operation = "control" }
+
+    init(value: StreamControl) {
+      key = value.control
+      self.value = value
+    }
   }
 }
 
@@ -291,13 +469,19 @@ public enum StreamError: Error, Equatable, Sendable {
   /// The decoded batch was rejected before any provider apply. `observed` is capped at `limit + 1`.
   case batchTooLarge(limit: Int, observed: Int)
   case decoding(String)
+  /// The stream carries a must-refetch control: output before it was dropped, so the stream can
+  /// no longer complete what a reader holds. The reader fails closed without applying the batch
+  /// or advancing the cursor; reload from a snapshot.
+  case mustRefetch(path: String, control: StreamControl)
 }
 
 public typealias ShapeStreamError = StreamError
 
-// MARK: - Long-poll reader
+private struct SSEStalled: Error, Sendable {}
 
-/// Reads one native durable shape stream using HTTP long-polling. Responses with an advertised
+// MARK: - Stream reader
+
+/// Reads one native durable shape stream using long-polling or opt-in SSE. Responses with an advertised
 /// checkpoint, including empty responses, are applied exactly once; idle responses without one are
 /// ignored. Retry/backoff is intentionally outside this narrow slice; callers can restart the reader
 /// with the last committed cursor using their own policy.
@@ -309,6 +493,9 @@ public struct ShapeStreamReader: Sendable {
   public let telemetry: TelemetryReporter
   public let responseDecodingLimits: ResponseDecodingLimits
   private let resumesFromMaterializer: Bool
+  private let liveReadState: LiveReadState
+  private let silenceTimeout: Duration
+  private static let sseSilenceTimeout: Duration = .seconds(45)
 
   public init(
     streamURL: URL,
@@ -316,13 +503,34 @@ public struct ShapeStreamReader: Sendable {
     materializer: any ShapeMaterializer,
     startingAt cursor: StreamCursor? = nil,
     telemetry: TelemetryReporter = .noop,
-    responseDecodingLimits: ResponseDecodingLimits = .default
+    responseDecodingLimits: ResponseDecodingLimits = .default,
+    configuration: ElectricCircuitsClient.Configuration = .default
   ) {
+    self.init(
+      streamURL: streamURL, transport: transport, materializer: materializer,
+      startingAt: cursor, telemetry: telemetry, responseDecodingLimits: responseDecodingLimits,
+      configuration: configuration, sseSilenceTimeout: Self.sseSilenceTimeout)
+  }
+
+  init(
+    streamURL: URL,
+    transport: any HTTPTransport,
+    materializer: any ShapeMaterializer,
+    startingAt cursor: StreamCursor? = nil,
+    telemetry: TelemetryReporter = .noop,
+    responseDecodingLimits: ResponseDecodingLimits = .default,
+    configuration: ElectricCircuitsClient.Configuration = .default,
+    sseSilenceTimeout: Duration
+  ) {
+    self.liveReadState = LiveReadState(
+      configuration: configuration,
+      maximumEventBytes: responseDecodingLimits.maximumDecodedResponseBytes)
     self.streamURL = streamURL
     self.transport = transport
     self.materializer = materializer
     self.telemetry = telemetry
     self.responseDecodingLimits = responseDecodingLimits
+    self.silenceTimeout = sseSilenceTimeout
     initialCursor = cursor ?? .beginning
     resumesFromMaterializer = cursor == nil
   }
@@ -340,68 +548,344 @@ public struct ShapeStreamReader: Sendable {
         throw StreamError.startingCursorMismatch(durable: expectedCursor, requested: initialCursor)
       }
     }
+    await liveReadState.beginTail()
     while true {
       try Task.checkCancellation()
-      let result = try await poll(at: cursor)
-      if let result {
-        try Task.checkCancellation()
-        let span = telemetry.beginSpan(name: "electric.materializer.apply", kind: .internalSpan)
-        let started = DispatchTime.now().uptimeNanoseconds
+      if await liveReadState.mode == .sse {
+        let response = SSEReadSession(
+          reader: self, cursor: cursor, expectedCursor: expectedCursor,
+          maximumEventBytes: await liveReadState.maximumEventBytes)
         do {
+          try await readSSE(at: cursor, into: response)
+        } catch {
+          if Task.isCancelled || error is CancellationError { throw CancellationError() }
+          if error is SSEStalled {
+            await liveReadState.setMaximumEventBytes(await response.maximumEventBytes)
+            (cursor, expectedCursor) = await response.checkpoint()
+            continue
+          }
+          if let streamError = error as? StreamError, case .terminal = streamError { throw error }
+          if shouldFallBackFromSSE(error, sawControl: await response.sawControl) {
+            // This state belongs to the reader's source lifetime, including coordinator retries.
+            await liveReadState.fallBack()
+          } else {
+            throw error
+          }
+        }
+        await liveReadState.setMaximumEventBytes(await response.maximumEventBytes)
+        (cursor, expectedCursor) = await response.checkpoint()
+      } else if let result = try await poll(at: cursor) {
+        cursor = try await commit(result, expecting: expectedCursor)
+        expectedCursor = cursor
+      }
+    }
+  }
+
+  private actor LiveReadState {
+    private let configuration: ElectricCircuitsClient.Configuration
+    private var fellBack = false
+    private(set) var maximumEventBytes: Int
+    init(configuration: ElectricCircuitsClient.Configuration, maximumEventBytes: Int) {
+      self.configuration = configuration
+      self.maximumEventBytes = maximumEventBytes
+    }
+    /// Resolved before each live read; a fallback from SSE outlasts any later answer.
+    var mode: LiveReadMode { fellBack ? .longPoll : configuration.liveReadMode }
+    func fallBack() { fellBack = true }
+    /// Whether a batch has applied a change since `run()` last started its tail.
+    private(set) var deliveredSinceTailStart = false
+    func beginTail() { deliveredSinceTailStart = false }
+    func markDelivered() { deliveredSinceTailStart = true }
+    func setMaximumEventBytes(_ value: Int) { maximumEventBytes = value }
+  }
+
+  private func commit(_ result: PollResult, expecting expectedCursor: StreamCursor?) async throws
+    -> StreamCursor
+  {
+    try Task.checkCancellation()
+    // Every materializer fails closed here, whether or not it reads `controls`: committing past
+    // a must-refetch marker would move the cursor over output the stream dropped.
+    if let control = result.batch.controls.first(where: { $0.isMustRefetch }) {
+      throw StreamError.mustRefetch(path: streamURL.path, control: control)
+    }
+    // A control kind this reader does not know may also say the stream cannot complete what the
+    // reader holds; skipping it would commit past an instruction, so it fails closed as well.
+    if let control = result.batch.controls.first {
+      throw StreamError.decoding("unsupported stream control '\(control.control)'")
+    }
+    var delivery: LiveDelivery?
+    if !result.batch.isEmpty {
+      let first = !(await liveReadState.deliveredSinceTailStart)
+      delivery = LiveDelivery(
+        mode: result.mode, serverSentAt: result.serverSentAt, receivedAt: result.receivedAt,
+        firstAfterReconnect: first,
+        changes: result.batch.envelopes.map {
+          LiveDelivery.Change(table: $0.type, commitTimestamp: $0.headers.commitTimestamp)
+        })
+    }
+    let span = telemetry.beginSpan(name: "electric.materializer.apply", kind: .internalSpan)
+    let started = DispatchTime.now().uptimeNanoseconds
+    let report = LiveDelivery.ApplyReport()
+    do {
+      try await LiveDelivery.$applyReport.withValue(report) {
+        try await LiveDelivery.$current.withValue(delivery) {
           try await materializer.apply(
             result.batch, expecting: expectedCursor, advancingTo: result.cursor)
-        } catch {
-          telemetry.endSpan(
-            span, attributes: ["electric.operation": "apply", "error.type": "materializer"])
-          telemetry.recordCounter(
-            "electric.materializer.failures", attributes: ["electric.operation": "apply"])
-          throw error
-        }
-        telemetry.endSpan(span, attributes: ["electric.operation": "apply"])
-        telemetry.recordGauge(
-          "electric.materializer.duration_ms",
-          value: Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000,
-          attributes: ["electric.operation": "apply"])
-        // A materializer may atomically reseed from a SQL snapshot while applying this stream
-        // batch. That snapshot retains the durable offset but can carry a newer LSN, so the next
-        // CAS must resume from the checkpoint the provider actually committed—not merely the
-        // stream batch's diagnostic watermark. Legacy materializers that do not expose durable
-        // state retain the original result-cursor behavior.
-        if let committedCursor = try await materializer.currentCursor() {
-          guard committedCursor.offset == result.cursor.offset else {
-            throw StreamError.committedCursorMismatch(
-              result: result.cursor, committed: committedCursor)
-          }
-          cursor = committedCursor
-          expectedCursor = committedCursor
-        } else {
-          cursor = result.cursor
-          expectedCursor = result.cursor
         }
       }
-      // An idle response without a next offset leaves the durable cursor unchanged. When the
-      // server advertises a next offset, `result.batch` is empty but still goes through the same
-      // atomic materializer boundary so the checkpoint is durable.
+    } catch {
+      telemetry.endSpan(
+        span, attributes: ["electric.operation": "apply", "error.type": "materializer"])
+      telemetry.recordCounter(
+        "electric.materializer.failures", attributes: ["electric.operation": "apply"])
+      throw error
+    }
+    telemetry.endSpan(span, attributes: ["electric.operation": "apply"])
+    if delivery != nil, (report.applied ?? result.batch.envelopes.count) > 0 {
+      await liveReadState.markDelivered()
+    }
+    telemetry.recordGauge(
+      "electric.materializer.duration_ms",
+      value: Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000,
+      attributes: ["electric.operation": "apply"])
+    // Preserve a provider's strengthened diagnostic LSN while checking its durable offset.
+    if let committedCursor = try await materializer.currentCursor() {
+      guard committedCursor.offset == result.cursor.offset else {
+        throw StreamError.committedCursorMismatch(result: result.cursor, committed: committedCursor)
+      }
+      return committedCursor
+    }
+    return result.cursor
+  }
+
+  private func readSSE(at cursor: StreamCursor, into receiver: SSEReadSession) async throws {
+    var request = try streamRequest(at: cursor, mode: .sse)
+    request = transport.prepare(request)
+    let span = telemetry.beginSpan(
+      name: "electric.stream.sse", kind: .client,
+      parentTraceparent: request.value(forHTTPHeaderField: "traceparent"))
+    telemetry.injectTraceContext(into: &request, span: span)
+    let streamRequest = request
+    do {
+      try await withThrowingTaskGroup(of: Void.self) { group in
+        group.addTask {
+          try await self.transport.stream(
+            streamRequest,
+            onResponse: { try await receiver.receive($0) },
+            onBytes: { try await receiver.receive($0) })
+        }
+        group.addTask {
+          try await receiver.waitForSilence(timeout: silenceTimeout)
+        }
+        defer { group.cancelAll() }
+        _ = try await group.next()
+      }
+      let attributes = ["http.method": "GET", "http.route": "/stream"]
+      telemetry.endSpan(span, attributes: attributes)
+      telemetry.recordCounter("electric.http.requests", attributes: attributes)
+    } catch {
+      let attributes = ["http.method": "GET", "http.route": "/stream", "error.type": "stream"]
+      telemetry.endSpan(span, attributes: attributes)
+      telemetry.recordCounter("electric.http.requests", attributes: attributes)
+      throw error
+    }
+    // The receiver is response-local: trailing partial events and uncommitted data are dropped.
+  }
+
+  private func shouldFallBackFromSSE(_ error: Error, sawControl: Bool) -> Bool {
+    guard !sawControl else { return false }
+    if error is SSEFallback { return true }
+    if error is StreamingUnsupported { return true }
+    if let clientError = error as? ClientError {
+      if case .http(let status, _) = clientError {
+        return (400..<500).contains(status) && status != 404 && status != 410
+      }
+    }
+    // Transport errors, retryable HTTP responses (including 408/425/429), and parser/provider
+    // failures stay on SSE so the coordinator can apply its shared retry policy and resume from
+    // the committed cursor. A non-event-stream response is the distinct SSEFallback case above.
+    return false
+  }
+
+  private struct SSEFallback: Error {}
+
+  private actor SSEReadSession {
+    let reader: ShapeStreamReader
+    var cursor: StreamCursor
+    var expectedCursor: StreamCursor?
+    var parser: SSEParser
+    var pending = ChangeBatch()
+    /// The `server-time:` of the last `data` event folded into `pending`.
+    private var pendingServerTime: Int64?
+    /// When the bytes completing the last `data` event folded into `pending` arrived.
+    private var pendingReceivedAt: Int64?
+    private(set) var maximumEventBytes: Int
+    private let clock = ContinuousClock()
+    private var lastActivity: ContinuousClock.Instant
+    private var receivedHeaders = false
+    private var headerWaiters: [CheckedContinuation<Void, Never>] = []
+    private var committing = false
+    private(set) var sawControl = false
+
+    init(
+      reader: ShapeStreamReader, cursor: StreamCursor, expectedCursor: StreamCursor?,
+      maximumEventBytes: Int
+    ) {
+      self.reader = reader
+      self.cursor = cursor
+      self.expectedCursor = expectedCursor
+      self.maximumEventBytes = maximumEventBytes
+      parser = SSEParser(maximumEventBytes: maximumEventBytes)
+      lastActivity = ContinuousClock().now
+    }
+
+    func checkpoint() -> (StreamCursor, StreamCursor?) { (cursor, expectedCursor) }
+
+    func waitForSilence(timeout: Duration) async throws {
+      if !receivedHeaders {
+        await withTaskCancellationHandler(
+          operation: {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+              if receivedHeaders {
+                continuation.resume()
+              } else {
+                headerWaiters.append(continuation)
+              }
+            }
+          },
+          onCancel: { Task { await self.resumeHeaderWaiters() } })
+        try Task.checkCancellation()
+      }
+      while true {
+        if committing {
+          try await Task.sleep(for: .milliseconds(10))
+          continue
+        }
+        let deadline = lastActivity.advanced(by: timeout)
+        if clock.now >= deadline { throw SSEStalled() }
+        try await Task.sleep(until: deadline, clock: clock)
+        if !committing && clock.now >= lastActivity.advanced(by: timeout) { throw SSEStalled() }
+      }
+    }
+
+    func receive(_ headers: HTTPURLResponse) throws {
+      receivedHeaders = true
+      resumeHeaderWaiters()
+      lastActivity = clock.now
+      let status = headers.statusCode
+      if headers.value(forHTTPHeaderField: "stream-closed")?.lowercased() == "true" {
+        throw StreamError.terminal(path: reader.streamURL.path, status: status, reason: .closed)
+      }
+      if status == 404 || status == 410 {
+        throw StreamError.terminal(
+          path: reader.streamURL.path, status: status, reason: status == 404 ? .notFound : .gone)
+      }
+      guard (200..<300).contains(status) else { throw nativeHTTPError(response: headers) }
+      let mediaType = headers.value(forHTTPHeaderField: "Content-Type")?
+        .split(separator: ";", maxSplits: 1).first?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      guard mediaType == "text/event-stream" else { throw SSEFallback() }
+    }
+
+    private func resumeHeaderWaiters() {
+      for waiter in headerWaiters { waiter.resume() }
+      headerWaiters.removeAll()
+    }
+
+    func receive(_ bytes: Data) async throws {
+      let bytesReceivedAt = LiveDelivery.now()
+      lastActivity = clock.now
+      try Task.checkCancellation()
+      for event in try parser.append(bytes) {
+        switch event.name {
+        case "data":
+          let limits = reader.responseDecodingLimits
+          let batch: ChangeBatch
+          do { batch = try JSONDecoder().decode(ChangeBatch.self, from: event.data) } catch {
+            throw StreamError.decoding("Invalid SSE data event")
+          }
+          lastActivity = clock.now
+          guard
+            batch.envelopes.count + batch.controls.count
+              <= limits.maximumChangeEventsPerStreamBatch - pending.envelopes.count
+              - pending.controls.count
+          else {
+            throw StreamError.batchTooLarge(
+              limit: limits.maximumChangeEventsPerStreamBatch,
+              observed: limits.maximumChangeEventsPerStreamBatch + 1)
+          }
+          pending.envelopes.append(contentsOf: batch.envelopes)
+          pending.controls.append(contentsOf: batch.controls)
+          pendingServerTime = event.serverTime
+          pendingReceivedAt = bytesReceivedAt
+        case "control":
+          let control: Control
+          do { control = try JSONDecoder().decode(Control.self, from: event.data) } catch {
+            throw StreamError.decoding("Invalid SSE control event")
+          }
+          lastActivity = clock.now
+          sawControl = true
+          if let offset = control.streamNextOffset, !offset.isEmpty, offset != cursor.offset {
+            let lsn = pending.envelopes.reversed().compactMap { $0.headers.lsn }.first ?? cursor.lsn
+            committing = true
+            defer {
+              committing = false
+              lastActivity = clock.now
+            }
+            cursor = try await reader.commit(
+              PollResult(
+                batch: pending, cursor: StreamCursor(offset: offset, lsn: lsn), mode: .sse,
+                serverSentAt: pendingServerTime,
+                receivedAt: pendingReceivedAt ?? bytesReceivedAt),
+              expecting: expectedCursor)
+            expectedCursor = cursor
+            pending = ChangeBatch()
+            pendingServerTime = nil
+            pendingReceivedAt = nil
+          }
+          if control.streamClosed == true {
+            throw StreamError.terminal(path: reader.streamURL.path, status: 200, reason: .closed)
+          }
+        default: break
+        }
+        maximumEventBytes = parser.maximumEventBytes
+      }
+    }
+
+    private struct Control: Decodable {
+      let streamNextOffset: String?
+      let streamClosed: Bool?
     }
   }
 
   private struct PollResult: Sendable {
     let batch: ChangeBatch
     let cursor: StreamCursor
+    let mode: LiveReadMode
+    /// The gateway's send time (Unix ms), when it sent one.
+    var serverSentAt: Int64? = nil
+    /// When this device held the complete batch (Unix ms).
+    var receivedAt: Int64 = LiveDelivery.now()
   }
 
-  private func poll(at cursor: StreamCursor) async throws -> PollResult? {
+  private func streamRequest(at cursor: StreamCursor, mode: LiveReadMode) throws -> URLRequest {
     var components = URLComponents(url: streamURL, resolvingAgainstBaseURL: false)
     var query = components?.queryItems ?? []
     query.removeAll { $0.name == "offset" || $0.name == "live" }
     query.append(URLQueryItem(name: "offset", value: cursor.offset))
-    query.append(URLQueryItem(name: "live", value: "long-poll"))
+    query.append(URLQueryItem(name: "live", value: mode.rawValue))
     components?.queryItems = query
     guard let url = components?.url else { throw StreamError.invalidResponse }
 
     var request = URLRequest(url: url)
     request.httpMethod = "GET"
-    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue(
+      mode == .sse ? "text/event-stream" : "application/json", forHTTPHeaderField: "Accept")
+    return request
+  }
+
+  private func poll(at cursor: StreamCursor) async throws -> PollResult? {
+    var request = try streamRequest(at: cursor, mode: .longPoll)
     request = transport.prepare(request)
     let span = telemetry.beginSpan(
       name: "electric.stream.poll", kind: .client,
@@ -427,6 +911,7 @@ public struct ShapeStreamReader: Sendable {
         "electric.http.requests", attributes: ["http.method": "GET", "error.type": "transport"])
       throw error
     }
+    let receivedAt = LiveDelivery.now()
     let headers = response.response
     let attributes = [
       "http.method": "GET", "http.route": "/stream", "http.status_code": "\(headers.statusCode)",
@@ -478,12 +963,11 @@ public struct ShapeStreamReader: Sendable {
     } catch {
       throw StreamError.decoding(String(describing: error))
     }
-    guard batch.envelopes.count <= responseDecodingLimits.maximumChangeEventsPerStreamBatch else {
+    let entries = batch.envelopes.count + batch.controls.count
+    guard entries <= responseDecodingLimits.maximumChangeEventsPerStreamBatch else {
       throw StreamError.batchTooLarge(
         limit: responseDecodingLimits.maximumChangeEventsPerStreamBatch,
-        observed: min(
-          batch.envelopes.count,
-          responseDecodingLimits.maximumChangeEventsPerStreamBatch + 1))
+        observed: min(entries, responseDecodingLimits.maximumChangeEventsPerStreamBatch + 1))
     }
     guard !batch.isEmpty else {
       return emptyPollResult(nextOffset: nextOffset, preserving: cursor)
@@ -492,14 +976,20 @@ public struct ShapeStreamReader: Sendable {
       throw StreamError.missingNextOffset(path: streamURL.path)
     }
     let lsn = batch.envelopes.reversed().compactMap { $0.headers.lsn }.first ?? cursor.lsn
-    return PollResult(batch: batch, cursor: StreamCursor(offset: nextOffset, lsn: lsn))
+    return PollResult(
+      batch: batch, cursor: StreamCursor(offset: nextOffset, lsn: lsn), mode: .longPoll,
+      serverSentAt: headers.value(forHTTPHeaderField: LiveDelivery.serverTimeHeader).flatMap {
+        Int64($0)
+      },
+      receivedAt: receivedAt)
   }
 
   private func emptyPollResult(nextOffset: String?, preserving cursor: StreamCursor) -> PollResult?
   {
     guard let nextOffset, !nextOffset.isEmpty, nextOffset != cursor.offset else { return nil }
     return PollResult(
-      batch: ChangeBatch(), cursor: StreamCursor(offset: nextOffset, lsn: cursor.lsn))
+      batch: ChangeBatch(), cursor: StreamCursor(offset: nextOffset, lsn: cursor.lsn),
+      mode: .longPoll)
   }
 }
 

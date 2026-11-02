@@ -35,12 +35,20 @@ only while foreground and online. The pass shares ordinary leases, re-runs at mo
 subscriptions at a time (smallest first), and retries failures with capped backoff. Held leases,
 including leases retained by the app's warm pool, clear without another request. A missing
 rebuilder, a nil result, or a rebuilt demand with a different normalized identity removes the
-stale materialization. Earlier-launch marks in the same principal and authorization are rebuilt
-in the current generation; after successful replacement, the old materialization is removed so
-its claims cannot retain stale rows. Other principals and authorization scopes are excluded.
+stale materialization. A mark an earlier launch's copy carries, in the same principal and
+authorization, is re-read under that copy's own `cacheKey`: this generation's demand finds the
+same copy, its snapshot replaces the copy's claims in place, and the pass clears the mark and keeps
+the copy. A mark clears only when the copy the pass held or re-read is the marked one. Other
+principals and authorization scopes are excluded.
 Idle listings run every five seconds; opening the gate, local snapshot/feed writes, completed
 runs and retry expiry wake the pass immediately. Cancel and await the task when
-retiring its scope or generation. The store protocol is unchanged in 0.8.0.
+retiring its scope or generation. Precondition: a retiring generation releases its leases and
+cancels and awaits its stale pass before a newer generation's coordinator is created. Generations
+of one principal and authorization share stored copies by `cacheKey` and cannot be ordered, and a
+copy has one cursor, so two generations live on one copy at once would fail the older lease on its
+next batch, and a retiring generation's pass could re-read, rebind or remove a copy a newer
+generation is live on. The precondition rules both out; the app enforces it. The store protocol is
+unchanged in 0.7.1.
 
 For app-wide scheduling across collections, await `drainStaleRevalidation()` before opening the
 next collection's gate or starting an explicit repair read. Drain closes admission and lets
@@ -86,26 +94,41 @@ creating the claim a second time, and the producer cannot advance its local curs
 consumer's atomic store callback returns.
 
 A demand the store already holds is resumed rather than re-materialized when the source allows it.
-On an exact cached record, `CollectionCoordinator` first calls the adapter's `resume`, which returns
-a `CollectionResumeSession` (a live tail from the stored cursor and source version) or nil. A
-resumed attempt skips `replaceSnapshot`: the demand stays `.cached` and reports `.live` once the
-tail commits a batch or answers an idle poll, and feed deletes release claims through the ordinary
-store `apply`. Nil takes the snapshot path; the default implementation always returns nil. Stale
-revalidation always snapshots. A session whose feed refuses the stored cursor throws
-`CollectionResumeInvalidated`: until the tail goes live, the same attempt snapshots instead, so no
-lease sees a failure. A transient failure fails the attempt, and the next attempt resumes again.
+When the store holds a copy bound to the demand, generation included, `CollectionCoordinator` first
+calls the adapter's `resume`, which returns a `CollectionResumeSession` (a live tail from the stored
+cursor and source version) or nil. A copy an earlier generation stored snapshots instead, because
+only a snapshot rebinds it to the current demand. A resumed attempt skips `replaceSnapshot`: the
+demand stays `.cached` and reports `.live` once the tail commits a batch or answers an idle poll,
+and feed deletes release claims through the ordinary store `apply`. Nil takes the snapshot path; the
+default implementation always returns nil. Stale revalidation always snapshots. A session whose feed
+refuses the stored cursor throws `CollectionResumeInvalidated`: until the tail goes live, the same
+attempt snapshots instead, so no lease sees a failure. A transient failure fails the attempt, and
+the next attempt resumes again.
 
 `CircuitsSubsetSource` fences each snapshot with the feed's stream URL and the snapshot's
-transaction visibility (`subset-v2`), and resumes by re-joining the identical feed request. The
-engine answers that request with the same stream URL until it retires the feed, and the stream is
-append-only, so the same URL means the stored offset is still a gap-free position in it
+transaction visibility (`subset-v2`), and resumes by re-joining the identical feed request under
+this launch's subscription. The engine shares a feed by its request, not its subscription, and
+answers with the same stream URL until it retires the feed; the stream is append-only, so the same
+URL means the stored offset is still a gap-free position in it
 (`Contracts/native-v1-contract-v1.md`, "Feed continuity"). A resume makes one `/v1/subset-feeds`
-POST and no frontier `HEAD` or snapshot query. Limited windows, `subset-v1` fences, a different
-stream URL, and a fence whose last session ended in a terminal stream outcome snapshot instead. A
-feed that answers with a different URL is kept for the snapshot that follows on the same source
-instance; an adapter that snapshots through another instance first calls
-`cleanupAbandonedMaterialization`, which releases it. On a feed that is already current, `.live`
-waits for the first long-poll answer.
+POST and no frontier `HEAD` or snapshot query. Limited windows, `subset-v1` fences and a different
+stream URL snapshot instead, and so does a fence whose last session ended in a terminal stream
+outcome or a non-retryable failure other than an authentication refusal (401, 403, 407); transport
+loss, exhausted retries and authentication refusals leave it resumable. A feed that answers with a
+different URL is kept for the snapshot that follows on the same source instance; an adapter that
+snapshots through another instance first calls `cleanupAbandonedMaterialization`, which releases it.
+On a feed that is already current, `.live` waits for the first long-poll answer.
+
+Each demand has two keys. `CollectionDemandIdentity.cacheKey` names the stored copy: the
+principal, authorization, collection, canonical predicate, order, limit and the source's columns
+(`*` for every column), never the scope's generation. A `CollectionStore` keeps one
+materialization per `cacheKey`, so a later launch's demand finds the copy an earlier launch stored
+and its snapshot replaces that copy's claims in place; the stale pass re-reads a marked copy under
+its own key and clears the mark. `storageKey` adds the generation and names the in-memory lease, so
+two launches never share one. Each source names its server subscription from the materialization ID
+plus the generation, so the stored copy's ID is stable while every launch opens its own
+subscription. A `CollectionGroupMember`'s `identity(scope:)` has the `cacheKey` of the
+single-table demand for the same collection, predicate and columns.
 
 ```swift
 let definition = CollectionDefinition<Issue, Int64>(
@@ -134,6 +157,36 @@ return the same stable identity the collection definition and store key rows by,
 demand without it is rejected before any server resource exists. Rows that leave the window are
 released from the materialization's claim, so hold a separate demand for anything that must stay
 local beyond the page.
+
+`CircuitsSubsetGroupSource` loads several tables as one shape group, such as a Record and its
+companion tables: one `loadSubsetGroup(_:)` call names the subscription and every member and
+returns one handle, one stream, one snapshot position and rows tagged by table. Each
+`CollectionGroupMember` names its table, predicate and the `CollectionDefinition` its rows land
+in. The source routes each stream envelope to its member by `type`, keys rows by table and key
+so equal keys in two tables never collide, and hands every batch to a `CollectionGroupStore` as
+one `CollectionGroupChangeBatch`: every member's changes and the group's one cursor, which the
+store commits in one transaction. A refused member, a `503` or a broken stream fails the whole
+group. `InMemoryCollectionGroupStore` is the reference provider.
+
+Groups are not ready to enable for users yet. The group route has only the load call, so every
+lease renewal re-reads the whole group snapshot; the client decodes only the claim. A group whose
+rows grow past `ResponseDecodingLimits` after setup fails at its next renewal. A rows-free renewal (OTTO-10739) is needed first.
+
+```swift
+let demand = CollectionGroupDemand(members: [
+  CollectionGroupMember(
+    definition: records, table: "public.record", predicate: RecordFields.id == recordID,
+    decodeRow: Record.init(row:), decodeKey: { $0 }),
+  CollectionGroupMember(
+    definition: assignments, table: "public.assignment",
+    predicate: AssignmentFields.recordID == recordID,
+    decodeRow: Assignment.init(row:), decodeKey: { $0 }),
+])
+let identity = demand.identity(scope: scope)
+let session = try await groupSource.materialize(demand, identity: identity, materializationID: id)
+try await store.replaceGroupSnapshot(session.snapshot, materializationID: id, demand: identity)
+try await session.run { batch in try await store.applyGroup(batch, to: id) }
+```
 
 ```swift
 let client = ElectricCircuitsClient(baseURL: URL(string: "https://engine.example")!)
@@ -302,7 +355,10 @@ dependencies: [
 ]
 ```
 
-Add the `ElectricCircuitsSwift` product to targets that use only the native protocol client. Add
+Add the `ElectricCircuitsSwift` product to targets that use only the native protocol client. Set
+`ElectricCircuitsClient.Configuration(liveReadMode: .sse)` to hold one live SSE response per
+stream; `.longPoll` remains the default. Pass a closure instead (`Configuration(liveReadMode: { ... })`)
+to have each reader ask for its mode before every live read, for example behind a feature flag. Add
 `ElectricCircuitsCollections` for typed demands, leases, snapshot/live coordination, and the
 store-provider contract. The optional LinearLite GRDB provider remains a separate example package.
 See [the release guide](Docs/RELEASING.md) for the release contract and versioned-source-control

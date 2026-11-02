@@ -1,7 +1,8 @@
-import ElectricCircuitsCollections
 import ElectricCircuitsSwift
 import Foundation
 import Testing
+
+@testable import ElectricCircuitsCollections
 
 #if canImport(FoundationNetworking)
   import FoundationNetworking
@@ -233,6 +234,50 @@ struct CircuitsSubsetSourceTests {
     #expect(rows[4]?.title == "Past horizon")
   }
 
+  /// A table source passes its store only the envelopes the snapshot gate accepts: a batch it drops
+  /// entirely runs with no delivery and leaves the first-after-start flag for the next batch.
+  @Test func aTableSourceNarrowsItsDeliveryToAcceptedChanges() async throws {
+    let alreadySeen =
+      #"{"type":"public.issues","key":"2","value":{"id":2,"title":"Already seen"},"headers":{"operation":"upsert","lsn":"0/120","txid":"104","commit_ts":100}}"#
+    let transport = NativeSubsetTransport(
+      streamBodies: [
+        "[\(alreadySeen)]",
+        "[\(alreadySeen),"
+          + #"{"type":"public.issues","key":"1","value":{"id":1,"title":"Committed during snapshot"},"headers":{"operation":"update","lsn":"0/FF","txid":"4294967401","commit_ts":200}}]"#,
+      ],
+      queryBodies: [
+        #"{"rows":[{"id":1,"title":"Snapshot"}],"lsn":"0/100","snapshot":"100:110:105","horizon":"0/180"}"#
+      ])
+    let source = makeLimitedSource(transport, clock: SubsetRecreateClock())
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: .init(rawValue: "issues"), key: \.id)
+    let demand = CollectionDemand<NativeIssue>(unsafePredicateIdentity: "all")
+    let identity = demand.identity(
+      for: definition, scope: .init(principal: "u", authorization: "a", generation: "g"))
+    let session = try await source.materialize(
+      demand, identity: identity, materializationID: CollectionMaterializationID(rawValue: "narrow"))
+    let deliveries = AppliedDeliveries()
+    let batches = AppliedNativeBatches()
+    let run = Task {
+      try await session.run { batch in
+        await deliveries.append(LiveDelivery.current)
+        await batches.append(batch)
+      }
+    }
+    for _ in 0..<20_000 {
+      if await batches.values().count >= 2 { break }
+      await Task.yield()
+    }
+    try await session.stop()
+    try await run.value
+    let applied = await deliveries.values
+    #expect(applied.count == 2)
+    #expect(applied.first == .some(nil))
+    let second = try #require(applied.last ?? nil)
+    #expect(second.changes == [LiveDelivery.Change(table: "public.issues", commitTimestamp: 200)])
+    #expect(second.firstAfterReconnect)
+  }
+
   @Test func limitedWindowRetriesSnapshotThatStillExcludesAnyAcceptedTransaction() async throws {
     let clock = SubsetRecreateClock()
     let transport = NativeSubsetTransport(
@@ -271,6 +316,11 @@ struct CircuitsSubsetSourceTests {
     #expect(batch.changes.count == 1)
     #expect(batch.sourceVersion.order == 0x120)
     #expect(batch.cursor.lsn == "0/120")
+  }
+
+  private actor AppliedDeliveries {
+    private(set) var values: [LiveDelivery?] = []
+    func append(_ delivery: LiveDelivery?) { values.append(delivery) }
   }
 
   @Test func snapshotFenceThenAwaitedLiveTailUsesStableSubsetFeedClaim() async throws {
@@ -315,14 +365,23 @@ struct CircuitsSubsetSourceTests {
         == "9:subset-v2|36:https://streams.test/streams/shape-1|2:10|4:0/10|0:|0:")
 
     let applied = AppliedNativeBatches()
+    let delivery = AppliedDeliveries()
     let run = Task {
-      try await session.run { batch in await applied.append(batch) }
+      try await session.run { batch in
+        await delivery.append(LiveDelivery.current)
+        await applied.append(batch)
+      }
     }
     for _ in 0..<10_000 {
       if await applied.values().count == 1 { break }
       await Task.yield()
     }
     let batch = try #require(await applied.values().first)
+    // A table source's apply runs under the batch's delivery, first after the tail started.
+    let firstDelivery = try #require(await delivery.values.first ?? nil)
+    #expect(firstDelivery.mode == .longPoll)
+    #expect(firstDelivery.firstAfterReconnect)
+    #expect(firstDelivery.changes.map(\.table) == ["public.issues"])
     #expect(batch.expectedCursor == StreamCursor(offset: "10", lsn: "0/10"))
     #expect(batch.cursor == StreamCursor(offset: "11", lsn: "0/20"))
     guard case .upsert(let issue, let changeVersion) = try #require(batch.changes.first) else {
@@ -349,8 +408,52 @@ struct CircuitsSubsetSourceTests {
     let createBodies = try subsetCreates.map { request in
       try JSONDecoder().decode(ShapeRequest.self, from: #require(request.httpBody))
     }
-    #expect(createBodies.allSatisfy { $0.subscription == materializationID.rawValue })
+    #expect(
+      createBodies.allSatisfy {
+        $0.subscription == materializationID.subscription(generation: scope.generation)
+      })
     #expect(createBodies.allSatisfy { $0.changesOnly == true })
+  }
+
+  @Test func eachLaunchOpensItsOwnSubscriptionForOneStoredCopy() async throws {
+    let transport = NativeSubsetTransport()
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let source = CircuitsSubsetSource<NativeIssue, Int64>(
+      client: client,
+      transport: transport,
+      table: "public.issues",
+      retryPolicy: ShapeSubscriptionRetryPolicy(maxRetries: 0),
+      decodeRow: NativeIssue.init(row:),
+      decodeKey: { key in
+        guard let id = Int64(key) else { throw CircuitsSubsetSourceError.invalidLiveKey(key) }
+        return id
+      }
+    )
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: CollectionID(rawValue: "issues"), key: \.id)
+    let demand = CollectionDemand<NativeIssue>(unsafePredicateIdentity: "status=open")
+    // The stored copy's id is the same in both launches; only the generation differs.
+    let materializationID = CollectionMaterializationID(rawValue: "issues-open")
+    for generation in ["launch-1", "launch-2"] {
+      let identity = demand.identity(
+        for: definition,
+        scope: .init(principal: "user-1", authorization: "workspace-1", generation: generation))
+      let session = try await source.materialize(
+        demand, identity: identity, materializationID: materializationID)
+      try await session.stop()
+    }
+
+    let names = try await transport.requests
+      .filter { $0.httpMethod == "POST" && $0.url?.path == "/v1/subset-feeds" }
+      .map { try JSONDecoder().decode(ShapeRequest.self, from: #require($0.httpBody)).subscription }
+    #expect(
+      names == [
+        materializationID.subscription(generation: "launch-1"),
+        materializationID.subscription(generation: "launch-2"),
+      ])
+    #expect(Set(names).count == 2)
+    #expect(names.allSatisfy { $0?.hasPrefix("issues-open.") == true })
   }
 
   @Test func goneOnTheInitialSubsetFeedRecreatesBeforeSnapshotSetup() async throws {
@@ -515,14 +618,23 @@ struct CircuitsSubsetSourceTests {
     #expect(session.snapshot.rows == [NativeIssue(id: 1, title: "Snapshot")])
 
     let applied = AppliedNativeBatches()
+    let deliveries = AppliedDeliveries()
     let run = Task {
-      try await session.run { batch in await applied.append(batch) }
+      try await session.run { batch in
+        await deliveries.append(LiveDelivery.current)
+        await applied.append(batch)
+      }
     }
     for _ in 0..<10_000 {
       if await applied.values().count == 1 { break }
       await Task.yield()
     }
     let batch = try #require(await applied.values().first)
+    // A window's delivery lists the accepted feed change that triggered the re-query, not the
+    // page rows the store receives.
+    #expect(
+      await deliveries.values.first??.changes
+        == [LiveDelivery.Change(table: "public.issues", commitTimestamp: nil)])
     #expect(batch.cursor == StreamCursor(offset: "11", lsn: "0/21"))
     #expect(batch.sourceVersion == .init(rawValue: "0/21", order: 33))
     #expect(batch.changes.count == 2)
