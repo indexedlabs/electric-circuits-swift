@@ -80,4 +80,8 @@ struct CollectionStoreStaleMarkContractTests {
   @Test func refreshAndFeedKeepMarkUntilExplicitClear() async throws {
     try await contract.refreshAndFeedKeepMarkUntilExplicitClear()
   }
+
+  @Test func laterGenerationBindsTheEarlierCopy() async throws {
+    try await contract.laterGenerationBindsTheEarlierCopy()
+  }
 }

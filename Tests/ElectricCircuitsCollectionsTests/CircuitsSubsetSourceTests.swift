@@ -1,7 +1,8 @@
-import ElectricCircuitsCollections
 import ElectricCircuitsSwift
 import Foundation
 import Testing
+
+@testable import ElectricCircuitsCollections
 
 #if canImport(FoundationNetworking)
   import FoundationNetworking
@@ -403,8 +404,52 @@ struct CircuitsSubsetSourceTests {
     let createBodies = try subsetCreates.map { request in
       try JSONDecoder().decode(ShapeRequest.self, from: #require(request.httpBody))
     }
-    #expect(createBodies.allSatisfy { $0.subscription == materializationID.rawValue })
+    #expect(
+      createBodies.allSatisfy {
+        $0.subscription == materializationID.subscription(generation: scope.generation)
+      })
     #expect(createBodies.allSatisfy { $0.changesOnly == true })
+  }
+
+  @Test func eachLaunchOpensItsOwnSubscriptionForOneStoredCopy() async throws {
+    let transport = NativeSubsetTransport()
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://engine.test")!, transport: transport)
+    let source = CircuitsSubsetSource<NativeIssue, Int64>(
+      client: client,
+      transport: transport,
+      table: "public.issues",
+      retryPolicy: ShapeSubscriptionRetryPolicy(maxRetries: 0),
+      decodeRow: NativeIssue.init(row:),
+      decodeKey: { key in
+        guard let id = Int64(key) else { throw CircuitsSubsetSourceError.invalidLiveKey(key) }
+        return id
+      }
+    )
+    let definition = CollectionDefinition<NativeIssue, Int64>(
+      id: CollectionID(rawValue: "issues"), key: \.id)
+    let demand = CollectionDemand<NativeIssue>(unsafePredicateIdentity: "status=open")
+    // The stored copy's id is the same in both launches; only the generation differs.
+    let materializationID = CollectionMaterializationID(rawValue: "issues-open")
+    for generation in ["launch-1", "launch-2"] {
+      let identity = demand.identity(
+        for: definition,
+        scope: .init(principal: "user-1", authorization: "workspace-1", generation: generation))
+      let session = try await source.materialize(
+        demand, identity: identity, materializationID: materializationID)
+      try await session.stop()
+    }
+
+    let names = try await transport.requests
+      .filter { $0.httpMethod == "POST" && $0.url?.path == "/v1/subset-feeds" }
+      .map { try JSONDecoder().decode(ShapeRequest.self, from: #require($0.httpBody)).subscription }
+    #expect(
+      names == [
+        materializationID.subscription(generation: "launch-1"),
+        materializationID.subscription(generation: "launch-2"),
+      ])
+    #expect(Set(names).count == 2)
+    #expect(names.allSatisfy { $0?.hasPrefix("issues-open.") == true })
   }
 
   @Test func goneOnTheInitialSubsetFeedRecreatesBeforeSnapshotSetup() async throws {

@@ -1228,34 +1228,44 @@ struct CollectionCoordinatorStalePassTests {
     }
   }
 
-  @Test func earlierLaunchRefreshUsesCurrentScopeAndReleasesOldClaim() async throws {
+  @Test func earlierLaunchRefreshKeepsTheCopyUnderItsCacheKeyAndClearsTheMark() async throws {
     let old = StaleFixture()
     try await old.mark()
     let current = StaleFixture(
       scope: .init(principal: "user", authorization: "authorized", generation: "next-launch"),
       source: old.source, store: old.store)
+    #expect(old.identity("one").cacheKey == current.identity("one").cacheKey)
+    #expect(old.identity("one").storageKey != current.identity("one").storageKey)
     try await current.withPass {
       try #require(
         try await current.eventually(advancingClock: false) {
           await current.source.requests.count == 1
         })
+      // This launch's demand finds the earlier launch's copy and re-reads it under its own id.
       #expect(await current.source.requests[0].identity == current.identity("one"))
-      #expect(await current.source.requests[0].materializationID != old.id("one"))
+      #expect(await current.source.requests[0].materializationID == old.id("one"))
       await current.source.succeed(0)
       try #require(
         try await current.eventually(advancingClock: false) {
-          await current.store.removals.contains(old.id("one"))
+          await current.store.clears.count == 1
         })
-      #expect(try await current.store.materialization(for: old.identity("one")) == nil)
-      #expect(try await current.store.materialization(for: current.identity("one")) != nil)
+      #expect(await current.store.removals.isEmpty)
+      let record = try #require(
+        try await current.store.materialization(for: current.identity("one")))
+      #expect(record.id == old.id("one"))
+      #expect(record.demand == current.identity("one"))
+      #expect(try await current.store.materialization(for: old.identity("one")) == record)
+      // The empty snapshot replaced the copy's claims in place, so its only row left.
+      #expect(await current.store.base.rowClaims(for: old.id("one")).isEmpty)
       #expect(await current.store.base.rows().isEmpty)
       #expect(try await current.marks().isEmpty)
       #expect(await current.source.stopped == [0])
+      try await current.expectSpans(["refreshed"], released: ["1"], returned: ["0"])
     }
     await old.telemetry.shutdown()
   }
 
-  @Test func earlierLaunchHeldDemandUsesCurrentEntryWithoutAnotherRequest() async throws {
+  @Test func earlierLaunchHeldDemandClearsTheMarkOfTheCopyItRefreshed() async throws {
     let old = StaleFixture()
     try await old.mark()
     let current = StaleFixture(
@@ -1264,17 +1274,24 @@ struct CollectionCoordinatorStalePassTests {
       source: old.source, store: old.store)
     let screen = await current.coordinator.acquire(current.demand("one"))
     try #require(try await current.eventually { await current.source.requests.count == 1 })
+    #expect(await current.source.requests[0].materializationID == old.id("one"))
     await current.source.succeed(0)
     try #require(try await current.eventually { await screen.state() == .live })
+    // A snapshot never clears a mark; the held copy keeps it until the pass sees it held.
+    #expect(try await current.marks().map(\.record.id) == [old.id("one")])
     try await current.withPass {
       try #require(
         try await current.eventually(advancingClock: false) {
-          await current.store.removals == [old.id("one")]
+          await current.store.clears.count == 1
         })
+      #expect(await current.store.removals.isEmpty)
       #expect(await current.source.requests.count == 1)
       #expect(await current.source.stopped.isEmpty)
       #expect(await screen.state() == .live)
-      #expect(await current.store.base.rows().isEmpty)
+      #expect(try await current.marks().isEmpty)
+      #expect(
+        try await current.store.materialization(for: current.identity("one"))?.id
+          == old.id("one"))
       try await current.expectSpans(["held"], released: ["0"], returned: ["0"])
       try await screen.release()
     }
@@ -1308,9 +1325,11 @@ struct CollectionCoordinatorStalePassTests {
       await current.source.succeed(1)
       try #require(
         try await current.eventually(advancingClock: false) {
-          await current.store.removals == [old.id("one")]
+          await current.store.clears.count == 1
         })
+      #expect(await current.store.removals.isEmpty)
       #expect(await current.store.base.rows().isEmpty)
+      #expect(try await current.marks().isEmpty)
     }
     await old.telemetry.shutdown()
   }

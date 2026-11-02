@@ -84,6 +84,17 @@ below the horizon. It renews the same subset-feed claim through
 `ShapeSubscriptionCoordinator`, and the producer cannot advance its local cursor until the consumer's
 atomic store callback returns.
 
+Each demand has two keys. `CollectionDemandIdentity.cacheKey` names the stored copy: the
+principal, authorization, collection, canonical predicate, order, limit and the source's columns
+(`*` for every column), never the scope's generation. A `CollectionStore` keeps one
+materialization per `cacheKey`, so a later launch's demand finds the copy an earlier launch stored
+and its snapshot replaces that copy's claims in place; the stale pass re-reads a marked copy under
+its own key and clears the mark. `storageKey` adds the generation and names the in-memory lease, so
+two launches never share one. Each source names its server subscription from the materialization ID
+plus the generation, so the stored copy's ID is stable while every launch opens its own
+subscription. A `CollectionGroupMember`'s `identity(scope:)` has the `cacheKey` of the
+single-table demand for the same collection, predicate and columns.
+
 ```swift
 let definition = CollectionDefinition<Issue, Int64>(
   id: CollectionID(rawValue: "issues"), key: \.id)
@@ -136,9 +147,9 @@ let demand = CollectionGroupDemand(members: [
     predicate: AssignmentFields.recordID == recordID,
     decodeRow: Assignment.init(row:), decodeKey: { $0 }),
 ])
-let session = try await groupSource.materialize(demand, materializationID: id)
-try await store.replaceGroupSnapshot(
-  session.snapshot, materializationID: id, demand: demand.identity(scope: scope))
+let identity = demand.identity(scope: scope)
+let session = try await groupSource.materialize(demand, identity: identity, materializationID: id)
+try await store.replaceGroupSnapshot(session.snapshot, materializationID: id, demand: identity)
 try await session.run { batch in try await store.applyGroup(batch, to: id) }
 ```
 

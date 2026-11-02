@@ -19,6 +19,29 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 - Source-breaking: `StreamError` and `CircuitsSubsetGroupSourceError` each gain a case, so an
   exhaustive `switch` over either needs one more arm. Under the pre-1.0 rule in
   `Policies/SEMVER.md` that makes the next tag a minor bump (0.13.0).
+- One cache key per stored copy (OTTO-11415). `CollectionDemandIdentity.cacheKey` is framed from
+  the principal, authorization, collection, canonical demand (predicate, order and limit) and
+  columns (`*` for every column), never the generation; `storageKey` keeps the generation and
+  names the in-memory lease. `CollectionDemandIdentity` gains optional `columns`, which
+  `CollectionDemand.identity(for:scope:columns:)` and the new `CollectionSourceAdapter.columns`
+  (nil by default; `CircuitsSubsetSource` reports its own) fill in; an identity persisted before
+  decodes with every column, and its `storageKey` is unchanged.
+  `CollectionGroupMember.identity(scope:)` gives each table of a group the identity, and so the
+  `cacheKey`, of the single-table demand for it, and `CollectionGroupDemandIdentity.cacheKey` is
+  the group's key without the generation.
+- `CollectionStore.materialization(for:)` finds a copy by `cacheKey`, and a provider keeps one
+  materialization per key: a later generation's snapshot rebinds that copy to its demand and
+  replaces its claims in place. `InMemoryCollectionStore` keys records by `cacheKey` and shares
+  rows across generations of one principal and authorization. The shared store suite adds
+  `laterGenerationBindsTheEarlierCopy`.
+- The coordinator's stale pass re-reads a copy an earlier generation stored under its own
+  `cacheKey` and clears its mark; it no longer removes the copy it refreshed. Eviction fences are
+  keyed by `cacheKey`.
+- `CircuitsSubsetSource` and `CircuitsSubsetGroupSource` name each server subscription from the
+  materialization ID plus the scope's generation (the ID, a dot and a 16-digit digest of the
+  generation), so a launch never joins a subscription an earlier launch opened.
+- Source-breaking: `CircuitsSubsetGroupSource.materialize` takes the group's `identity:`, whose
+  generation names the subscription.
 
 ## 0.12.0
 

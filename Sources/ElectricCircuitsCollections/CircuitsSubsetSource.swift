@@ -18,14 +18,16 @@ public enum CircuitsSubsetSourceError: Error, Equatable, Sendable {
 
 /// Native Electric Circuits source strategy for an on-demand demand: establish the changes-only
 /// feed, fence its durable frontier, query the subset snapshot, then consume the feed with awaited
-/// store application. A stable materialization ID is also the server subscription claim.
+/// store application. The server subscription claim is the materialization ID plus the scope's
+/// generation (`CollectionMaterializationID.subscription(generation:)`), so the stored copy's ID is
+/// stable across launches while each launch opens its own subscription.
 public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   CollectionSourceAdapter
 {
   private let client: ElectricCircuitsClient
   private let transport: any HTTPTransport
   private let table: String
-  private let columns: [String]?
+  public let columns: [String]?
   private let decodeRow: @Sendable (ChangeRow) throws -> Model
   private let decodeKey: @Sendable (String) throws -> Key
   private let keyForRow: (@Sendable (Model) throws -> Key)?
@@ -84,7 +86,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       throw CircuitsSubsetSourceError.unsupportedOrderCount(demand.order.count)
     }
     try await pendingCleanup.retry(materializationID)
-    let subscription = materializationID.rawValue
+    let subscription = materializationID.subscription(generation: identity.scope.generation)
     let feedRequest = ShapeRequest(
       table: table,
       where: demand.sourcePredicate,
