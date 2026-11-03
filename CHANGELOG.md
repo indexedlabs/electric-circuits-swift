@@ -5,6 +5,18 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 
 ## Unreleased
 
+- Build and test under Xcode 27 (Swift 6.4) as well as Xcode 26. CI adds a `quality-xcode-27` job on
+  GitHub's `xcode-27` image (Xcode 27.1) beside the Xcode 26.3 job.
+- `LiveDelivery.applying(changesAt:_:)` is `nonisolated(nonsending)` on Swift 6.4 and later, where
+  TaskLocal's isolated-parameter `withValue` is deprecated; `operation` still runs on the caller's
+  actor. Older compilers keep the current signature, and callers are unchanged.
+- `Scripts/quality.sh` gives DocC only `ElectricCircuitsSwift`'s symbol graphs, which DocC 27
+  requires. One package test file and two of the LinearLite example's test files change only to
+  compile under Swift 6.4.
+- No API, store protocol, persisted schema or HTTP changes. The next tag is 0.15.1, a patch.
+
+## 0.15.0
+
 - `ShapeSubscriptionCoordinator`'s shape and subset-feed initializer takes `setupClaim:` and
   `setupClaimAge:`, as the group initializer does. The first `start()` streams a claim the caller
   already created with the same request instead of creating it again, still taking a capacity permit
