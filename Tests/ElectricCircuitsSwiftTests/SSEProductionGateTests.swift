@@ -479,10 +479,14 @@ struct SSEProductionGateTests {
     #expect(await transport.streamCalls == 1)
   }
 
-  @Test(
-    arguments: [16 * 1024 * 1024, 16 * 1024 * 1024 + 1, 64 * 1024 * 1024, 64 * 1024 * 1024 + 1])
+  // Typed constants: Swift 6.4 cannot type-check this argument list as one arithmetic literal.
+  private static let sixteenMiB: Int = 16 * 1024 * 1024
+  private static let sixtyFourMiB: Int = 64 * 1024 * 1024
+
+  @Test(arguments: [sixteenMiB, sixteenMiB + 1, sixtyFourMiB, sixtyFourMiB + 1])
   func largeEventsParseWholeAndCommit(size: Int) async throws {
-    let rig = SSEGateRig(initialLimit: size <= 16 * 1024 * 1024 + 1 ? 16 * 1024 * 1024 : 64 * 1024 * 1024)
+    let rig = SSEGateRig(
+      initialLimit: size <= Self.sixteenMiB + 1 ? Self.sixteenMiB : Self.sixtyFourMiB)
     defer { rig.session.invalidateAndCancel() }
     let coordinator = rig.coordinator()
     do {

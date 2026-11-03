@@ -412,14 +412,16 @@ struct LinearLiteSessionTests {
     #expect(requests.contains { $0.httpMethod == "HEAD" })
     #expect(requests.filter { $0.url?.path == "/v1/subsets/query" }.count == 2)
     #expect(requests.contains { $0.httpMethod == "GET" })
-    let cursor: Row? = try database.read { db -> Row? in
+    // Plain values, not a `Row`: a read's result crosses into the test, and `Row` isn't Sendable.
+    let cursor: (offset: String, lsn: String)? = try await database.read { db in
       try Row.fetchOne(
         db,
         sql: "SELECT offset, lsn FROM shape_cursors WHERE shape_id = ?",
-        arguments: ["recent-subset-recent-live"])
+        arguments: ["recent-subset-recent-live"]
+      ).map { ($0["offset"], $0["lsn"]) }
     }
-    #expect(cursor?["offset"] as String? == "6")
-    #expect(cursor?["lsn"] as String? == "0/200")
+    #expect(cursor?.offset == "6")
+    #expect(cursor?.lsn == "0/200")
   }
 
   @Test @MainActor func liveSubsetInWindowUpdateUsesTheExistingSnapshot() async throws {

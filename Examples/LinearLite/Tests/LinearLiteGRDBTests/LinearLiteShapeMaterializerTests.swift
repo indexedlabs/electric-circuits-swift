@@ -94,14 +94,15 @@ struct LinearLiteShapeMaterializerTests {
     }
     #expect(tables.contains("issues"))
     #expect(tables.contains("shape_cursors"))
-    let issueColumns: [Row] = try db.read { db -> [Row] in
-      try Row.fetchAll(db, sql: "PRAGMA table_info(issues)")
+    // Plain values, not `Row`s: a read's result crosses into the test, and `Row` isn't Sendable.
+    let issueColumns: [(name: String, pk: Int)] = try await db.read { db in
+      try Row.fetchAll(db, sql: "PRAGMA table_info(issues)").map { ($0["name"], $0["pk"]) }
     }
-    #expect(issueColumns.first?["name"] as String? == "principal_id")
-    #expect(issueColumns.first?["pk"] as Int? == 1)
-    #expect(issueColumns.dropFirst().first?["name"] as String? == "id")
-    #expect(issueColumns.dropFirst().first?["pk"] as Int? == 2)
-    #expect(issueColumns.contains { $0["name"] as String? == "client_id" })
+    #expect(issueColumns.first?.name == "principal_id")
+    #expect(issueColumns.first?.pk == 1)
+    #expect(issueColumns.dropFirst().first?.name == "id")
+    #expect(issueColumns.dropFirst().first?.pk == 2)
+    #expect(issueColumns.contains { $0.name == "client_id" })
     #expect(tables.contains("subset_view_members"))
     #expect(tables.contains("issue_overlays"))
   }
