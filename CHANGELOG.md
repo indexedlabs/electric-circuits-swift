@@ -9,11 +9,13 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   GitHub's `xcode-27` image (Xcode 27.1) beside the Xcode 26.3 job.
 - `LiveDelivery.applying(changesAt:_:)` is `nonisolated(nonsending)` on Swift 6.4 and later, where
   TaskLocal's isolated-parameter `withValue` is deprecated; `operation` still runs on the caller's
-  actor. Older compilers keep the current signature, and callers are unchanged.
+  actor. A caller that passes `isolation:` explicitly still builds there, against a deprecated
+  overload that says to omit it. Older compilers keep the current signature.
 - `Scripts/quality.sh` gives DocC only `ElectricCircuitsSwift`'s symbol graphs, which DocC 27
   requires. One package test file and two of the LinearLite example's test files change only to
   compile under Swift 6.4.
-- No API, store protocol, persisted schema or HTTP changes. The next tag is 0.15.1, a patch.
+- Source compatible, with no store protocol, persisted schema or HTTP changes. The next tag is
+  0.15.1, a patch.
 
 ## 0.15.0
 

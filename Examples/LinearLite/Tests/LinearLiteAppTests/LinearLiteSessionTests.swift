@@ -413,7 +413,7 @@ struct LinearLiteSessionTests {
     #expect(requests.filter { $0.url?.path == "/v1/subsets/query" }.count == 2)
     #expect(requests.contains { $0.httpMethod == "GET" })
     // Plain values, not a `Row`: a read's result crosses into the test, and `Row` isn't Sendable.
-    let cursor: (offset: String, lsn: String)? = try await database.read { db in
+    let cursor: (offset: String, lsn: String?)? = try await database.read { db in
       try Row.fetchOne(
         db,
         sql: "SELECT offset, lsn FROM shape_cursors WHERE shape_id = ?",

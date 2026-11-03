@@ -129,6 +129,16 @@ public struct LiveDelivery: Equatable, Sendable {
     ) async rethrows -> R {
       try await $current.withValue(narrowed(to: indices), operation: operation)
     }
+
+    /// The form older compilers expose, kept so a caller that passes `isolation:` still builds.
+    @available(*, deprecated, message: "Omit `isolation:`; `operation` runs on the caller's actor.")
+    public static func applying<R>(
+      changesAt indices: [Int],
+      isolation: isolated (any Actor)?,
+      _ operation: () async throws -> R
+    ) async rethrows -> R {
+      try await $current.withValue(narrowed(to: indices), operation: operation)
+    }
   #else
     /// Runs `operation`, a materializer's store apply, with `current` narrowed to the envelopes at
     /// `indices`: the ones a source accepted after dropping those its snapshot already holds. With

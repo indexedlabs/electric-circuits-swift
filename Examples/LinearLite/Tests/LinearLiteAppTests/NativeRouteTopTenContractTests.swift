@@ -574,7 +574,7 @@ struct NativeScriptedTopTenContractTests {
 /// `Row` isn't Sendable.
 private func storedCursor(
   _ database: some DatabaseReader, shapeID: String
-) async throws -> (offset: String, lsn: String)? {
+) async throws -> (offset: String, lsn: String?)? {
   try await database.read { db in
     try Row.fetchOne(
       db, sql: "SELECT offset, lsn FROM shape_cursors WHERE shape_id = ?", arguments: [shapeID]
