@@ -89,8 +89,40 @@ is skipped only for transactions visible to that snapshot below its WAL insert h
 32-bit xid wraparound ordering. The gate retires when the tail reaches the horizon. Engines without
 these fields retain LSN positioning; an unparseable or missing feed txid also uses the LSN fallback
 below the horizon. It renews the same subset-feed claim through
-`ShapeSubscriptionCoordinator`, and the producer cannot advance its local cursor until the consumer's
-atomic store callback returns.
+`ShapeSubscriptionCoordinator`, which adopts the handle the setup create returned rather than
+creating the claim a second time, and the producer cannot advance its local cursor until the
+consumer's atomic store callback returns.
+
+A demand the store already holds is resumed rather than re-materialized when the source allows it.
+When the store holds a copy bound to the demand, generation included, `CollectionCoordinator` first
+calls the adapter's `resume`, which returns a `CollectionResumeSession` (a live tail from the stored
+cursor and source version) or nil. A copy an earlier generation stored snapshots instead, because
+only a snapshot rebinds it to the current demand. So an app that starts a new generation on every
+launch resumes only within a launch: the first acquire after a relaunch snapshots, and later
+acquires in that launch resume. A resumed attempt skips `replaceSnapshot`: the demand stays
+`.cached` and reports `.live` once the tail commits a batch or answers an idle read (a long-poll
+`204` or empty batch, or an SSE control event at the stored offset), and feed deletes release claims
+through the ordinary store `apply`. Nil takes the snapshot path; the default implementation always
+returns nil. Stale revalidation always snapshots. A session whose feed refuses the stored cursor
+throws `CollectionResumeInvalidated`: until the tail goes live, the same attempt snapshots instead,
+so no lease sees a failure. A transient failure fails the attempt, and the next attempt resumes
+again.
+
+`CircuitsSubsetSource` fences each snapshot with the feed's stream URL and the snapshot's
+transaction visibility (`subset-v2`), and resumes by re-joining the identical feed request under
+this launch's subscription. The engine shares a feed by its request, not its subscription, and
+answers with the same stream URL until it retires the feed; the stream is append-only, so the same
+URL means the stored offset is still a gap-free position in it
+(`Contracts/native-v1-contract-v1.md`, "Feed continuity"). A resume makes one `/v1/subset-feeds`
+POST and no frontier `HEAD` or snapshot query. Limited windows, `subset-v1` fences and a different
+stream URL snapshot instead, and so does a fence whose last session ended in a terminal stream
+outcome or a non-retryable failure other than an authentication refusal (401, 403, 407); transport
+loss, exhausted retries and authentication refusals leave it resumable. A feed that answers with a
+different URL is kept for the snapshot that follows on the same source instance; an adapter that
+snapshots through another instance first calls `cleanupAbandonedMaterialization`, which releases it.
+On a feed that is already current, `.live` waits for the first idle answer: a long-poll `204` or
+empty batch, or over SSE the control event naming the stored offset, which the stream server sends
+as soon as a read opens at the tail.
 
 Each demand has two keys. `CollectionDemandIdentity.cacheKey` names the stored copy: the
 principal, authorization, collection, canonical predicate, order, limit and the source's columns

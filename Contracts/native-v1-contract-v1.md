@@ -74,6 +74,7 @@ OpenAPI document. Given `ShapeResponse.streamUrl`:
 | --- | --- | --- | --- |
 | frontier | `HEAD streamUrl` | `stream-next-offset` header | The nonempty header is the opaque resume cursor. Its absence on success is malformed. It fences a subset snapshot: create feed → `HEAD` frontier → snapshot → read from that frontier, under the same source receipt. |
 | read | `GET streamUrl?offset=<opaque>&live=long-poll` | JSON array and `stream-next-offset` | Apply rows and checkpoint atomically. A nonempty array without a next offset is malformed. Empty array, empty body, or `204` may still advance the cursor when the header differs. |
+| live read (SSE) | `GET streamUrl?offset=<opaque>&live=sse` | `event: data` and `event: control` frames | Each data frame is followed by a control whose `streamNextOffset` ends that batch; apply and checkpoint at the control. A read that opens at the tail first sends a control with `upToDate: true` and `streamNextOffset` equal to the requested offset, and repeats it while idle, so an idle answer arrives without new data (durable-streams-rust `handle_sse`, required by its conformance suite). `streamClosed: true` is terminal. |
 
 An envelope is `{ type, key, value?, old?, headers }`. `headers.operation` is `insert`, `update`,
 `upsert`, or `delete`; `key` is an opaque **bare engine key**, including for deletes. It is not a
@@ -100,6 +101,29 @@ rows, since the cursor it holds still sits before the marker and the next read w
 discarding the retired generation's materialization scope and cursor; never reuse its offset. Other
 transport/nonterminal HTTP failures are retryable only under the caller/coordinator's bounded retry
 policy. Reset/recreate starts a new scope keyed by principal, template, subscription, and generation.
+
+## Feed continuity
+
+The engine shares a changes-only subset feed by `(table, canonical where, sorted columns,
+changesOnly)`. Releasing the last claim, by `DELETE` or a lapsed lease, does not retire the feed:
+the engine keeps appending to its stream until an idle grace period passes, then retires it
+(`stream-closed`, then `404` or `410`). While the feed is registered, a later `POST
+/v1/subset-feeds` with the identical request returns the same `shapeId` and `streamUrl`; once it is
+retired, the create mints a new `shapeId`. Within one engine catalog a shape ID is never minted
+twice. Shape IDs and `streamPath` restart in a new query or store generation, and only `streamUrl`
+names that generation.
+
+So a `stream-next-offset` read from a `streamUrl` stays a gap-free position in that stream for as
+long as a create for the identical request returns the same `streamUrl`. A client may store the
+offset with its materialization and, after re-joining, read on from it instead of taking a new
+frontier and snapshot. It compares `streamUrl`, never `shapeId` alone. A read from a stored offset
+may repeat a change the client already applied (a feed restored after an engine restart replays
+idempotently), but never skips one. `404`, `410` or `stream-closed` on that read is the terminal
+result above: discard the stored offset and snapshot.
+
+The engine's OpenAPI document does not state this; it is engine behavior (`electric-circuits`
+`82c77935`) pinned by its retention and retirement conformance tests. The JSON projection, a drift
+gate against that document, gains it when the engine documents it.
 
 ## Scalar and cursor rules
 

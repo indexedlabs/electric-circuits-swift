@@ -319,6 +319,12 @@ public actor ShapeSubscriptionCoordinator {
     private var startReturnGates: [UInt64: CheckedContinuation<Void, Never>] = [:]
   #endif
 
+  /// `setupClaim` is the handle of a create the caller already made with this same `request` and
+  /// `kind`, such as a subset source's feed create before its snapshot. The first start uses it
+  /// instead of creating again, still taking a capacity permit and running the materializer
+  /// preflight, and the coordinator takes over releasing it. `setupClaimAge` is how long before
+  /// this call that create was sent: its lease began then, so the first renewal comes that much
+  /// sooner.
   public init(
     client: ElectricCircuitsClient, transport: any HTTPTransport, request: ShapeRequest,
     materializer: any ShapeMaterializer, retryPolicy: ShapeSubscriptionRetryPolicy = .init(),
@@ -327,7 +333,9 @@ public actor ShapeSubscriptionCoordinator {
     responseDecodingLimits: ResponseDecodingLimits = .default,
     telemetry: TelemetryReporter = .noop,
     kind: ShapeSubscriptionKind = .shape,
-    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init()
+    recreatePolicy: ShapeSubscriptionRecreatePolicy = .init(),
+    setupClaim: ShapeHandle? = nil,
+    setupClaimAge: Duration = .zero
   ) {
     let route: ShapeSubscriptionClaimRoute =
       switch kind {
@@ -338,7 +346,7 @@ public actor ShapeSubscriptionCoordinator {
       client: client, transport: transport, route: route, materializer: materializer,
       retryPolicy: retryPolicy, clock: clock, capacity: capacity,
       responseDecodingLimits: responseDecodingLimits, telemetry: telemetry,
-      recreatePolicy: recreatePolicy)
+      recreatePolicy: recreatePolicy, setupClaim: setupClaim, setupClaimAge: setupClaimAge)
   }
 
   /// A coordinator for one shape group: it loads the group, reads the group's one stream and
