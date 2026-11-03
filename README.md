@@ -97,13 +97,16 @@ A demand the store already holds is resumed rather than re-materialized when the
 When the store holds a copy bound to the demand, generation included, `CollectionCoordinator` first
 calls the adapter's `resume`, which returns a `CollectionResumeSession` (a live tail from the stored
 cursor and source version) or nil. A copy an earlier generation stored snapshots instead, because
-only a snapshot rebinds it to the current demand. A resumed attempt skips `replaceSnapshot`: the
-demand stays `.cached` and reports `.live` once the tail commits a batch or answers an idle poll,
-and feed deletes release claims through the ordinary store `apply`. Nil takes the snapshot path; the
-default implementation always returns nil. Stale revalidation always snapshots. A session whose feed
-refuses the stored cursor throws `CollectionResumeInvalidated`: until the tail goes live, the same
-attempt snapshots instead, so no lease sees a failure. A transient failure fails the attempt, and
-the next attempt resumes again.
+only a snapshot rebinds it to the current demand. So an app that starts a new generation on every
+launch resumes only within a launch: the first acquire after a relaunch snapshots, and later
+acquires in that launch resume. A resumed attempt skips `replaceSnapshot`: the demand stays
+`.cached` and reports `.live` once the tail commits a batch or answers an idle read (a long-poll
+`204` or empty batch, or an SSE control event at the stored offset), and feed deletes release claims
+through the ordinary store `apply`. Nil takes the snapshot path; the default implementation always
+returns nil. Stale revalidation always snapshots. A session whose feed refuses the stored cursor
+throws `CollectionResumeInvalidated`: until the tail goes live, the same attempt snapshots instead,
+so no lease sees a failure. A transient failure fails the attempt, and the next attempt resumes
+again.
 
 `CircuitsSubsetSource` fences each snapshot with the feed's stream URL and the snapshot's
 transaction visibility (`subset-v2`), and resumes by re-joining the identical feed request under

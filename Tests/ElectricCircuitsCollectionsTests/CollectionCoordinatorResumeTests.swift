@@ -353,6 +353,31 @@ struct CollectionCoordinatorResumeTests {
     await pass.value
   }
 
+  /// Without a way to rebuild the marked demand, the stale pass removes an unheld copy. A resumed
+  /// screen still settling on that copy holds it: the pass joins and snapshots it instead.
+  @Test func stalePassKeepsTheCopyAResumedScreenIsSettlingOn() async throws {
+    let store = try await seededStore(markingA: true)
+    let source = ResumingSource(snapshotRows: [2])
+    let coordinator = CollectionCoordinator(
+      definition: bareRows, scope: resumeScope, source: source, store: store)
+    let screen = await coordinator.acquire(demandA)
+    #expect(await eventually { await source.resumes == 1 })
+    #expect(await screen.state() == .cached)
+
+    let pass = Task { await coordinator.startStaleRevalidation() }
+    await coordinator.setStaleRevalidationGate(isOpen: true)
+
+    #expect(await eventually { try await store.staleMaterializations().isEmpty })
+    #expect(await source.materializations == 1)
+    #expect(await screen.state() == .live)
+    #expect(try await store.materialization(for: identityA)?.id == materializationA)
+    #expect(await store.rowClaims(for: materializationA) == [2])
+
+    try await screen.release()
+    pass.cancel()
+    await pass.value
+  }
+
   /// A screen that resumed and already reports live never re-read the source, so the stale pass
   /// still revalidates it through a snapshot before it clears the mark.
   @Test func stalePassSnapshotsAResumedScreenThatIsAlreadyLive() async throws {

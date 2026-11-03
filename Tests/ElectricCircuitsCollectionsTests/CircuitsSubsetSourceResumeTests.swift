@@ -105,6 +105,53 @@ private actor ResumeFeedTransport: HTTPTransport {
     }
   }
 
+  /// An SSE read (`live=sse`): each scripted reply becomes events, and an idle reply holds the
+  /// response open after its control event, as a stream at the tail does.
+  func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes: @Sendable (Data) async throws -> Void
+  ) async throws {
+    requests.append(request)
+    let path = request.url?.path ?? ""
+    let shape = String(path.dropFirst("/streams/".count))
+    let offset =
+      URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?
+      .first { $0.name == "offset" }?.value ?? ""
+    while streams[shape, default: []].isEmpty { try await park() }
+    let next = streams[shape, default: []].removeFirst()
+    if case .status(let status) = next {
+      try await onResponse(
+        HTTPURLResponse(
+          url: request.url!, statusCode: status, httpVersion: nil, headerFields: [:])!)
+      return
+    }
+    try await onResponse(
+      HTTPURLResponse(
+        url: request.url!, statusCode: 200, httpVersion: nil,
+        headerFields: ["Content-Type": "text/event-stream"])!)
+    switch next {
+    case .batch(let body, let nextOffset):
+      try await onBytes(Data("event: data\ndata: \(body)\n\n".utf8))
+      try await onBytes(
+        Data("event: control\ndata: {\"streamNextOffset\":\"\(nextOffset)\"}\n\n".utf8))
+    case .idle:
+      try await onBytes(
+        Data("event: control\ndata: {\"streamNextOffset\":\"\(offset)\"}\n\n".utf8))
+      while true { try await park() }
+    case .status:
+      return
+    }
+  }
+
+  /// The `live` mode of every stream read of `shape`, in order.
+  func liveModes(_ shape: String) -> [String] {
+    requests.filter { $0.httpMethod == "GET" && $0.url?.path == "/streams/\(shape)" }.compactMap {
+      URLComponents(url: $0.url!, resolvingAgainstBaseURL: false)?.queryItems?
+        .first { $0.name == "live" }?.value
+    }
+  }
+
   private func park() async throws {
     let id = UUID()
     await withTaskCancellationHandler {
@@ -145,11 +192,13 @@ private let openIdentity = openIssues.identity(
   for: resumeIssues, scope: resumeScope, columns: ["id", "title"])
 
 private func makeSource(
-  _ transport: ResumeFeedTransport, keyForRow: (@Sendable (ResumeIssue) throws -> Int64)? = nil
+  _ transport: ResumeFeedTransport, keyForRow: (@Sendable (ResumeIssue) throws -> Int64)? = nil,
+  liveReadMode: LiveReadMode = .longPoll
 ) -> CircuitsSubsetSource<ResumeIssue, Int64> {
   CircuitsSubsetSource<ResumeIssue, Int64>(
     client: ElectricCircuitsClient(
-      baseURL: URL(string: "https://engine.test")!, transport: transport),
+      baseURL: URL(string: "https://engine.test")!, transport: transport,
+      configuration: .init(liveReadMode: liveReadMode)),
     transport: transport,
     table: "public.issues",
     columns: ["id", "title"],
@@ -168,12 +217,15 @@ private typealias ResumeCoordinator = CollectionCoordinator<
   InMemoryCollectionStore<ResumeIssue, Int64>
 >
 
-/// A fresh coordinator and source over a surviving store: what an app relaunch sees.
+/// A fresh coordinator and source over a surviving store, in the same generation: a re-acquire
+/// within one launch, the case resume serves (a later launch's generation snapshots).
 private func relaunch(
-  _ transport: ResumeFeedTransport, store: InMemoryCollectionStore<ResumeIssue, Int64>
+  _ transport: ResumeFeedTransport, store: InMemoryCollectionStore<ResumeIssue, Int64>,
+  liveReadMode: LiveReadMode = .longPoll
 ) -> ResumeCoordinator {
   CollectionCoordinator(
-    definition: resumeIssues, scope: resumeScope, source: makeSource(transport), store: store)
+    definition: resumeIssues, scope: resumeScope,
+    source: makeSource(transport, liveReadMode: liveReadMode), store: store)
 }
 
 /// Polls with real sleeps rather than yields: the HTTP path crosses several actors per step.
@@ -249,6 +301,26 @@ struct CircuitsSubsetSourceResumeTests {
 
     try await lease.release()
     #expect(await transport.count("DELETE", "/v1/shapes/shape-1") == 2)
+  }
+
+  /// A resumed tail keeps the configured SSE reads, and the stream's control event naming the
+  /// stored offset is its idle answer: the demand reports live without a change or a snapshot.
+  @Test func aResumedTailKeepsSSEAndGoesLiveOnAnIdleControl() async throws {
+    let transport = ResumeFeedTransport()
+    let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
+    let seeded = try await seedBySnapshot(transport, store: store)
+
+    let lease = await relaunch(transport, store: store, liveReadMode: .sse).acquire(openIssues)
+    #expect(await eventually { await transport.liveModes("shape-1").count == 2 })
+    #expect(await lease.state() == .cached)
+
+    await transport.script("shape-1", [.idle])
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await transport.liveModes("shape-1").last == "sse")
+    #expect(await transport.streamOffsets("shape-1").last == "10")
+    #expect(await transport.count("POST", "/v1/subsets/query") == 1)
+    #expect(try await store.materialization(for: openIdentity) == seeded)
+    try await lease.release()
   }
 
   @Test func resumedDemandStaysCachedUntilAnIdlePollProvesTheTailIsCurrent() async throws {

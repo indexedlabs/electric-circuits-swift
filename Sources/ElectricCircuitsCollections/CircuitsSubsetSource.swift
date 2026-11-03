@@ -654,14 +654,32 @@ private actor CircuitsSubsetSessionLifecycle {
   }
 }
 
-/// Reports idle answers on a resumed tail's stream reads: a `204` (the long-poll window elapsed
-/// at the tail) or an empty successful batch, neither closed. A response carrying changes proves
-/// progress through the committed `apply` instead, and terminal answers stay with the reader.
+/// Reports idle answers on a resumed tail's stream reads: over long-poll a `204` (the window
+/// elapsed at the tail) or an empty successful batch, neither closed; over SSE a `control` event
+/// naming the offset the read started from. A response carrying changes proves progress through
+/// the committed `apply` instead, and terminal answers stay with the reader.
 private struct CaughtUpObservingTransport: HTTPTransport {
   let base: any HTTPTransport
   let caughtUp: @Sendable () async -> Void
 
   func prepare(_ request: URLRequest) -> URLRequest { base.prepare(request) }
+
+  /// Forwards the SSE read unchanged, so a resumed tail keeps the configured live read mode. The
+  /// bytes reach the reader first, then the scan.
+  func stream(
+    _ request: URLRequest,
+    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
+    onBytes: @Sendable (Data) async throws -> Void
+  ) async throws {
+    let offset = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?
+      .queryItems?.first { $0.name == "offset" }?.value
+    let scan = IdleControlScan(offset: offset)
+    let caughtUp = caughtUp
+    try await base.stream(request, onResponse: onResponse) { bytes in
+      try await onBytes(bytes)
+      if await scan.findsIdleControl(in: bytes) { await caughtUp() }
+    }
+  }
 
   func send(_ request: URLRequest) async throws -> HTTPResponse {
     let response = try await base.send(request)
@@ -691,6 +709,55 @@ private struct CaughtUpObservingTransport: HTTPTransport {
     guard data.count <= 64 else { return false }
     let significant = data.filter { $0 != 0x20 && $0 != 0x09 && $0 != 0x0A && $0 != 0x0D }
     return significant.isEmpty || significant.elementsEqual("[]".utf8)
+  }
+}
+
+/// Finds, in an SSE response's bytes, a `control` event whose `streamNextOffset` is the offset the
+/// read started from: the stream has nothing after it. Only control events are kept, and only up
+/// to a small bound; a data event's payload is the reader's.
+private actor IdleControlScan {
+  private let offset: String?
+  private var line = Data()
+  private var event: String?
+  private var data = Data()
+
+  init(offset: String?) {
+    self.offset = offset
+  }
+
+  func findsIdleControl(in bytes: Data) -> Bool {
+    guard let offset else { return false }
+    var found = false
+    for byte in bytes {
+      guard byte == 0x0A else {
+        if line.count < 4_096 { line.append(byte) }
+        continue
+      }
+      if line.last == 0x0D { line.removeLast() }
+      if line.isEmpty {
+        if event == "control", Self.isIdle(data, at: offset) { found = true }
+        event = nil
+        data = Data()
+      } else if let text = String(data: line, encoding: .utf8) {
+        if text.hasPrefix("event:") {
+          event = text.dropFirst("event:".count).trimmingCharacters(in: .whitespaces)
+        } else if text.hasPrefix("data:"), event == "control" || event == nil, data.count < 4_096 {
+          data.append(contentsOf: text.dropFirst("data:".count).drop { $0 == " " }.utf8)
+        }
+      }
+      line = Data()
+    }
+    return found
+  }
+
+  private struct Control: Decodable {
+    let streamNextOffset: String?
+    let streamClosed: Bool?
+  }
+
+  private static func isIdle(_ data: Data, at offset: String) -> Bool {
+    guard let control = try? JSONDecoder().decode(Control.self, from: data) else { return false }
+    return control.streamNextOffset == offset && control.streamClosed != true
   }
 }
 

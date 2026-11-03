@@ -562,10 +562,13 @@ public actor CollectionCoordinator<
       // A held live copy maintains its own claims from the feed, once its snapshot established
       // them. A resumed tail does not count: it never re-read the source, which is what the mark
       // asks for, so it revalidates through a snapshot like an unheld copy, below.
-      let held = entries[activeIdentity].flatMap { entry in
-        !entry.leases.isEmpty && entry.state == .live
-          && activeIdentity.cacheKey == storedIdentity.cacheKey ? entry : nil
+      let leased = entries[activeIdentity].flatMap { entry in
+        !entry.leases.isEmpty && activeIdentity.cacheKey == storedIdentity.cacheKey ? entry : nil
       }
+      let held = leased.flatMap { $0.state == .live ? $0 : nil }
+      // A resumed attempt tails this copy without a snapshot, live or not yet: the pass joins it
+      // and restarts it as a snapshot rather than removing the copy under its tail.
+      let resuming = leased.flatMap { $0.resumingAttempt == $0.attempt ? $0 : nil }
       if let entry = held, entry.resumingAttempt != entry.attempt {
         if entry.materializationID == id {
           try await store.clearStale(id, ifMarkedAt: mark.markedAt)
@@ -574,7 +577,8 @@ public actor CollectionCoordinator<
           claimsReleased = mark.claimCount
         }
         outcome = "held"
-      } else if let demand = held?.demand ?? rebuiltDemand(storedIdentity, active: activeIdentity),
+      } else if let demand = resuming?.demand
+        ?? rebuiltDemand(storedIdentity, active: activeIdentity),
         activeIdentity.cacheKey == storedIdentity.cacheKey
       {
         // Revalidation is a fresh snapshot: a resumed tail neither reports a row count nor
