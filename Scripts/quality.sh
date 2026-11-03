@@ -33,8 +33,14 @@ Scripts/check-swift-format.sh
 symbol_graphs="$work_dir/symbol-graphs"
 mkdir -p "$symbol_graphs"
 swift build -Xswiftc -emit-symbol-graph -Xswiftc -emit-symbol-graph-dir -Xswiftc "$symbol_graphs"
+# The catalog documents one module. DocC 27 refuses another module's main symbol graph, so pass
+# only ElectricCircuitsSwift's own graph and its extensions of other modules' types.
+module_graphs="$work_dir/electric-circuits-swift-symbol-graphs"
+mkdir -p "$module_graphs"
+cp "$symbol_graphs"/ElectricCircuitsSwift.symbols.json "$module_graphs"/
+find "$symbol_graphs" -name 'ElectricCircuitsSwift@*.symbols.json' -exec cp {} "$module_graphs"/ \;
 xcrun docc convert Sources/ElectricCircuitsSwift/ElectricCircuitsSwift.docc \
-  --additional-symbol-graph-dir "$symbol_graphs" --output-path "$work_dir/ElectricCircuitsSwift.doccarchive" \
+  --additional-symbol-graph-dir "$module_graphs" --output-path "$work_dir/ElectricCircuitsSwift.doccarchive" \
   --fallback-display-name ElectricCircuitsSwift \
   --fallback-bundle-identifier com.electriccircuits.swift --fallback-bundle-version 0.8.0 \
   --warnings-as-errors

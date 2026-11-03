@@ -397,13 +397,9 @@ struct NativeScriptedTopTenContractTests {
 
     #expect(session.issues.map(\.id) == Array((1...10).reversed()).map(Int64.init))
     #expect(await transport.requestsFor(method: "POST", path: "/v1/subsets/query").count == 3)
-    let cursor: Row? = try database.read { db -> Row? in
-      try Row.fetchOne(
-        db, sql: "SELECT offset, lsn FROM shape_cursors WHERE shape_id = ?",
-        arguments: ["recent-subset-top-ten"])
-    }
-    #expect(cursor?["offset"] as String? == "103")
-    #expect(cursor?["lsn"] as String? == "0/103")
+    let cursor = try await storedCursor(database, shapeID: "recent-subset-top-ten")
+    #expect(cursor?.offset == "103")
+    #expect(cursor?.lsn == "0/103")
   }
 
   @Test @MainActor func readerResumesFromTheCheckpointCommittedByAReseedSnapshot() async throws {
@@ -442,13 +438,9 @@ struct NativeScriptedTopTenContractTests {
     }
 
     #expect(session.issues.map(\.id) == Array((2...11).reversed()).map(Int64.init))
-    let cursor: Row? = try database.read { db -> Row? in
-      try Row.fetchOne(
-        db, sql: "SELECT offset, lsn FROM shape_cursors WHERE shape_id = ?",
-        arguments: ["recent-subset-top-ten"])
-    }
-    #expect(cursor?["offset"] as String? == "102")
-    #expect(cursor?["lsn"] as String? == "0/102")
+    let cursor = try await storedCursor(database, shapeID: "recent-subset-top-ten")
+    #expect(cursor?.offset == "102")
+    #expect(cursor?.lsn == "0/102")
   }
 
   @Test @MainActor func boundaryChurnRefillsTheStrictPageFromTheIndependentSubsetSnapshot()
@@ -500,13 +492,9 @@ struct NativeScriptedTopTenContractTests {
 
     #expect(session.issues.map(\.id) == Array((2...11).reversed()).map(Int64.init))
     #expect(await transport.requestsFor(method: "POST", path: "/v1/subsets/query").count == 2)
-    let cursor: Row? = try database.read { db -> Row? in
-      try Row.fetchOne(
-        db, sql: "SELECT offset, lsn FROM shape_cursors WHERE shape_id = ?",
-        arguments: ["recent-subset-top-ten"])
-    }
-    #expect(cursor?["offset"] as String? == "302")
-    #expect(cursor?["lsn"] as String? == "0/301")
+    let cursor = try await storedCursor(database, shapeID: "recent-subset-top-ten")
+    #expect(cursor?.offset == "302")
+    #expect(cursor?.lsn == "0/301")
   }
 
   @Test @MainActor func closedStreamRequiresAnExplicitFreshSubscriptionAndSnapshot() async throws {
@@ -579,5 +567,17 @@ struct NativeScriptedTopTenContractTests {
     #expect(decodedQuery.where == expected)
     #expect(decodedFeed.where == expected)
     await session.stop()
+  }
+}
+
+/// The cursor committed for `shapeID`, as plain values: a read's result crosses into the test, and
+/// `Row` isn't Sendable.
+private func storedCursor(
+  _ database: some DatabaseReader, shapeID: String
+) async throws -> (offset: String, lsn: String?)? {
+  try await database.read { db in
+    try Row.fetchOne(
+      db, sql: "SELECT offset, lsn FROM shape_cursors WHERE shape_id = ?", arguments: [shapeID]
+    ).map { ($0["offset"], $0["lsn"]) }
   }
 }

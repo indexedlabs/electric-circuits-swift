@@ -117,17 +117,47 @@ public struct LiveDelivery: Equatable, Sendable {
   /// `ShapeMaterializer.apply`. `nil` outside a live apply.
   @TaskLocal public static var current: LiveDelivery?
 
-  /// Runs `operation`, a materializer's store apply, with `current` narrowed to the envelopes at
-  /// `indices`: the ones a source accepted after dropping those its snapshot already holds. With
-  /// none accepted, `current` is `nil`, and the batch doesn't count as the first applied after a
-  /// reconnect. A materializer that never calls this is taken to have applied every envelope.
-  public static func applying<R>(
-    changesAt indices: [Int],
-    isolation: isolated (any Actor)? = #isolation,
-    _ operation: () async throws -> R
-  ) async rethrows -> R {
+  #if compiler(>=6.4)
+    /// Runs `operation`, a materializer's store apply, with `current` narrowed to the envelopes at
+    /// `indices`: the ones a source accepted after dropping those its snapshot already holds. With
+    /// none accepted, `current` is `nil`, and the batch doesn't count as the first applied after a
+    /// reconnect. A materializer that never calls this is taken to have applied every envelope.
+    /// `operation` runs on the caller's actor.
+    public nonisolated(nonsending) static func applying<R>(
+      changesAt indices: [Int],
+      _ operation: nonisolated(nonsending) () async throws -> R
+    ) async rethrows -> R {
+      try await $current.withValue(narrowed(to: indices), operation: operation)
+    }
+
+    /// The form older compilers expose, kept so a caller that passes `isolation:` still builds.
+    @available(*, deprecated, message: "Omit `isolation:`; `operation` runs on the caller's actor.")
+    public static func applying<R>(
+      changesAt indices: [Int],
+      isolation: isolated (any Actor)?,
+      _ operation: () async throws -> R
+    ) async rethrows -> R {
+      try await $current.withValue(narrowed(to: indices), operation: operation)
+    }
+  #else
+    /// Runs `operation`, a materializer's store apply, with `current` narrowed to the envelopes at
+    /// `indices`: the ones a source accepted after dropping those its snapshot already holds. With
+    /// none accepted, `current` is `nil`, and the batch doesn't count as the first applied after a
+    /// reconnect. A materializer that never calls this is taken to have applied every envelope.
+    /// `operation` runs on the caller's actor.
+    public static func applying<R>(
+      changesAt indices: [Int],
+      isolation: isolated (any Actor)? = #isolation,
+      _ operation: () async throws -> R
+    ) async rethrows -> R {
+      try await $current.withValue(narrowed(to: indices), operation: operation)
+    }
+  #endif
+
+  /// Records `indices` as applied, and returns `current` narrowed to them.
+  private static func narrowed(to indices: [Int]) -> LiveDelivery? {
     applyReport?.record(applied: indices.count)
-    let narrowed: LiveDelivery? = current.flatMap { delivery in
+    return current.flatMap { delivery in
       indices.isEmpty
         ? nil
         : LiveDelivery(
@@ -135,7 +165,6 @@ public struct LiveDelivery: Equatable, Sendable {
           receivedAt: delivery.receivedAt, firstAfterReconnect: delivery.firstAfterReconnect,
           changes: indices.map { delivery.changes[$0] })
     }
-    return try await $current.withValue(narrowed, operation: operation)
   }
 
   /// How many envelopes the materializer reported applying, through `applying(changesAt:_:)`.
