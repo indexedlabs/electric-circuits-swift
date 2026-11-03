@@ -74,6 +74,7 @@ OpenAPI document. Given `ShapeResponse.streamUrl`:
 | --- | --- | --- | --- |
 | frontier | `HEAD streamUrl` | `stream-next-offset` header | The nonempty header is the opaque resume cursor. Its absence on success is malformed. It fences a subset snapshot: create feed → `HEAD` frontier → snapshot → read from that frontier, under the same source receipt. |
 | read | `GET streamUrl?offset=<opaque>&live=long-poll` | JSON array and `stream-next-offset` | Apply rows and checkpoint atomically. A nonempty array without a next offset is malformed. Empty array, empty body, or `204` may still advance the cursor when the header differs. |
+| live read (SSE) | `GET streamUrl?offset=<opaque>&live=sse` | `event: data` and `event: control` frames | Each data frame is followed by a control whose `streamNextOffset` ends that batch; apply and checkpoint at the control. A read that opens at the tail first sends a control with `upToDate: true` and `streamNextOffset` equal to the requested offset, and repeats it while idle, so an idle answer arrives without new data (durable-streams-rust `handle_sse`, required by its conformance suite). `streamClosed: true` is terminal. |
 
 An envelope is `{ type, key, value?, old?, headers }`. `headers.operation` is `insert`, `update`,
 `upsert`, or `delete`; `key` is an opaque **bare engine key**, including for deletes. It is not a

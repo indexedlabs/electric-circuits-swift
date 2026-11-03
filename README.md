@@ -120,7 +120,9 @@ outcome or a non-retryable failure other than an authentication refusal (401, 40
 loss, exhausted retries and authentication refusals leave it resumable. A feed that answers with a
 different URL is kept for the snapshot that follows on the same source instance; an adapter that
 snapshots through another instance first calls `cleanupAbandonedMaterialization`, which releases it.
-On a feed that is already current, `.live` waits for the first long-poll answer.
+On a feed that is already current, `.live` waits for the first idle answer: a long-poll `204` or
+empty batch, or over SSE the control event naming the stored offset, which the stream server sends
+as soon as a read opens at the tail.
 
 Each demand has two keys. `CollectionDemandIdentity.cacheKey` names the stored copy: the
 principal, authorization, collection, canonical predicate, order, limit and the source's columns
