@@ -49,6 +49,9 @@ public actor CollectionLease {
     return await stateAction(id)
   }
 
+  /// Stops the lease's session and materializes the demand again with a new snapshot and feed.
+  /// A refresh always re-reads the source, even when the store holds a copy that an acquire
+  /// would resume from its stored cursor.
   public func refresh() async {
     guard !released else { return }
     await refreshAction(id)
@@ -120,7 +123,8 @@ public actor CollectionCoordinator<
     var awaitsEviction: Bool
     var snapshotRowCount: Int?
     /// The next attempt must take the snapshot path even when the store holds an exact record.
-    /// Set by the stale pass, whose revalidation is a fresh snapshot; cleared once one commits.
+    /// Set by the stale pass and by every refresh, each a re-read; cleared once a snapshot
+    /// commits, so after a refresh's snapshot fails the entry's next restart snapshots too.
     var requiresSnapshot = false
     /// The attempt currently continuing a stored cursor through `source.resume`, if any.
     var resumingAttempt: UUID?
@@ -867,7 +871,8 @@ public actor CollectionCoordinator<
   /// source declines, the stored record moved while it was asked, or the feed refuses the stored
   /// cursor (`CollectionResumeInvalidated`) before the tail went live, and the attempt must take
   /// the snapshot path; true when this attempt has finished, failed or been superseded. A
-  /// transient failure fails the attempt and leaves the cursor resumable by the next one.
+  /// transient failure fails the attempt and leaves the cursor resumable by the next acquire; a
+  /// refresh always snapshots.
   ///
   /// The snapshot path's per-acquire invariants, and how a resumed attempt keeps them:
   /// - Rows and claims: there is no `replaceSnapshot`, so no omission pass marks other holders
@@ -1197,6 +1202,9 @@ public actor CollectionCoordinator<
     entry.refreshToken = nil
     entry.refreshTask = nil
     entry.state = .unavailable
+    // A refresh is a re-read of the source: its attempt snapshots even when the store holds a
+    // copy it could resume. Resume serves acquires.
+    entry.requiresSnapshot = true
     entries[identity] = entry
     for continuation in entry.leases.values { continuation.yield(.unavailable) }
     startAttempt(for: identity, attempt: nextAttempt)
