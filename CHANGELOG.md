@@ -45,7 +45,7 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   restarts a resumed attempt it joins, including one that already reports `.live`. A session whose
   feed refuses the stored cursor throws `CollectionResumeInvalidated`; until the tail goes live, the
   same attempt snapshots instead, so no lease sees a failure. A transient failure fails the attempt,
-  and the next acquire resumes again.
+  and the next attempt resumes again.
 - `CircuitsSubsetSource` writes `subset-v2|<streamUrl>|<offset>|<lsn>|<snapshot>|<horizon>` snapshot
   fences and implements `resume`: it re-joins the identical feed request under this launch's
   subscription and, when the engine answers with the fenced stream URL, tails the same append-only

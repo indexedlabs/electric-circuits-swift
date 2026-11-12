@@ -123,7 +123,8 @@ public actor CollectionCoordinator<
     var awaitsEviction: Bool
     var snapshotRowCount: Int?
     /// The next attempt must take the snapshot path even when the store holds an exact record.
-    /// Set by the stale pass, whose revalidation is a fresh snapshot; cleared once one commits.
+    /// Set by the stale pass and by every refresh, each a re-read; cleared once a snapshot
+    /// commits, so after a refresh's snapshot fails the entry's next restart snapshots too.
     var requiresSnapshot = false
     /// The attempt currently continuing a stored cursor through `source.resume`, if any.
     var resumingAttempt: UUID?
@@ -870,7 +871,8 @@ public actor CollectionCoordinator<
   /// source declines, the stored record moved while it was asked, or the feed refuses the stored
   /// cursor (`CollectionResumeInvalidated`) before the tail went live, and the attempt must take
   /// the snapshot path; true when this attempt has finished, failed or been superseded. A
-  /// transient failure fails the attempt and leaves the cursor resumable by the next one.
+  /// transient failure fails the attempt and leaves the cursor resumable by the next acquire; a
+  /// refresh always snapshots.
   ///
   /// The snapshot path's per-acquire invariants, and how a resumed attempt keeps them:
   /// - Rows and claims: there is no `replaceSnapshot`, so no omission pass marks other holders
