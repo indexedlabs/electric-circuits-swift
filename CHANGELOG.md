@@ -5,6 +5,14 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 
 ## Unreleased
 
+- Fix: `CollectionLease.refresh()` snapshots again, as it did before 0.15.0. A refresh is a re-read
+  of the source, and 0.15.0 let it resume from the stored cursor instead, skipping the read a caller
+  asked for (for example an app re-reading every held demand after a long absence). Resume now
+  serves acquires only, and the next acquire after a transient failure still resumes. The next tag
+  is 0.15.2, a patch.
+
+## 0.15.1
+
 - Build and test under Xcode 27 (Swift 6.4) as well as Xcode 26. CI adds a `quality-xcode-27` job on
   GitHub's `xcode-27` image (Xcode 27.1) beside the Xcode 26.3 job.
 - `LiveDelivery.applying(changesAt:_:)` is `nonisolated(nonsending)` on Swift 6.4 and later, where
@@ -37,7 +45,7 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
   restarts a resumed attempt it joins, including one that already reports `.live`. A session whose
   feed refuses the stored cursor throws `CollectionResumeInvalidated`; until the tail goes live, the
   same attempt snapshots instead, so no lease sees a failure. A transient failure fails the attempt,
-  and the next attempt resumes again.
+  and the next acquire resumes again.
 - `CircuitsSubsetSource` writes `subset-v2|<streamUrl>|<offset>|<lsn>|<snapshot>|<horizon>` snapshot
   fences and implements `resume`: it re-joins the identical feed request under this launch's
   subscription and, when the engine answers with the fenced stream URL, tails the same append-only

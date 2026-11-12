@@ -71,7 +71,7 @@ public struct CollectionResumeSession<Model: Sendable, Key: Hashable & Sendable>
 /// committed or caught up the coordinator stops the session and snapshots in the same attempt.
 /// After that, the demand has been reported live and the attempt fails as any tail would.
 /// Transient failures (transport loss, exhausted retries, capacity) throw their own error: they
-/// say nothing about the cursor, and the next attempt resumes again.
+/// say nothing about the cursor, and the next acquire resumes again. A refresh always snapshots.
 public struct CollectionResumeInvalidated: Error, Sendable {
   public let cause: any Error
 

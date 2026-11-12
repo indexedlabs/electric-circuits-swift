@@ -49,6 +49,9 @@ public actor CollectionLease {
     return await stateAction(id)
   }
 
+  /// Stops the lease's session and materializes the demand again with a new snapshot and feed.
+  /// A refresh always re-reads the source, even when the store holds a copy that an acquire
+  /// would resume from its stored cursor.
   public func refresh() async {
     guard !released else { return }
     await refreshAction(id)
@@ -1197,6 +1200,9 @@ public actor CollectionCoordinator<
     entry.refreshToken = nil
     entry.refreshTask = nil
     entry.state = .unavailable
+    // A refresh is a re-read of the source: its attempt snapshots even when the store holds a
+    // copy it could resume. Resume serves acquires.
+    entry.requiresSnapshot = true
     entries[identity] = entry
     for continuation in entry.leases.values { continuation.yield(.unavailable) }
     startAttempt(for: identity, attempt: nextAttempt)
