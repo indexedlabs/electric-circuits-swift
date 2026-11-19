@@ -13,6 +13,14 @@ only after the committed local cursor. Replaying an already committed cursor is 
 in-memory reference materializer; production providers must implement their own corresponding
 idempotence and transactional guarantees.
 
+A materializer that restarts from a stored cursor holds rows that were current at that cursor. Pass
+`onCaughtUp:` to the coordinator, or to ``ShapeStreamReader``, to learn when they are current again:
+the stream is first read to its head without waiting there (a long-poll reader's reads carry no
+`live` parameter until one is answered as up to date), and the closure is called once, with the
+committed cursor, after every change up to that head has been applied. Without it a reader long-polls
+from the stored cursor, and at the stream's head its first answer comes only when the server's poll
+window ends.
+
 ## Lifecycle outcomes
 
 A successful `start` creates or renews a named claim, then starts a long-poll reader. `stop` cancels

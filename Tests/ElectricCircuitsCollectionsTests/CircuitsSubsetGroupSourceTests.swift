@@ -149,15 +149,19 @@ private actor GroupStreamServer: HTTPTransport {
   /// A batch served, never consumed, to every read at or before its offset: a stream position
   /// that a reader resuming from an old cursor would reach again.
   private let sticky: (offset: Int, body: String)?
+  /// Whether the server has `POST /v1/subsets/rejoin`; without it the route answers `404`.
+  private let rejoinRoute: Bool
   private(set) var loads: [SubsetGroupRequest] = []
+  private(set) var rejoins: [SubsetGroupRequest] = []
   private(set) var streamURLs: [URL] = []
   private(set) var releases: [URL] = []
 
   init(
     batches: [String], goneReads: Int = 0, goneStatus: Int = 410, endless: Bool = false,
     leaseSeconds: Int? = nil, loadDelay: Duration = .zero, loadAnswers: [String] = [],
-    sticky: (offset: Int, body: String)? = nil
+    sticky: (offset: Int, body: String)? = nil, rejoinRoute: Bool = true
   ) {
+    self.rejoinRoute = rejoinRoute
     self.loadAnswers = loadAnswers
     self.sticky = sticky
     self.leaseSeconds = leaseSeconds
@@ -179,6 +183,15 @@ private actor GroupStreamServer: HTTPTransport {
           of: #""streamPath":"#, with: #""leaseSeconds":\#($0),"streamPath":"#)
       }
       if !loadAnswers.isEmpty { return reply(loadAnswers.removeFirst(), request: request) }
+      return reply(answer ?? groupLoadAnswer, request: request)
+    case ("POST", "/v1/subsets/rejoin"):
+      rejoins.append(try JSONDecoder().decode(SubsetGroupRequest.self, from: request.httpBody!))
+      guard rejoinRoute else { return reply("Not Found", request: request, status: 404) }
+      // The claim alone: a client decodes the load's answer the same way and reads no rows.
+      let answer = leaseSeconds.map {
+        groupLoadAnswer.replacingOccurrences(
+          of: #""streamPath":"#, with: #""leaseSeconds":\#($0),"streamPath":"#)
+      }
       return reply(answer ?? groupLoadAnswer, request: request)
     case ("GET", let path) where path.hasPrefix("/streams/"):
       streamURLs.append(request.url!)
@@ -674,15 +687,38 @@ struct CircuitsSubsetGroupSourceTests {
     #expect(first <= .seconds(10) - .milliseconds(50))
     #expect(await server.loads.count == 1)
 
+    // The renewal is a re-join, which reads no rows; the setup's load stays the only one.
     await clock.wake()
     await waitUntil { await clock.sleeps.count >= 2 }
-    #expect(await server.loads.count == 2)
+    #expect(await server.rejoins == server.loads)
+    #expect(await server.loads.count == 1)
     #expect(await clock.sleeps[1] == .seconds(10))
 
     run.cancel()
     _ = await run.result
     await waitUntil { await !server.releases.isEmpty }
     #expect(await server.releases.contains { $0.path == "/v1/shapes/group-1" })
+  }
+
+  /// A gateway without the re-join route answers it `404`; the session then renews by load, as
+  /// it did before the route existed, and keeps running.
+  @Test func aSessionOnAServerWithoutTheRejoinRouteRenewsByLoad() async throws {
+    let server = GroupStreamServer(batches: [], leaseSeconds: 30, rejoinRoute: false)
+    let clock = GroupSourceLeaseClock()
+    let session = try await makeSource(server, mode: .longPoll, clock: clock).materialize(
+      threeTableDemand(), materializationID: CollectionMaterializationID(rawValue: "scope-1"))
+
+    let run = Task { try await session.run { _ in } }
+    await waitUntil { await !clock.sleeps.isEmpty }
+    await clock.wake()
+    await waitUntil { await clock.sleeps.count >= 2 }
+
+    #expect(await server.rejoins.count == 1)
+    #expect(await server.loads.count == 2)
+    #expect(await server.releases.isEmpty)
+    run.cancel()
+    _ = await run.result
+    await waitUntil { await !server.releases.isEmpty }
   }
 
   @Test func aSlowSetupLoadShortensTheFirstRenewal() async throws {
@@ -702,8 +738,9 @@ struct CircuitsSubsetGroupSourceTests {
 
     // The renewal comes when that sleep ends, inside the lease.
     await clock.wake()
-    await waitUntil { await server.loads.count >= 2 }
-    #expect(await server.loads.count == 2)
+    await waitUntil { await server.rejoins.count >= 1 }
+    #expect(await server.rejoins.count == 1)
+    #expect(await server.loads.count == 1)
 
     run.cancel()
     _ = await run.result

@@ -5,6 +5,152 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 
 ## Unreleased
 
+- A release names the claim it was issued for (`Contracts/native-v1-contract-v1.md`, "Claim
+  identity"). Fix: a group's launches share one subscription, so a release an earlier launch
+  sent, arriving late or retried after a later launch re-joined the group, released the later
+  launch's claim; until its next renewal nothing held the group, and an engine at its shape cap
+  could evict it under its reader. The engine now answers the identity of each claim (`claim` on
+  a create, a load and a re-join), and the SDK holds it in memory and names it: add
+  `ShapeResponse.claim`, `ShapeHandle.claim`, `SubsetGroupResponse.claim` and
+  `SubsetGroupRejoinResponse.claim`; `releaseShape(_:)` sends `claim` beside `subscription`; and
+  `createShape`, `renewShape`, `createSubsetFeed`, `createAggregate`, `loadSubsetGroup` and
+  `rejoinSubsetGroup` take `holding:`, the claim the caller holds, sent as the `claim` query
+  parameter. `ShapeSubscriptionCoordinator` names the held claim on every renewal, so the engine
+  keeps its identity and the session's release names its claim after any number of renewals, and
+  it adopts the answer's claim, so a renewal answered another identity is released by that one. A
+  claim is never stored: a launch that resumes a group re-joins without one, is answered its own,
+  and releases only that. Against a server that answers no `claim` nothing is sent and every
+  release is the one it was before. The probe reports the claim a request names (`named`) and the
+  one its answer carries (`claim`).
+- Resume survives a relaunch. `CollectionCoordinator` asks the source to continue the copy stored
+  under the demand's `cacheKey` whichever generation stored it, where 0.15.0 resumed only a copy
+  bound to the same generation and so only within a launch. Before the tail runs it binds an
+  earlier generation's copy to its own demand through the new
+  `CollectionStore.rebindMaterialization(_:to:)`, which changes nothing else about the copy, so
+  `evict(_:)` and the stale pass treat it as this generation's. The requirement has a default that
+  answers false: a provider that does not implement it snapshots on a later launch as before, with
+  no extra request, and a provider whose `materialization(for:)` already reports the requested
+  demand is never asked. `InMemoryCollectionStore` implements it. `CircuitsSubsetSource` needs no
+  change: each launch claims the feed under its own subscription, and the engine answers the
+  identical request with the same stream URL until it retires the feed.
+- Groups resume. `CircuitsSubsetGroupSource` writes
+  `group-v2|<streamUrl>|<subscription>|<offset>|<lsn>|<snapshot>|<horizon>` snapshot fences and
+  gains `resume(_:identity:materializationID:record:mode:)`, which returns a
+  `CollectionGroupResumeSession` or nil. It loads the group under the fenced subscription and,
+  when the engine answers with the fenced stream URL, tails that stream from the stored cursor
+  with the snapshot's own overlap gate; the caller replaces nothing in its store. The engine
+  keeps a group's stream only while its one subscription is claimed, so a group resumes after a
+  process was killed or lost its connection, within the lease. After the engine released the
+  group, the same load answers with a new stream: `resume` returns nil and keeps that load, and
+  the `materialize` that follows uses it as its snapshot, so the fallback loads once.
+  `cleanupAbandonedMaterialization` releases a kept load no `materialize` used. (The request a
+  resume makes is the re-join described further down, not this load, wherever the server has the
+  route.) `group-v1` fences decode and are rewritten by the next snapshot.
+  `InMemoryCollectionGroupStore` keeps rows per collection, principal and authorization rather
+  than per generation, and accepts a later generation's snapshot of the same group.
+- A batch a source refuses no longer blocks the scope. Both sources refuse a batch whose live
+  envelope has no parseable `headers.lsn`, or whose key or row does not decode, without applying
+  any of it. The stream serves that batch again at the stored cursor, and 0.15.0 resumed into it
+  on every later attempt without ever taking a snapshot. Now the source declines to resume from a
+  fence whose session ended that way, so the next attempt snapshots, and a resumed tail that
+  reaches such a batch before reporting live throws `CollectionResumeInvalidated`, so the same
+  attempt snapshots. A must-refetch marker on a group stream does the same. The ordering rule is
+  unchanged: an envelope without a position is never applied.
+- Both sources follow the engine's rules for an envelope's position (electric-circuits
+  `docs/ARCHITECTURE.md`, "Native envelope positions"). Fix: a resumed tail consulted the snapshot
+  for every key until an applied change raised the stored version above the snapshot's LSN, so
+  after a restart it could skip an envelope for a row the stream had already changed, such as a
+  flip's verdict that names a transaction the snapshot includes. A resumed tail now consults the
+  snapshot only while its cursor is still the snapshot's own offset, and both tails remember the
+  last position applied to each key whether or not the snapshot carried visibility.
+- `CircuitsSubsetSource`'s session throws the error that refused a batch, such as
+  `CircuitsSubsetSourceError.invalidLiveSourceVersion(nil)`, where it threw
+  `.subscription(.materializer)` for it; the group source already did. A store's refusal to apply
+  still reports `.subscription(.materializer)`.
+- Add `Tests/Fixtures/engine-live-envelopes.json`, live envelopes captured from the engine at
+  `1be10fb`, and tests that pin what the SDK does with them: a plain feed's envelopes carry
+  `headers.lsn` and apply in place; a subquery feed's carry none and fail the feed.
+- Add `ElectricCircuitsSwiftProbe`, a development executable (not a product) that drives the
+  collection stack against an engine URL with a file-backed store and reports state, applied
+  changes, failures and every network request as JSON lines. Its `acquire` and `refresh` commands
+  take `"mode":"snapshot"`, `ECS_SWIFT_PROBE_LIVE=sse` selects SSE, and each stream read reports
+  its `live` parameter (`none` for a read without one) and whether the answer was marked up to
+  date.
+- The caller can ask for a snapshot. Add `CollectionLoadMode` (`.resume`, `.snapshot`),
+  `CollectionCoordinator.acquire(_:mode:)` and `CollectionLease.refresh(_:)`. Since 0.15.0 every
+  `refresh()` of a resumable demand continued from the stored cursor, so an app that refreshed to
+  read the source again (after marking a scope stale, on a handover, after reading authority
+  again) silently stopped doing so. `.snapshot` takes a new snapshot without asking the source to
+  resume, as every acquire and refresh did before 0.15.0; `.resume` is what `acquire(_:)` and
+  `refresh()` do, and they are unchanged. A snapshot the caller asked for is owed until one
+  commits: an attempt that fails first is followed by another snapshot whatever mode the retry
+  names, and `refresh(.snapshot)` is answered by an attempt that starts after the call, never by
+  a snapshot the replaced attempt was already reading. `acquire(_:mode: .snapshot)` replaces a
+  shared attempt that resumed and joins one that took its own snapshot. The stale pass, whose
+  revalidation always snapshots (0.15.0), now asks through the same mode, so one requirement on
+  the demand serves both. For a group, `CircuitsSubsetGroupSource.resume` takes `mode:`: with
+  `.snapshot` it makes no request, releases a load an earlier declined resume kept, and returns
+  nil, so the `materialize` that follows reads the group anew.
+- A resumed session reports live when it has read to the stream's head, and asks where that is
+  instead of waiting there (`Contracts/native-v1-contract-v1.md`, "Live after a resume"). Fix:
+  with nothing new on the stream, a resumed long-poll tail reported `.live` only when the
+  server's long-poll window ran out, about 30 seconds, and a resumed group called `caughtUp` only
+  then; under SSE both were told at once. A resumed long-poll tail now starts with
+  reads that carry no `live` parameter, which the stream answers at once, until one is marked
+  `stream-up-to-date`; then it long-polls. A resumed SSE tail reads the mark from the stream's
+  control event (`upToDate`). Fix: a resumed demand reported `.live` at its first committed
+  batch, with changes the stream already held still unread; it now stays `.cached` until the
+  batch that ends at the head is committed. Three things to review:
+  - `CollectionResumeSession`: only `caughtUp` reports the demand live. A custom adapter whose
+    resumed session relied on a committed `apply` to do so must call `caughtUp` when it is at its
+    feed's head.
+  - `CollectionGroupResumeSession`: the stored rows are current when `caughtUp` is called, which
+    now happens once, after the last batch up to the head; treat an applied batch as progress
+    only.
+  - A gateway in front of the stream must pass a read without `live`, return
+    `stream-up-to-date` and `stream-next-offset`, and not answer it from a cache (the read carries
+    `Cache-Control: no-cache`). A resume costs one stream read more than before when nothing is
+    new and none when something is; it still reads no frontier and no snapshot.
+- Add `onCaughtUp:` to `ShapeStreamReader.init` and both `ShapeSubscriptionCoordinator`
+  initializers, nil by default: with it the reader reads to the stream's head as above and calls
+  the closure once, with the committed cursor, after everything up to that head is applied.
+  Without it a reader's requests are unchanged.
+- The contract gains "Live after a resume", the read without `live` in its stream table,
+  "Group re-join" and "Requests to the engine": what a group needs from the engine to resume
+  after a clean stop.
+- A group resumes and renews without the engine reading its rows. Add
+  `ElectricCircuitsClient.rejoinSubsetGroup(_:)`, `SubsetGroupRejoin` and
+  `SubsetGroupRejoinResponse` for `POST /v1/subsets/rejoin` (contract, "Group re-join"): a load's
+  body, answered with the load's answer less `rows`, `lsn`, `snapshot` and `horizon`. It claims
+  or renews the group the subscription holds and never creates one; `412` is "no such group".
+  `CircuitsSubsetGroupSource.resume` sends it in place of the load 0.16.0's draft made, so a
+  relaunch that continues a stored group costs the engine no member query. When the engine
+  answers `412`, `resume` returns nil without having created anything and the `materialize` that
+  follows loads once, under the launch's own subscription (the declined resume's load used to be
+  made under the fenced one and kept). `ShapeSubscriptionCoordinator`'s group initializer renews
+  with it too, which removes the renewal that could outgrow `ResponseDecodingLimits`
+  (OTTO-10739); `412` at a renewal ends the session with `.reseedRequired`, reason
+  `.terminal(.gone)`, the claim released and nothing created. A server without the route answers
+  `404` or `405`, and both paths then use the load exactly as before, so the package works
+  against the engine at `1be10fb` and a gateway that has not added the route. One new request
+  shape, to a new route.
+- Fix: a claim request refused as retryable is repeated. `CircuitsSubsetSource` creates its feed,
+  and `CircuitsSubsetGroupSource` loads or re-joins its group, before a subscription coordinator
+  exists, and a `503` there failed the scope at once. An engine at its shape cap answers a
+  create `503` with `Retry-After` until a subscription is released, so every such scope failed
+  and waited for its caller. Those requests are now repeated on the source's
+  `ShapeSubscriptionRetryPolicy`, each after its backoff or the server's `Retry-After`, whichever
+  is longer, for `408`, `425`, `429` and `5xx`; past the budget the refusal is thrown as before.
+- Additive, with behaviour to review: an app that relied on a snapshot at every launch to drop
+  rows the feed never removed no longer gets one while the engine serves the same stream, and
+  asks for one with `.snapshot` where it needs it; and the three points under "A resumed session
+  reports live" above. One new stream request shape (a read without `live`), no engine route
+  changes. Custom `CollectionStore` providers and call sites keep compiling; fences stay opaque
+  strings to stores. The next tag is 0.16.0, a minor bump under the pre-1.0 rule in
+  `Policies/SEMVER.md`.
+
+## 0.15.1
+
 - Build and test under Xcode 27 (Swift 6.4) as well as Xcode 26. CI adds a `quality-xcode-27` job on
   GitHub's `xcode-27` image (Xcode 27.1) beside the Xcode 26.3 job.
 - `LiveDelivery.applying(changesAt:_:)` is `nonisolated(nonsending)` on Swift 6.4 and later, where

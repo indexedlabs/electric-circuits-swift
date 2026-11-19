@@ -279,8 +279,10 @@ public protocol CollectionGroupStore: Sendable {
   func groupMaterialization(_ materializationID: CollectionMaterializationID) async throws
     -> CollectionGroupMaterializationRecord?
 
-  /// Replaces this materialization's rows in every member collection and records its fence,
-  /// source version and cursor. Rows another materialization still claims stay.
+  /// Replaces this materialization's rows in every member collection and records its demand,
+  /// fence, source version and cursor. Rows another materialization still claims stay. A later
+  /// generation's snapshot of the same group (`demand.cacheKey`) replaces the stored copy in
+  /// place.
   func replaceGroupSnapshot(
     _ snapshot: CollectionGroupSnapshot,
     materializationID: CollectionMaterializationID,
@@ -299,13 +301,29 @@ public protocol CollectionGroupStore: Sendable {
   func removeGroupMaterialization(_ materializationID: CollectionMaterializationID) async throws
 }
 
-/// Reference group store for contract tests and previews. Rows are canonical per collection and
-/// scope, claimed per materialization, and versioned like `InMemoryCollectionStore`'s.
+/// Reference group store for contract tests and previews. Rows are canonical per collection,
+/// principal and authorization, shared by every generation, claimed per materialization, and
+/// versioned like `InMemoryCollectionStore`'s. A materialization keeps the group it was first
+/// stored for (`cacheKey`): a later generation's snapshot replaces its rows in place and records
+/// that generation's demand, and a tail resumed without a snapshot leaves the record's demand as
+/// it was, which nothing in this protocol reads.
 public actor InMemoryCollectionGroupStore: CollectionGroupStore {
   private struct RowKey: Hashable {
     let collection: CollectionID
-    let scope: CollectionScope
+    let principal: String
+    let authorization: String
     let key: AnyHashable
+
+    init(collection: CollectionID, scope: CollectionScope, key: AnyHashable) {
+      self.collection = collection
+      principal = scope.principal
+      authorization = scope.authorization
+      self.key = key
+    }
+
+    func belongs(to scope: CollectionScope) -> Bool {
+      principal == scope.principal && authorization == scope.authorization
+    }
   }
   /// A nil value is a versioned tombstone, as in `InMemoryCollectionStore`.
   private struct Row {
@@ -333,7 +351,7 @@ public actor InMemoryCollectionGroupStore: CollectionGroupStore {
     demand: CollectionGroupDemandIdentity
   ) async throws {
     if let existing = state.records[materializationID] {
-      guard existing.demand == demand else {
+      guard existing.demand.cacheKey == demand.cacheKey else {
         throw CollectionGroupStoreError.materializationBoundToDifferentDemand(
           materializationID: materializationID, existing: existing.demand, requested: demand)
       }
@@ -418,13 +436,14 @@ public actor InMemoryCollectionGroupStore: CollectionGroupStore {
     state = next
   }
 
-  /// One collection's live rows in a scope, decoded as the member's model and key.
+  /// One collection's live rows for a scope's principal and authorization, whichever generation
+  /// stored them, decoded as the member's model and key.
   public func rows<Model: Sendable, Key: Hashable & Sendable>(
     in collection: CollectionID, scope: CollectionScope, as _: Model.Type = Model.self,
     key _: Key.Type = Key.self
   ) -> [Key: Model] {
     state.rows.reduce(into: [:]) { result, pair in
-      guard pair.key.collection == collection, pair.key.scope == scope,
+      guard pair.key.collection == collection, pair.key.belongs(to: scope),
         let key = pair.key.key.base as? Key, let row = pair.value.value as? Model
       else { return }
       result[key] = row
@@ -478,7 +497,7 @@ public actor InMemoryCollectionGroupStore: CollectionGroupStore {
     state.rows = state.rows.filter { rowKey, row in
       guard row.value == nil else { return true }
       return records.contains { record in
-        record.demand.scope == rowKey.scope && record.collections.contains(rowKey.collection)
+        rowKey.belongs(to: record.demand.scope) && record.collections.contains(rowKey.collection)
           && !record.sourceVersion.supersedes(row.version)
       }
     }

@@ -36,6 +36,13 @@ let package = Package(
       dependencies: ["ElectricCircuitsSwift"],
       path: "Sources/ElectricCircuitsSwiftEngineDSOutage"
     ),
+    // A development tool, deliberately not a product: it drives the collection stack against a
+    // real engine and reports what the SDK does (`swift run ElectricCircuitsSwiftProbe`).
+    .executableTarget(
+      name: "ElectricCircuitsSwiftProbe",
+      dependencies: ["ElectricCircuitsSwift", "ElectricCircuitsCollections"],
+      path: "Sources/ElectricCircuitsSwiftProbe"
+    ),
     .testTarget(
       name: "ElectricCircuitsSwiftTests", dependencies: ["ElectricCircuitsSwift"],
       path: "Tests/ElectricCircuitsSwiftTests"),

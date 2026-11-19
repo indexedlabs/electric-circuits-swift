@@ -232,8 +232,8 @@ public enum ShapeSubscriptionKind: Equatable, Sendable {
   case subsetFeed
 }
 
-/// The request a coordinator creates and renews its claim with. A group load renews by posting
-/// the same subscription and members again.
+/// The request a coordinator creates and renews its claim with. A group is created by a load and
+/// renewed by re-joining it with the same subscription and members.
 private enum ShapeSubscriptionClaimRoute: Sendable {
   case shape(ShapeRequest)
   case subsetFeed(ShapeRequest)
@@ -241,6 +241,11 @@ private enum ShapeSubscriptionClaimRoute: Sendable {
 }
 
 private struct MaterializerFailure: Error, Sendable {}
+/// A group renewal was answered "no such group": the engine no longer holds the group `previous`
+/// claimed. Raised inside the renewal task and consumed by `renew()`.
+private struct GroupClaimGone: Error, Sendable {
+  let previous: ShapeHandle
+}
 private struct CoordinatedMaterializer: ShapeMaterializer {
   let base: any ShapeMaterializer
   func currentCursor() async throws -> StreamCursor? {
@@ -283,6 +288,7 @@ public actor ShapeSubscriptionCoordinator {
   private let responseDecodingLimits: ResponseDecodingLimits
   private let telemetry: TelemetryReporter
   private let recreatePolicy: ShapeSubscriptionRecreatePolicy
+  private let onCaughtUp: (@Sendable (StreamCursor) async -> Void)?
   private var continuation: AsyncStream<ShapeSubscriptionState>.Continuation?
   private var handle: ShapeHandle?
   /// A claim the caller already holds, which the first start uses instead of creating one.
@@ -325,6 +331,11 @@ public actor ShapeSubscriptionCoordinator {
   /// preflight, and the coordinator takes over releasing it. `setupClaimAge` is how long before
   /// this call that create was sent: its lease began then, so the first renewal comes that much
   /// sooner.
+  ///
+  /// `onCaughtUp` is `ShapeStreamReader`'s: with it the stream is first read to its head without
+  /// waiting there, and the closure is called once, after every change up to that head has been
+  /// applied. A coordinator that starts from a cursor its materializer stored earlier uses it to
+  /// learn that what the materializer holds is current.
   public init(
     client: ElectricCircuitsClient, transport: any HTTPTransport, request: ShapeRequest,
     materializer: any ShapeMaterializer, retryPolicy: ShapeSubscriptionRetryPolicy = .init(),
@@ -335,7 +346,8 @@ public actor ShapeSubscriptionCoordinator {
     kind: ShapeSubscriptionKind = .shape,
     recreatePolicy: ShapeSubscriptionRecreatePolicy = .init(),
     setupClaim: ShapeHandle? = nil,
-    setupClaimAge: Duration = .zero
+    setupClaimAge: Duration = .zero,
+    onCaughtUp: (@Sendable (StreamCursor) async -> Void)? = nil
   ) {
     let route: ShapeSubscriptionClaimRoute =
       switch kind {
@@ -346,21 +358,27 @@ public actor ShapeSubscriptionCoordinator {
       client: client, transport: transport, route: route, materializer: materializer,
       retryPolicy: retryPolicy, clock: clock, capacity: capacity,
       responseDecodingLimits: responseDecodingLimits, telemetry: telemetry,
-      recreatePolicy: recreatePolicy, setupClaim: setupClaim, setupClaimAge: setupClaimAge)
+      recreatePolicy: recreatePolicy, setupClaim: setupClaim, setupClaimAge: setupClaimAge,
+      onCaughtUp: onCaughtUp)
   }
 
   /// A coordinator for one shape group: it loads the group, reads the group's one stream and
-  /// renews by loading the same subscription and members again.
+  /// renews by re-joining it with the same subscription and members.
   ///
-  /// `setupClaim` is the handle of a load the caller just made for its snapshot. The coordinator
-  /// starts on it instead of loading the group a second time, and takes over releasing it.
-  /// `setupClaimAge` is how long before this call that load was made: its lease began then, so
-  /// the first renewal comes that much sooner.
+  /// `setupClaim` is the handle of a load, or of a re-join, the caller just made. The coordinator
+  /// starts on it instead of claiming the group a second time, and takes over releasing it.
+  /// `setupClaimAge` is how long before this call that request was made: its lease began then,
+  /// so the first renewal comes that much sooner.
   ///
-  /// A renewal is a full group load: the engine re-reads every member's snapshot and the answer
-  /// carries its rows, which are not decoded. The answer still counts against
-  /// `ResponseDecodingLimits`, so a group whose rows outgrow the limit fails at its next renewal.
-  /// A rows-free renewal is OTTO-10739; don't enable groups for users before it lands.
+  /// A renewal is `ElectricCircuitsClient.rejoinSubsetGroup(_:)`: the engine reads no rows for
+  /// it, and its answer's size follows the number of members, so it cannot outgrow
+  /// `ResponseDecodingLimits`. When the engine answers that the subscription holds no such group
+  /// any more, the session ends as it does when the group's stream is retired: `.reseedRequired`
+  /// with `.terminal(.gone)`, the claim released, nothing created. On a server without the
+  /// re-join route the renewal is the load it was before the route existed, whose rows are not
+  /// decoded but still count against the limits.
+  ///
+  /// `onCaughtUp` is as on the shape initializer.
   public init(
     client: ElectricCircuitsClient, transport: any HTTPTransport,
     groupRequest: SubsetGroupRequest, materializer: any ShapeMaterializer,
@@ -371,7 +389,8 @@ public actor ShapeSubscriptionCoordinator {
     telemetry: TelemetryReporter = .noop,
     recreatePolicy: ShapeSubscriptionRecreatePolicy = .init(),
     setupClaim: ShapeHandle? = nil,
-    setupClaimAge: Duration = .zero
+    setupClaimAge: Duration = .zero,
+    onCaughtUp: (@Sendable (StreamCursor) async -> Void)? = nil
   ) {
     // Only a load that names its subscription renews the same group; without one, every
     // renewal would mint a new group and report a replacement.
@@ -381,7 +400,8 @@ public actor ShapeSubscriptionCoordinator {
       client: client, transport: transport, route: .subsetGroup(groupRequest),
       materializer: materializer, retryPolicy: retryPolicy, clock: clock, capacity: capacity,
       responseDecodingLimits: responseDecodingLimits, telemetry: telemetry,
-      recreatePolicy: recreatePolicy, setupClaim: setupClaim, setupClaimAge: setupClaimAge)
+      recreatePolicy: recreatePolicy, setupClaim: setupClaim, setupClaimAge: setupClaimAge,
+      onCaughtUp: onCaughtUp)
   }
 
   private init(
@@ -390,10 +410,12 @@ public actor ShapeSubscriptionCoordinator {
     retryPolicy: ShapeSubscriptionRetryPolicy, clock: any ShapeSubscriptionClock,
     capacity: ShapeSubscriptionCapacity?, responseDecodingLimits: ResponseDecodingLimits,
     telemetry: TelemetryReporter, recreatePolicy: ShapeSubscriptionRecreatePolicy,
-    setupClaim: ShapeHandle? = nil, setupClaimAge: Duration = .zero
+    setupClaim: ShapeHandle? = nil, setupClaimAge: Duration = .zero,
+    onCaughtUp: (@Sendable (StreamCursor) async -> Void)? = nil
   ) {
     self.setupClaim = setupClaim
     self.setupClaimAge = setupClaimAge
+    self.onCaughtUp = onCaughtUp
     self.client = client
     self.transport = transport
     self.route = route
@@ -603,7 +625,14 @@ public actor ShapeSubscriptionCoordinator {
     guard let previous = handle, isAcceptingOperations else { throw CancellationError() }
     let expectedGeneration = generation
     if let task = renewTask {
-      let renewed = try await task.value
+      let renewed: ShapeHandle
+      do {
+        renewed = try await task.value
+      } catch let gone as GroupClaimGone {
+        // The caller that started this renewal ends the session; this one only reports it.
+        throw ShapeSubscriptionFailure.reseedRequired(
+          ShapeSubscriptionReseedRequired(reason: .terminal(.gone), previous: gone.previous))
+      }
       guard isCurrent(expectedGeneration) else {
         appendRelease(renewed)
         throw CancellationError()
@@ -617,7 +646,23 @@ public actor ShapeSubscriptionCoordinator {
     }
     renewTask = task
     do {
-      let renewed = try await task.value
+      let renewed: ShapeHandle
+      do {
+        renewed = try await task.value
+      } catch let gone as GroupClaimGone {
+        // The engine holds no group for this claim any more. End the session as a terminal
+        // stream answer does: the old reader first, then the claim, then the reseed.
+        renewTask = nil
+        guard isCurrent(expectedGeneration) else { throw CancellationError() }
+        let outcome = ShapeSubscriptionReseedRequired(
+          reason: .terminal(.gone), previous: gone.previous)
+        let oldStream = streamTask
+        oldStream?.cancel()
+        if let oldStream { await oldStream.value }
+        streamTask = nil
+        try await requireReseed(outcome)
+        throw ShapeSubscriptionFailure.reseedRequired(outcome)
+      }
       renewTask = nil
       // A terminal stream result or stop can advance the generation while the HTTP response is in
       // flight. Never publish a handle from that retired generation; retain it for compensation.
@@ -729,7 +774,8 @@ public actor ShapeSubscriptionCoordinator {
     let reader = ShapeStreamReader(
       streamURL: streamHandle.stream.url, transport: transport,
       materializer: CoordinatedMaterializer(base: materializer), telemetry: telemetry,
-      responseDecodingLimits: responseDecodingLimits, configuration: configuration)
+      responseDecodingLimits: responseDecodingLimits, configuration: configuration,
+      onCaughtUp: onCaughtUp)
     var retries = 0
     while isCurrent(generation) {
       // Unknown until this attempt's own read succeeds: a failed read must not leave the previous
@@ -886,17 +932,37 @@ public actor ShapeSubscriptionCoordinator {
   /// the engine's own fall-through produces: `renew()` routes it through `requireReseed`, the same
   /// reconciliation the durable-stream gone receipt uses, so the application reseeds one explicit
   /// fresh scope instead of inheriting two live server claims.
+  ///
+  /// A group renews by re-joining (`POST /v1/subsets/rejoin`), for which the engine reads no
+  /// rows. The re-join never creates a group, so an engine that no longer holds this one says so
+  /// and the renewal throws `GroupClaimGone`, which `renew()` turns into the reseed a retired
+  /// stream causes. A server without the route is renewed by load, as before it existed.
+  ///
+  /// Every renewal names the identity of the claim this session holds (`ShapeHandle.claim`), so
+  /// the engine keeps it and the release this session sends later still names the claim it
+  /// holds, whether or not a renewal's answer arrived. The answer's handle replaces the held one
+  /// either way: where the engine answers another identity (the claim lapsed and was taken
+  /// again, or a server on the way does not pass the name on), that is the one to release.
   private func renewWithRetry() async throws -> ShapeHandle {
-    try await recreatingOnGone(operation: "renew") {
+    let previous = handle
+    let held = previous?.claim
+    return try await recreatingOnGone(operation: "renew") {
       switch self.route {
       case .shape(let request):
-        try await self.client.renewShape(request)
+        return try await self.client.renewShape(request, holding: held)
       case .subsetFeed(let request):
-        try await self.client.createSubsetFeed(request)
+        return try await self.client.createSubsetFeed(request, holding: held)
       case .subsetGroup(let request):
-        // A renewal is the same load and still carries the group's rows; only its claim is
-        // decoded. A rows-free renewal needs a server route (OTTO-10739).
-        try await self.client.claimSubsetGroup(request)
+        switch try await self.client.rejoinSubsetGroup(request, holding: held) {
+        case .joined(let claim):
+          return claim.handle
+        case .noSuchGroup:
+          guard let previous else { throw CancellationError() }
+          throw GroupClaimGone(previous: previous)
+        case .unavailable:
+          // The load still carries the group's rows; only its claim is decoded.
+          return try await self.client.claimSubsetGroup(request, holding: held)
+        }
       }
     }
   }
@@ -907,12 +973,17 @@ public actor ShapeSubscriptionCoordinator {
     // the only claim identity that authorizes release.
     while let next = pendingRelease.last {
       try await retrying(operation: "release") { try await self.client.releaseShape(next) }
-      if let index = pendingRelease.lastIndex(where: {
-        $0.id == next.id && $0.subscription == next.subscription
-      }) {
+      if let index = pendingRelease.lastIndex(where: { Self.sameClaim($0, next) }) {
         pendingRelease.remove(at: index)
       }
     }
+  }
+
+  /// Whether two handles release the same claim: one shape, one subscription, one identity. A
+  /// renewal that was answered another identity is another claim, and both are released: the
+  /// engine ignores the release of the one it no longer holds.
+  private static func sameClaim(_ lhs: ShapeHandle, _ rhs: ShapeHandle) -> Bool {
+    lhs.id == rhs.id && lhs.subscription == rhs.subscription && lhs.claim == rhs.claim
   }
 
   private func retrying<T>(operation: String, _ body: @escaping @Sendable () async throws -> T)
@@ -921,7 +992,10 @@ public actor ShapeSubscriptionCoordinator {
     var retries = 0
     while true {
       try Task.checkCancellation()
-      do { return try await body() } catch {
+      do { return try await body() } catch let gone as GroupClaimGone {
+        // An answer, not a failure: `renew()` ends the session on it.
+        throw gone
+      } catch {
         guard isRetryable(error), retries < retryPolicy.maxRetries else {
           throw exhaustedOrFailure(error, retries: retries, operation: operation)
         }
@@ -967,9 +1041,7 @@ public actor ShapeSubscriptionCoordinator {
     try await materializer.currentCursor() ?? .beginning
   }
   private func appendRelease(_ candidate: ShapeHandle) {
-    if !pendingRelease.contains(where: {
-      $0.id == candidate.id && $0.subscription == candidate.subscription
-    }) {
+    if !pendingRelease.contains(where: { Self.sameClaim($0, candidate) }) {
       pendingRelease.append(candidate)
     }
   }

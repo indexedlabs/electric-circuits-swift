@@ -225,10 +225,15 @@ public struct ShapeResponse: Codable, Equatable, Sendable {
   public var leaseSeconds: Int?
   public var state: String?
   public var subscriptions: Int?
+  /// The identity of the claim this answer granted (`Contracts/native-v1-contract-v1.md`, "Claim
+  /// identity"): opaque, compared only for equality, and never stored. A renewal names it to keep
+  /// it and a release names it to release this claim and no later one. Nil from a server that
+  /// answers none; the release then names the subscription alone, as before.
+  public var claim: String?
   public init(
     shapeId: String, table: String, streamPath: String, streamURL: URL,
     subscription: String? = nil, leaseSeconds: Int? = nil, state: String? = nil,
-    subscriptions: Int? = nil
+    subscriptions: Int? = nil, claim: String? = nil
   ) {
     self.shapeId = shapeId
     self.table = table
@@ -238,11 +243,12 @@ public struct ShapeResponse: Codable, Equatable, Sendable {
     self.leaseSeconds = leaseSeconds
     self.state = state
     self.subscriptions = subscriptions
+    self.claim = claim
   }
   enum CodingKeys: String, CodingKey {
     case shapeId, table, streamPath
     case streamURL = "streamUrl"
-    case subscription, leaseSeconds, state, subscriptions
+    case subscription, leaseSeconds, state, subscriptions, claim
   }
 }
 
@@ -574,6 +580,8 @@ public struct ShapeHandle: Sendable, Equatable {
   public init(response: ShapeResponse) { self.response = response }
   public var id: String { response.shapeId }
   public var subscription: String? { response.subscription }
+  /// The identity of the claim this handle holds, when the server answered one.
+  public var claim: String? { response.claim }
   public var stream: DurableStreamHandle {
     DurableStreamHandle(path: response.streamPath, url: response.streamURL)
   }
@@ -688,41 +696,83 @@ public actor ElectricCircuitsClient {
     self.decoder = JSONDecoder()
   }
 
-  public func createShape(_ request: ShapeRequest) async throws -> ShapeHandle {
-    try await sendShape(path: "v1/shapes", request: request)
+  /// Creates a shape, or renews the claim `request.subscription` holds on it.
+  ///
+  /// `claim` is the identity of the claim the caller already holds under that subscription (the
+  /// `claim` of the handle its last create or renewal returned), and is what makes this a
+  /// renewal by the claim's holder: the engine keeps the identity, so the handle the caller holds
+  /// still releases the claim. Without it the engine gives the claim a new identity, as it does
+  /// for a new claim, and only the returned handle releases it. The same holds for
+  /// `renewShape`, `createSubsetFeed`, `createAggregate`, `loadSubsetGroup` and
+  /// `rejoinSubsetGroup`.
+  public func createShape(_ request: ShapeRequest, holding claim: String? = nil) async throws
+    -> ShapeHandle
+  {
+    try await sendShape(path: "v1/shapes", request: request, claim: claim)
   }
   /// Repeats a create using the request's stable subscription claim to renew its lease.
-  public func renewShape(_ request: ShapeRequest) async throws -> ShapeHandle {
-    try await createShape(request)
+  public func renewShape(_ request: ShapeRequest, holding claim: String? = nil) async throws
+    -> ShapeHandle
+  {
+    try await createShape(request, holding: claim)
   }
-  public func createSubsetFeed(_ request: ShapeRequest) async throws -> ShapeHandle {
+  public func createSubsetFeed(_ request: ShapeRequest, holding claim: String? = nil) async throws
+    -> ShapeHandle
+  {
     var request = request
     request.changesOnly = true
-    return try await sendShape(path: "v1/subset-feeds", request: request)
+    return try await sendShape(path: "v1/subset-feeds", request: request, claim: claim)
   }
-  public func createAggregate(_ request: AggregateRequest) async throws -> ShapeHandle {
-    ShapeHandle(response: try await send(path: "v1/aggregates", method: "POST", body: request))
+  public func createAggregate(_ request: AggregateRequest, holding claim: String? = nil)
+    async throws -> ShapeHandle
+  {
+    ShapeHandle(
+      response: try await send(
+        path: "v1/aggregates", method: "POST", body: request, query: Self.claimQuery(claim)))
   }
   public func getShape(id: String) async throws -> ShapeResponse {
     try decode(
       await sendRaw(
         components: ["v1", "shapes", id], method: "GET", body: Optional<Empty>.none, query: []))
   }
+  /// Releases the claim `handle` holds. The release names the handle's `claim` when it has one,
+  /// so it releases that claim and no later one: sent late or again, after another session took
+  /// the claim under the same subscription, it is answered as a success and changes nothing.
   public func releaseShape(_ handle: ShapeHandle) async throws {
+    var query: [URLQueryItem] = []
+    if let subscription = handle.subscription {
+      query.append(URLQueryItem(name: "subscription", value: subscription))
+      // A claim is named with its subscription; a handle without one releases anonymously.
+      query += Self.claimQuery(handle.claim)
+    }
     do {
       _ = try await sendRaw(
         components: ["v1", "shapes", handle.id], method: "DELETE", body: Optional<Empty>.none,
-        query: handle.subscription.map { [URLQueryItem(name: "subscription", value: $0)] } ?? [])
+        query: query)
     } catch ClientError.http(status: 404, message: _) {
       // DELETE is idempotent from a client's perspective: an already-retired shape is released.
     }
+  }
+  /// The `claim` query parameter: the identity of the claim the caller holds, when it holds one.
+  static func claimQuery(_ claim: String?) -> [URLQueryItem] {
+    claim.map { [URLQueryItem(name: "claim", value: $0)] } ?? []
   }
   public func querySubset(_ request: SubsetQuery) async throws -> SubsetResponse {
     try await send(path: "v1/subsets/query", method: "POST", body: request)
   }
   /// The group load's one native call; its callers check the answer against the request.
-  func sendGroupLoad<Response: Decodable>(_ request: SubsetGroupRequest) async throws -> Response {
-    try await send(path: "v1/subsets/load", method: "POST", body: request)
+  func sendGroupLoad<Response: Decodable>(_ request: SubsetGroupRequest, claim: String? = nil)
+    async throws -> Response
+  {
+    try await send(
+      path: "v1/subsets/load", method: "POST", body: request, query: Self.claimQuery(claim))
+  }
+  /// The group re-join's one native call: the load's body, answered with the claim and no rows.
+  func sendGroupRejoin<Response: Decodable>(_ request: SubsetGroupRequest, claim: String? = nil)
+    async throws -> Response
+  {
+    try await send(
+      path: "v1/subsets/rejoin", method: "POST", body: request, query: Self.claimQuery(claim))
   }
 
   /// Reads the durable stream's current frontier without consuming a batch. Subset-feed clients
@@ -772,8 +822,11 @@ public actor ElectricCircuitsClient {
   }
 
   private struct Empty: Encodable {}
-  private func sendShape(path: String, request: ShapeRequest) async throws -> ShapeHandle {
-    var response: ShapeResponse = try await send(path: path, method: "POST", body: request)
+  private func sendShape(path: String, request: ShapeRequest, claim: String?) async throws
+    -> ShapeHandle
+  {
+    var response: ShapeResponse = try await send(
+      path: path, method: "POST", body: request, query: Self.claimQuery(claim))
     if let subscription = request.subscription {
       if let echoed = response.subscription, echoed != subscription {
         throw ClientError.decoding("shape response subscription does not match request")
@@ -784,9 +837,11 @@ public actor ElectricCircuitsClient {
     }
     return ShapeHandle(response: response)
   }
-  private func send<T: Decodable, B: Encodable>(path: String, method: String, body: B?) async throws
-    -> T
-  { try decode(await sendRaw(path: path, method: method, body: body, query: [])) }
+  private func send<T: Decodable, B: Encodable>(
+    path: String, method: String, body: B?, query: [URLQueryItem] = []
+  ) async throws -> T {
+    try decode(await sendRaw(path: path, method: method, body: body, query: query))
+  }
   private func sendRaw<B: Encodable>(path: String, method: String, body: B?, query: [URLQueryItem])
     async throws -> HTTPResponse
   {

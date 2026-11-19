@@ -32,9 +32,14 @@ private struct ResumeIssue: Equatable, Sendable {
 /// shape and otherwise parks, cancellably, until the test scripts one.
 private actor ResumeFeedTransport: HTTPTransport {
   enum StreamReply: Sendable {
-    case batch(String, next: String)
+    /// A batch; `upToDate` marks it as ending at the stream's head (`stream-up-to-date`, or
+    /// `upToDate` on its SSE control).
+    case batch(String, next: String, upToDate: Bool = false)
     /// A `204` with no next offset: the long-poll window elapsed at the tail.
     case idle
+    /// The stream has nothing after the read's offset. A read without `live` and an SSE read are
+    /// told so at once; a long-poll is not, and waits out its window, so it never takes this.
+    case atHead
     case status(Int)
   }
 
@@ -89,12 +94,30 @@ private actor ResumeFeedTransport: HTTPTransport {
       return reply(body, to: request)
     case ("GET", _) where path.hasPrefix("/streams/"):
       let shape = String(path.dropFirst("/streams/".count))
-      while streams[shape, default: []].isEmpty { try await park() }
+      let query = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems
+      let longPoll = query?.contains { $0.name == "live" } == true
+      while true {
+        if let next = streams[shape]?.first {
+          if case .atHead = next, longPoll {
+            // Held for the poll window, which no test sits through.
+          } else {
+            break
+          }
+        }
+        try await park()
+      }
       switch streams[shape, default: []].removeFirst() {
-      case .batch(let body, let next):
-        return reply(body, to: request, headers: ["stream-next-offset": next])
+      case .batch(let body, let next, let upToDate):
+        var headers = ["stream-next-offset": next]
+        if upToDate { headers["stream-up-to-date"] = "true" }
+        return reply(body, to: request, headers: headers)
       case .idle:
         return reply("", to: request, status: 204)
+      case .atHead:
+        let offset = query?.first { $0.name == "offset" }?.value ?? ""
+        return reply(
+          "[]", to: request,
+          headers: ["stream-next-offset": offset, "stream-up-to-date": "true"])
       case .status(let status):
         return reply("", to: request, status: status)
       }
@@ -131,24 +154,39 @@ private actor ResumeFeedTransport: HTTPTransport {
         url: request.url!, statusCode: 200, httpVersion: nil,
         headerFields: ["Content-Type": "text/event-stream"])!)
     switch next {
-    case .batch(let body, let nextOffset):
+    case .batch(let body, let nextOffset, let upToDate):
+      let flag = upToDate ? #","upToDate":true"# : ""
       try await onBytes(Data("event: data\ndata: \(body)\n\n".utf8))
       try await onBytes(
-        Data("event: control\ndata: {\"streamNextOffset\":\"\(nextOffset)\"}\n\n".utf8))
+        Data("event: control\ndata: {\"streamNextOffset\":\"\(nextOffset)\"\(flag)}\n\n".utf8))
     case .idle:
       try await onBytes(
         Data("event: control\ndata: {\"streamNextOffset\":\"\(offset)\"}\n\n".utf8))
+      while true { try await park() }
+    case .atHead:
+      try await onBytes(
+        Data(
+          "event: control\ndata: {\"streamNextOffset\":\"\(offset)\",\"upToDate\":true}\n\n"
+            .utf8))
       while true { try await park() }
     case .status:
       return
     }
   }
 
-  /// The `live` mode of every stream read of `shape`, in order.
+  /// The `live` mode of every stream read of `shape` that named one, in order.
   func liveModes(_ shape: String) -> [String] {
-    requests.filter { $0.httpMethod == "GET" && $0.url?.path == "/streams/\(shape)" }.compactMap {
-      URLComponents(url: $0.url!, resolvingAgainstBaseURL: false)?.queryItems?
-        .first { $0.name == "live" }?.value
+    reads(shape).compactMap(\.live)
+  }
+
+  /// Every stream read of `shape`, in order: its `offset`, and its `live` mode or nil for a
+  /// catch-up read.
+  func reads(_ shape: String) -> [(offset: String?, live: String?)] {
+    requests.filter { $0.httpMethod == "GET" && $0.url?.path == "/streams/\(shape)" }.map {
+      let query = URLComponents(url: $0.url!, resolvingAgainstBaseURL: false)?.queryItems
+      return (
+        query?.first { $0.name == "offset" }?.value, query?.first { $0.name == "live" }?.value
+      )
     }
   }
 
@@ -218,7 +256,7 @@ private typealias ResumeCoordinator = CollectionCoordinator<
 >
 
 /// A fresh coordinator and source over a surviving store, in the same generation: a re-acquire
-/// within one launch, the case resume serves (a later launch's generation snapshots).
+/// within one launch. `RelaunchResumeTests` covers a later launch's generation.
 private func relaunch(
   _ transport: ResumeFeedTransport, store: InMemoryCollectionStore<ResumeIssue, Int64>,
   liveReadMode: LiveReadMode = .longPoll
@@ -271,15 +309,13 @@ struct CircuitsSubsetSourceResumeTests {
           next: "11"),
         .batch(
           #"[{"type":"public.issues","key":"3","headers":{"operation":"delete","lsn":"0/30"}}]"#,
-          next: "12"),
+          next: "12", upToDate: true),
       ])
     let lease = await relaunch(transport, store: store).acquire(openIssues)
 
     #expect(await eventually { await lease.state() == .live })
-    #expect(
-      await eventually {
-        try await store.materialization(for: openIdentity)?.cursor?.offset == "12"
-      })
+    // Live means read to the head: both batches are committed by then.
+    #expect(try await store.materialization(for: openIdentity)?.cursor?.offset == "12")
     #expect(
       await store.rows() == [
         1: ResumeIssue(id: 1, title: "One, edited"), 2: ResumeIssue(id: 2, title: "Two"),
@@ -323,22 +359,110 @@ struct CircuitsSubsetSourceResumeTests {
     try await lease.release()
   }
 
-  @Test func resumedDemandStaysCachedUntilAnIdlePollProvesTheTailIsCurrent() async throws {
+  /// A long-poll at the stream's head is held for the poll window (about 30 s), so a resumed
+  /// long-poll tail does not start with one: its first read has no `live` parameter, which the
+  /// stream answers at once. The demand stays cached until that answer, goes live on it without
+  /// a change or a snapshot, and the tail then long-polls from the same offset.
+  @Test func aResumedLongPollTailAsksForTheHeadFirstAndGoesLiveOnTheAnswer() async throws {
     let transport = ResumeFeedTransport()
     let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
     let seeded = try await seedBySnapshot(transport, store: store)
 
     let lease = await relaunch(transport, store: store).acquire(openIssues)
     #expect(await eventually { await transport.streamOffsets("shape-1").count == 2 })
-    // The resumed read is parked at the tail: its rows are local, but nothing proves the
-    // stored cursor is still current yet.
+    // The resumed read is unanswered: its rows are local, but nothing says yet that the stored
+    // cursor is still the stream's head.
     #expect(await lease.state() == .cached)
 
-    await transport.script("shape-1", [.idle])
+    await transport.script("shape-1", [.atHead])
     #expect(await eventually { await lease.state() == .live })
+    #expect(await eventually { await transport.reads("shape-1").count == 3 })
+    let resumed = await transport.reads("shape-1").dropFirst()
+    #expect(resumed.map(\.live) == [nil, "long-poll"])
+    #expect(resumed.map(\.offset) == ["10", "10"])
     #expect(try await store.materialization(for: openIdentity) == seeded)
     #expect(await transport.count("POST", "/v1/subsets/query") == 1)
     #expect(await transport.count("POST", "/v1/subset-feeds") == 2)
+    #expect(await transport.count("HEAD", "/streams/shape-1") == 1)
+    try await lease.release()
+  }
+
+  /// A committed batch does not make a resumed demand live: the stream may hold more. The demand
+  /// stays cached, with the first batch in the store, until the batch the stream marks as ending
+  /// at its head is committed too.
+  @Test(arguments: [LiveReadMode.longPoll, .sse])
+  func aResumedTailStaysCachedUntilItHasReadToTheHead(mode: LiveReadMode) async throws {
+    let transport = ResumeFeedTransport()
+    let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
+    _ = try await seedBySnapshot(transport, store: store)
+    await transport.script(
+      "shape-1",
+      [
+        .batch(
+          #"[{"type":"public.issues","key":"2","value":{"id":2,"title":"Two"},"headers":{"operation":"insert","lsn":"0/20"}}]"#,
+          next: "11")
+      ])
+
+    let lease = await relaunch(transport, store: store, liveReadMode: mode).acquire(openIssues)
+    // The first batch is committed and the tail has asked for what follows it.
+    #expect(await eventually { await transport.streamOffsets("shape-1").last == "11" })
+    #expect(try await store.materialization(for: openIdentity)?.cursor?.offset == "11")
+    #expect(await store.rows()[2] == ResumeIssue(id: 2, title: "Two"))
+    #expect(await lease.state() == .cached)
+
+    await transport.script(
+      "shape-1",
+      [
+        .batch(
+          #"[{"type":"public.issues","key":"3","headers":{"operation":"delete","lsn":"0/30"}}]"#,
+          next: "12", upToDate: true)
+      ])
+    #expect(await eventually { await lease.state() == .live })
+    #expect(try await store.materialization(for: openIdentity)?.cursor?.offset == "12")
+    #expect(await transport.count("POST", "/v1/subsets/query") == 1)
+    if mode == .longPoll {
+      // Reads up to the head never wait; the tail long-polls only once it is there.
+      #expect(await eventually { await transport.reads("shape-1").count == 4 })
+      #expect(
+        await transport.reads("shape-1").dropFirst().map(\.live) == [nil, nil, "long-poll"])
+    }
+    try await lease.release()
+  }
+
+  /// The caller can ask for the snapshot a resumable feed would not otherwise take: the scope
+  /// was marked stale, or its authority was read again. The refresh re-joins the feed, reads its
+  /// frontier and queries the page; a plain refresh after it resumes again.
+  @Test func aSnapshotRefreshQueriesThePageAgainOnAFeedItCouldResume() async throws {
+    let transport = ResumeFeedTransport(queryBodies: [
+      #"{"rows":[{"id":1,"title":"One"},{"id":3,"title":"Three"}],"lsn":"0/10"}"#,
+      #"{"rows":[{"id":1,"title":"Fresh"}],"lsn":"0/40"}"#,
+    ])
+    let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
+    let seeded = try await seedBySnapshot(transport, store: store)
+    await transport.script("shape-1", [.atHead])
+    let lease = await relaunch(transport, store: store).acquire(openIssues)
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await transport.count("POST", "/v1/subsets/query") == 1)
+
+    await lease.refresh(.snapshot)
+
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await transport.count("POST", "/v1/subsets/query") == 2)
+    #expect(await transport.count("HEAD", "/streams/shape-1") == 2)
+    #expect(await transport.count("POST", "/v1/subset-feeds") == 3)
+    #expect(await store.rows() == [1: ResumeIssue(id: 1, title: "Fresh")])
+    #expect(await store.rowClaims(for: seeded.id) == [1])
+    let refreshed = try #require(try await store.materialization(for: openIdentity))
+    #expect(refreshed.id == seeded.id)
+    #expect(
+      refreshed.snapshotFence.rawValue == "9:subset-v2|\(shapeOne)|2:10|4:0/40|0:|0:")
+
+    // The snapshot is taken; the next refresh may continue from its cursor.
+    await transport.script("shape-1", [.atHead])
+    await lease.refresh(.resume)
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await transport.count("POST", "/v1/subsets/query") == 2)
+    #expect(await transport.count("POST", "/v1/subset-feeds") == 4)
     try await lease.release()
   }
 
@@ -566,7 +690,7 @@ struct CircuitsSubsetSourceResumeTests {
       [
         .batch(
           #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"Already in the snapshot"},"headers":{"operation":"update","lsn":"0/F0","txid":"104"}},{"type":"public.issues","key":"2","value":{"id":2,"title":"Committed during snapshot"},"headers":{"operation":"insert","lsn":"0/FF","txid":"105"}}]"#,
-          next: "11")
+          next: "11", upToDate: true)
       ])
     let lease = await relaunch(transport, store: store).acquire(openIssues)
 

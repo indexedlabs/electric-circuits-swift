@@ -31,10 +31,13 @@ public struct CollectionSourceSession<Model: Sendable, Key: Hashable & Sendable>
 ///
 /// `cursor` and `sourceVersion` are the stored position the tail starts from; the first batch's
 /// `expectedCursor` is `cursor`. `run` delivers batches through `apply` exactly as a
-/// `CollectionSourceSession` does. It calls `caughtUp` when a read from the resumed position
-/// returned without changes (an idle or up-to-date poll); a committed `apply` already proves the
-/// tail made progress, so the session need not call both. Until one of them happens, the
-/// coordinator reports the demand as `.cached`. A session whose feed will not serve `cursor` throws
+/// `CollectionSourceSession` does, and calls `caughtUp` once the tail has read to its feed's
+/// head: every change the feed held after `cursor` has been applied, or it held none. Only
+/// `caughtUp` reports the demand `.live`. Until then the coordinator reports it `.cached`,
+/// however many batches `apply` has committed, because the feed may hold more after any of them.
+/// So a session calls `caughtUp` as soon as it knows it is at the head, without waiting for a
+/// change to arrive or for a held read to time out, and never while it knows of changes it has
+/// not applied; calling it again is harmless. A session whose feed will not serve `cursor` throws
 /// `CollectionResumeInvalidated` from `run`; any other error fails the attempt like a snapshot
 /// session's. `stop` must release the remote resource; the coordinator guarantees at-most-once
 /// invocation.
@@ -67,9 +70,10 @@ public struct CollectionResumeSession<Model: Sendable, Key: Hashable & Sendable>
 
 /// Thrown from `CollectionResumeSession.run` when the feed will not serve the stored cursor: a
 /// terminal stream outcome (`404`, `410`, `stream-closed`) or another answer a re-join from the
-/// same cursor would repeat. A stale cursor is an ordinary reseed, so before the resumed tail has
-/// committed or caught up the coordinator stops the session and snapshots in the same attempt.
-/// After that, the demand has been reported live and the attempt fails as any tail would.
+/// same cursor would repeat. A stale cursor is an ordinary reseed, so until the resumed tail has
+/// caught up the coordinator stops the session and snapshots in the same attempt, replacing
+/// whatever the tail committed on the way. After that, the demand has been reported live and the
+/// attempt fails as any tail would.
 /// Transient failures (transport loss, exhausted retries, capacity) throw their own error: they
 /// say nothing about the cursor, and the next attempt resumes again.
 public struct CollectionResumeInvalidated: Error, Sendable {
@@ -96,12 +100,14 @@ public protocol CollectionSourceAdapter<Model, Key>: Sendable {
     materializationID: CollectionMaterializationID
   ) async throws -> CollectionSourceSession<Model, Key>
 
-  /// Continues an exact cached materialization from `record`'s committed cursor, or returns nil
-  /// when this source cannot prove the stored cursor still names a gap-free position in the same
-  /// live feed. The coordinator asks this before `materialize` whenever the store holds an exact
-  /// record for the demand, and takes the snapshot path on nil. A thrown error fails the attempt
-  /// as a source failure, and the next attempt asks again. The default returns nil, so every
-  /// acquire snapshots.
+  /// Continues a stored materialization from `record`'s committed cursor, or returns nil when
+  /// this source cannot prove the stored cursor still names a gap-free position in the same live
+  /// feed. The coordinator asks this before `materialize` whenever the store holds a copy for the
+  /// demand's `cacheKey`, whichever generation stored it, and takes the snapshot path on nil. It
+  /// does not ask while the demand owes a snapshot: a lease asked for one
+  /// (`CollectionLoadMode.snapshot`) or the stale pass is revalidating it. A thrown error fails
+  /// the attempt as a source failure, and the next attempt asks again. The default returns nil,
+  /// so every acquire snapshots.
   func resume(
     _ demand: CollectionDemand<Model>,
     identity: CollectionDemandIdentity,

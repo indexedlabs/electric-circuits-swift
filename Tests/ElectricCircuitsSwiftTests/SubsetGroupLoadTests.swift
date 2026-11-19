@@ -9,32 +9,52 @@ import Testing
 
 private actor GroupLoadTransport: HTTPTransport {
   private let body: String
+  private let status: Int
+  private let headers: [String: String]
   private(set) var requests: [URLRequest] = []
 
-  init(body: String) { self.body = body }
+  init(body: String, status: Int = 200, headers: [String: String] = [:]) {
+    self.body = body
+    self.status = status
+    self.headers = headers
+  }
 
   func send(_ request: URLRequest) async throws -> HTTPResponse {
     requests.append(request)
     return HTTPResponse(
       data: Data(body.utf8),
       response: HTTPURLResponse(
-        url: request.url!, statusCode: 200, httpVersion: nil,
-        headerFields: ["Content-Type": "application/json"])!)
+        url: request.url!, statusCode: status, httpVersion: nil,
+        headerFields: headers.merging(["Content-Type": "application/json"]) { $1 })!)
   }
 }
 
-/// Answers each group load with the next scripted group id, holds stream reads open and records
-/// releases, so a coordinator can create, renew and release a group.
+/// Answers each group load and each re-join with the next scripted group id, holds stream reads
+/// open and records releases, so a coordinator can create, renew and release a group. A re-join
+/// answers the claim with no rows; `rejoinStatuses` are answered first, one per re-join.
 private actor GroupRenewalTransport: HTTPTransport {
   private var shapeIDs: [String]
+  private var rejoinStatuses: [Int]
   private(set) var loads = 0
+  private(set) var rejoins: [URLRequest] = []
   private(set) var releasedPaths: [String] = []
 
-  init(shapeIDs: [String]) { self.shapeIDs = shapeIDs }
+  init(shapeIDs: [String], rejoinStatuses: [Int] = []) {
+    self.shapeIDs = shapeIDs
+    self.rejoinStatuses = rejoinStatuses
+  }
 
   func send(_ request: URLRequest) async throws -> HTTPResponse {
     let path = request.url?.path ?? ""
     switch request.httpMethod {
+    case "POST" where path.hasSuffix("/v1/subsets/rejoin"):
+      rejoins.append(request)
+      if !rejoinStatuses.isEmpty {
+        return reply("", request: request, status: rejoinStatuses.removeFirst())
+      }
+      let id = shapeIDs.count > 1 ? shapeIDs.removeFirst() : shapeIDs[0]
+      let body = groupRejoinAnswer.replacingOccurrences(of: #""g-1""#, with: "\"\(id)\"")
+      return reply(body, request: request)
     case "POST":
       loads += 1
       let id = shapeIDs.count > 1 ? shapeIDs.removeFirst() : shapeIDs[0]
@@ -111,6 +131,15 @@ private let groupLoadAnswer = #"""
               {"key":"public.assignment","table":"public.assignment","shapeId":"s-2","subscription":"scope-1:member:1"}]}
   """#
 
+/// What a re-join answers: the load's answer less `rows`, `lsn`, `snapshot` and `horizon`.
+private let groupRejoinAnswer = #"""
+  {"groupId":"g-1","shapeId":"g-1","subscription":"scope-1","leaseSeconds":30,
+   "streamPath":"/sync/v1/streams/tok","streamUrl":"https://gateway.test/sync/v1/streams/tok",
+   "offset":"0000_0012",
+   "results":[{"key":"public.record","table":"public.record","shapeId":"s-1","subscription":"scope-1"},
+              {"key":"public.assignment","table":"public.assignment","shapeId":"s-2","subscription":"scope-1:member:1"}]}
+  """#
+
 private func groupRequest() -> SubsetGroupRequest {
   SubsetGroupRequest(
     members: [
@@ -160,6 +189,86 @@ struct SubsetGroupLoadTests {
     #expect(load.results.map(\.key) == ["public.record", "public.assignment"])
   }
 
+  @Test func groupRejoinPostsTheLoadsBodyAndReadsTheClaimWithoutRows() async throws {
+    let transport = GroupLoadTransport(body: groupRejoinAnswer)
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://gateway.test/sync")!, transport: transport)
+
+    let rejoined = try await client.rejoinSubsetGroup(groupRequest())
+
+    let request = try #require(await transport.requests.first)
+    #expect(await transport.requests.count == 1)
+    #expect(request.httpMethod == "POST")
+    #expect(request.url?.path == "/sync/v1/subsets/rejoin")
+    #expect(
+      try JSONDecoder().decode(SubsetGroupRequest.self, from: #require(request.httpBody))
+        == groupRequest())
+    guard case .joined(let claim) = rejoined else {
+      Issue.record("expected the claim, got \(rejoined)")
+      return
+    }
+    #expect(claim.groupId == "g-1")
+    #expect(claim.shapeId == "g-1")
+    #expect(claim.subscription == "scope-1")
+    #expect(claim.leaseSeconds == 30)
+    #expect(claim.offset == "0000_0012")
+    #expect(claim.results.map(\.key) == ["public.record", "public.assignment"])
+    // The same claim a load of the same request answers: one handle renews and releases both.
+    let load = try await ElectricCircuitsClient(
+      baseURL: URL(string: "https://gateway.test/sync")!,
+      transport: GroupLoadTransport(body: groupLoadAnswer)
+    ).loadSubsetGroup(groupRequest())
+    #expect(claim.handle == load.handle)
+  }
+
+  @Test func groupRejoinTellsNoSuchGroupFromAServerWithoutTheRoute() async throws {
+    func rejoin(_ status: Int, headers: [String: String] = [:]) async throws -> SubsetGroupRejoin {
+      try await ElectricCircuitsClient(
+        baseURL: URL(string: "https://gateway.test/sync")!,
+        transport: GroupLoadTransport(
+          body: #"{"error":"refused"}"#, status: status, headers: headers)
+      ).rejoinSubsetGroup(groupRequest())
+    }
+    #expect(SubsetGroupRejoin.noSuchGroupStatus == 412)
+    #expect(try await rejoin(412) == .noSuchGroup)
+    #expect(try await rejoin(404) == .unavailable)
+    #expect(try await rejoin(405) == .unavailable)
+    // Its other statuses are a load's.
+    await #expect(throws: ClientError.http(status: 400, message: "HTTP request failed")) {
+      _ = try await rejoin(400)
+    }
+    await #expect(throws: ClientError.http(status: 409, message: "HTTP request failed")) {
+      _ = try await rejoin(409)
+    }
+    await #expect(throws: ClientError.http(status: 410, message: "HTTP request failed")) {
+      _ = try await rejoin(410)
+    }
+    await #expect(throws: ClientError.retryableHTTP(status: 503, retryAfter: .seconds(1))) {
+      _ = try await rejoin(503, headers: ["Retry-After": "1"])
+    }
+  }
+
+  @Test func groupRejoinRejectsAnAnswerThatDoesNotMatchTheRequest() async throws {
+    let otherMembers = groupRejoinAnswer.replacingOccurrences(
+      of: #""key":"public.assignment""#, with: #""key":"public.tag""#)
+    var answer = try #require(
+      try JSONSerialization.jsonObject(with: Data(groupRejoinAnswer.utf8)) as? [String: Any])
+    answer["results"] = (answer["results"] as? [Any])?.dropLast().map { $0 }
+    let missingMember = String(
+      decoding: try JSONSerialization.data(withJSONObject: answer), as: UTF8.self)
+    let otherSubscription = groupRejoinAnswer.replacingOccurrences(
+      of: #""subscription":"scope-1","leaseSeconds""#,
+      with: #""subscription":"scope-2","leaseSeconds""#)
+    for body in [otherMembers, missingMember, otherSubscription] {
+      let client = ElectricCircuitsClient(
+        baseURL: URL(string: "https://gateway.test/sync")!,
+        transport: GroupLoadTransport(body: body))
+      await #expect(throws: ClientError.self) {
+        _ = try await client.rejoinSubsetGroup(groupRequest())
+      }
+    }
+  }
+
   @Test func groupLoadRejectsAnAnswerThatDoesNotMatchTheRequest() async throws {
     let otherMembers = groupLoadAnswer.replacingOccurrences(
       of: #""key":"public.assignment""#, with: #""key":"public.tag""#)
@@ -194,8 +303,14 @@ struct SubsetGroupLoadTests {
     #expect(handle.response.leaseSeconds == 30)
     #expect(await transport.loads == 1)
 
+    // A renewal is a re-join: the same body as the load, on the route that reads no rows.
     #expect(try await coordinator.renew() == handle)
-    #expect(await transport.loads == 2)
+    #expect(await transport.loads == 1)
+    let renewal = try #require(await transport.rejoins.first)
+    #expect(renewal.url?.path == "/sync/v1/subsets/rejoin")
+    #expect(
+      try JSONDecoder().decode(SubsetGroupRequest.self, from: #require(renewal.httpBody))
+        == groupRequest())
 
     await #expect(throws: ShapeSubscriptionFailure.self) {
       _ = try await coordinator.renew()
@@ -206,6 +321,66 @@ struct SubsetGroupLoadTests {
       return
     }
     #expect(outcome.reason == .replacement(previousShapeID: "g-1", replacementShapeID: "g-2"))
+    #expect(await transport.loads == 1)
+    try await coordinator.stop()
+  }
+
+  /// The engine holds no group for the claim any more (it retired the group, or another load
+  /// replaced it). The renewal creates nothing: the session ends as it does when the group's
+  /// stream is retired, and the caller reloads.
+  @Test func aRenewalToldThereIsNoSuchGroupEndsTheSessionAsARetiredStreamDoes() async throws {
+    let transport = GroupRenewalTransport(shapeIDs: ["g-1"], rejoinStatuses: [412])
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://gateway.test/sync")!, transport: transport)
+    let setup = try await client.loadSubsetGroup(groupRequest())
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: client, transport: transport, groupRequest: groupRequest(),
+      materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0),
+      setupClaim: setup.handle)
+    let handle = try await coordinator.start()
+
+    await #expect(throws: ShapeSubscriptionFailure.self) {
+      _ = try await coordinator.renew()
+    }
+
+    guard case .reseedRequired(let outcome) = await coordinator.state else {
+      Issue.record("expected reseedRequired when the group is gone, got \(await coordinator.state)")
+      try await coordinator.stop()
+      return
+    }
+    #expect(outcome.reason == .terminal(.gone))
+    #expect(outcome.previous == handle)
+    #expect(outcome.replacement == nil)
+    // No load stood in for the re-join, and the claim the session held is released.
+    #expect(await transport.loads == 1)
+    #expect(await transport.rejoins.count == 1)
+    #expect(await transport.releasedPaths == ["/sync/v1/shapes/g-1"])
+    try await coordinator.stop()
+  }
+
+  /// A server without the re-join route answers it `404` (or `405`). The lease is then renewed
+  /// by the load, as it was before the route existed.
+  @Test(arguments: [404, 405])
+  func aRenewalOnAServerWithoutTheRejoinRouteLoads(status: Int) async throws {
+    let transport = GroupRenewalTransport(shapeIDs: ["g-1"], rejoinStatuses: [status])
+    let client = ElectricCircuitsClient(
+      baseURL: URL(string: "https://gateway.test/sync")!, transport: transport)
+    let setup = try await client.loadSubsetGroup(groupRequest())
+    let coordinator = ShapeSubscriptionCoordinator(
+      client: client, transport: transport, groupRequest: groupRequest(),
+      materializer: InMemoryShapeMaterializer(), retryPolicy: .init(maxRetries: 0),
+      setupClaim: setup.handle)
+    let handle = try await coordinator.start()
+
+    #expect(try await coordinator.renew() == handle)
+
+    #expect(await transport.rejoins.count == 1)
+    #expect(await transport.loads == 2)
+    guard case .streaming = await coordinator.state else {
+      Issue.record("expected the renewed group to keep streaming")
+      try await coordinator.stop()
+      return
+    }
     try await coordinator.stop()
   }
 
@@ -234,7 +409,8 @@ struct SubsetGroupLoadTests {
     }
 
     await clock.waitForSleeps(first > .zero ? 2 : 1)
-    #expect(await transport.loads == 2)
+    #expect(await transport.rejoins.count == 1)
+    #expect(await transport.loads == 1)
     #expect(await clock.sleeps.last == .seconds(10))
     try await coordinator.stop()
   }
@@ -287,7 +463,7 @@ struct SubsetGroupLoadTests {
     #expect(handle.subscription == "scope-1")
     #expect(handle.response.leaseSeconds == 30)
 
-    // A renewal loads the same subscription and members and keeps the same group.
+    // A renewal re-joins under the same subscription and members and keeps the same group.
     #expect(try await coordinator.renew() == handle)
     guard case .streaming = await coordinator.state else {
       Issue.record("expected the renewed group to keep streaming")
@@ -306,7 +482,8 @@ struct SubsetGroupLoadTests {
       return
     }
     #expect(outcome.reason == .replacement(previousShapeID: "g-1", replacementShapeID: "g-2"))
-    #expect(await transport.loads == 3)
+    #expect(await transport.loads == 1)
+    #expect(await transport.rejoins.count == 2)
     #expect(
       Set(await transport.releasedPaths) == ["/sync/v1/shapes/g-1", "/sync/v1/shapes/g-2"])
     try await coordinator.stop()
