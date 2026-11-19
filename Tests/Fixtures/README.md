@@ -34,7 +34,7 @@ ECS_SWIFT_PROBE_FIXTURES=<this directory>/engine-live-envelopes.json \
 a feed whose predicate has a subquery, and `group` a group stream with one member of each kind.
 At `1be10fb`, the commit the checked-in file was written at, the plain feed's envelopes carry
 `headers.lsn` and the subquery feed's do not; the group stream carries both.
-`EngineLiveEnvelopeContractTests` pins what the SDK does with each. From the engine's
-`mh/feed-removals` on every envelope on all three streams carries `headers.lsn`, and the engine
+`EngineLiveEnvelopeContractTests` pins what the SDK does with each. From the engine's `a248886`
+(#71, merged to its `main`) on every envelope on all three streams carries `headers.lsn`, and the engine
 test asserts that; the file is not rewritten from it here, so that the SDK keeps a test of what it
 does with an envelope that has no position.

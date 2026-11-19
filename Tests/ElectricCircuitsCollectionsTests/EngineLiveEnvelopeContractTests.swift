@@ -190,14 +190,23 @@ private func positioned(_ id: Int, _ title: String, lsn: String, txid: String) -
     + #""headers":{"operation":"upsert","txid":"\#(txid)","lsn":"\#(lsn)","commit_ts":1794939392095}}"#
 }
 
+/// One `items` delete in the engine's form: the key, no value, and the position under test. From
+/// electric-circuits `e10c4bd` (#70) a changes-only feed sends one for a row that leaves its scope
+/// even when the client holds it only from its snapshot, and from `a248886` (#71) a subquery feed's
+/// delete carries `headers.lsn` like every other envelope.
+private func positionedDelete(_ id: Int, lsn: String, txid: String) -> String {
+  #"{"type":"public.items","key":"\#(id)","#
+    + #""headers":{"operation":"delete","txid":"\#(txid)","lsn":"\#(lsn)","commit_ts":1794939392095}}"#
+}
+
 private func batch(_ envelopes: String...) -> String {
   "[" + envelopes.joined(separator: ",") + "]"
 }
 
 /// The rules the engine states for an envelope's position (electric-circuits
-/// `docs/ARCHITECTURE.md`, "Native envelope positions"), as the SDK applies them. The engine at
-/// the fixture's commit does not yet position a subquery feed's envelopes, so these envelopes are
-/// written to the contract's form rather than captured.
+/// `docs/ARCHITECTURE.md`, "Native envelope positions", from `a248886`, #71), as the SDK applies
+/// them. The engine at the fixture's commit does not yet position a subquery feed's envelopes, so
+/// these envelopes are written to the contract's form rather than captured.
 @Suite("Engine contract: envelope positions")
 struct EngineEnvelopePositionTests {
   private func rows(_ store: InMemoryCollectionStore<ContractItem, Int64>) async -> [Int64: String]
@@ -314,6 +323,37 @@ struct EngineEnvelopePositionTests {
     #expect(
       try await store.materialization(for: contractIdentity("launch-2"))?.sourceVersion.rawValue
         == "0/1BF2C98")
+    try await lease.release()
+  }
+
+  /// A row the client holds only from its snapshot leaves the scope: the feed never delivered it,
+  /// and the engine still sends its delete (electric-circuits #70), positioned (#71). Rule 2
+  /// consults the snapshot for that key, which lacks the transaction, so the delete applies, on
+  /// the first tail and on a tail resumed by a later launch.
+  @Test func aDeleteForARowHeldOnlyFromTheSnapshotRemovesIt() async throws {
+    let engine = ContractEngine(snapshots: [overlapSnapshot])
+    let store = InMemoryCollectionStore<ContractItem, Int64>(key: \.id)
+    let first = await contractLaunch(engine, store: store, generation: "launch-1")
+      .acquire(listOneItems)
+    #expect(await contractEventually { await first.state() == .live })
+
+    // In progress when the snapshot was taken, below its LSN: the snapshot still holds row 2.
+    let removed = await engine.append(
+      "s1", batch(positionedDelete(2, lsn: "0/1BF2C60", txid: "768")))
+    #expect(await cursorReaches(removed, store))
+    #expect(await rows(store) == [1: "one"])
+    try await first.release()
+
+    // A later launch resumes from the stored cursor and removes the other snapshot row the same
+    // way, past the snapshot's horizon.
+    let next = await engine.append(
+      "s1", batch(positionedDelete(1, lsn: "0/1BF2E00", txid: "771")))
+    let lease = await contractLaunch(engine, store: store, generation: "launch-2")
+      .acquire(listOneItems)
+
+    #expect(await cursorReaches(next, store, generation: "launch-2"))
+    #expect(await rows(store) == [:])
+    #expect(await engine.count(.snapshotQuery) == 1)
     try await lease.release()
   }
 

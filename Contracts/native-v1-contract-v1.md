@@ -42,7 +42,8 @@ A `subscription` is a name the client chooses, and two sessions can use one, one
 A group's sessions always do: a launch that resumes a stored group re-joins it under the
 subscription the launch that stored it loaded with ("Group continuity"). The name alone therefore
 does not say whose claim a release means, so the engine gives each claim an identity. It is in the
-engine from `mh/feed-removals` on; a server from before it answers none. The engine's OpenAPI
+engine from `mh/feed-removals` on, which the engine's `mh/resume-integration` branch carries; the
+engine's `main` at `a248886` does not have it yet. A server from before it answers none. The engine's OpenAPI
 document lists `claim` on the five answers and as a query parameter of the six requests below; the
 JSON projection gains it with the group load.
 
@@ -183,6 +184,16 @@ snapshot. It consults the snapshot only while its cursor is still the snapshot's
 after that skips nothing on the snapshot's account; it then rejects, as a replay, only what lies
 below a position an applied change stored.
 
+A position can fall along a stream across an engine restart: a restored plain shape's stream, and
+a restored group stream, re-emit the commits after the engine's last checkpoint at their own
+positions, below what the stream already carries. Those are replays, rejected by rule 1; a falling
+position is never an error. A group's must-refetch control (`__circuits.control`) carries no
+`txid`; the client reads it as a control before it positions any row envelope of its batch.
+
+A changes-only feed also deletes a row the client holds only from its snapshot when the row leaves
+the scope, though the feed never delivered it (engine `e10c4bd`, #70). The delete is positioned like
+any envelope and applied by the same rules; a resumed tail applies it too.
+
 An envelope without a parseable `headers.lsn` has no position, which the engine's contract rules
 out. The client refuses the batch that carries it, applies none of it and does not move its cursor
 (`CircuitsSubsetSourceError.invalidLiveSourceVersion`); it never applies such an envelope as if it
@@ -193,7 +204,9 @@ The engine at `1be10fb`, before that contract, writes `operation`, `txid`, `lsn`
 on a changes-only feed with a plain predicate, and `operation`, `txid` and `commit_ts`, no `lsn`,
 on a feed whose predicate has a subquery. A group stream carries each member's envelopes the way
 that member's own feed would. `Tests/Fixtures/engine-live-envelopes.json` holds both, captured
-from that engine.
+from that engine. From `a248886` (#71) on, every envelope the engine writes to a subquery shape, a
+changes-only subquery feed or a group stream, deletes included, carries `headers.lsn` and the
+`txid` of the transaction that caused it.
 
 ## Feed continuity
 
@@ -310,7 +323,8 @@ will not serve.
 
 `POST /v1/subsets/rejoin` claims or renews the group a subscription already holds, without the
 engine reading a row. A client that kept its rows and its stream offset sends it to resume, and
-every lease renewal sends it. It is in the engine from `mh/feed-removals` on and not at `1be10fb`.
+every lease renewal sends it. It is in the engine from `mh/feed-removals` on (carried by the
+engine's `mh/resume-integration` branch), and not at `1be10fb` or on the engine's `main` at `a248886`.
 The engine's OpenAPI document lists it; the JSON projection gains it with the group load.
 
 **Request.** `POST /v1/subsets/rejoin`, optionally with `?claim=…` ("Claim identity": a lease
