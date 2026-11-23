@@ -91,7 +91,7 @@ struct EngineLiveEnvelopeContractTests {
     #expect(await engine.count(.release) == 1)
     let settled = await engine.requests.count
 
-    await lease.refresh()
+    await lease.refresh(.snapshot)
 
     #expect(await contractEventually { await lease.state() == .live })
     #expect(await engine.count(.snapshotQuery) == 2)

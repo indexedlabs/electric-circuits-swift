@@ -387,7 +387,7 @@ struct CollectionCoordinatorResumeTests {
 
     // A resume the source could not set up says nothing about the stored cursor, so the retry
     // asks again rather than re-querying the page.
-    await lease.refresh(.resume)
+    await lease.refresh()
     #expect(await eventually { await source.resumes == 2 })
     #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
     #expect(await source.materializations == 0)
@@ -426,7 +426,7 @@ struct CollectionCoordinatorResumeTests {
     #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
     #expect(await source.materializations == 0)
 
-    await lease.refresh(.resume)
+    await lease.refresh()
     #expect(await eventually { await source.resumes == 2 })
     #expect(await source.materializations == 0)
     #expect(await store.rowClaims(for: materializationA) == [1, 2])
@@ -552,7 +552,7 @@ struct CollectionCoordinatorResumeTests {
 /// cursor (`.resume`) or must be read again (`.snapshot`).
 @Suite("Collection coordinator load mode")
 struct CollectionCoordinatorLoadModeTests {
-  @Test func aPlainRefreshReadsTheSourceAgainWhileExplicitResumeContinues() async throws {
+  @Test func aSnapshotRefreshReadsTheSourceAgainWhereAPlainRefreshResumes() async throws {
     let store = try await seededStore()
     let source = ResumingSource(snapshotRows: [9])
     let coordinator = CollectionCoordinator(
@@ -562,18 +562,17 @@ struct CollectionCoordinatorLoadModeTests {
     await source.signalCaughtUp()
     #expect(await eventually { await lease.state() == .live })
 
-    // The no-argument refresh is the public re-read behavior. Explicit resume is available for
-    // retrying an attempt whose cursor is still trustworthy.
+    // A plain refresh, and one that says resume is allowed, continue the stored cursor.
     await lease.refresh()
-    #expect(await eventually { await source.materializations == 1 })
-    #expect(await source.resumes == 1)
-    #expect(await store.rowClaims(for: materializationA) == [9])
     await lease.refresh(.resume)
-    #expect(await eventually { await source.resumes == 2 })
-    await source.signalCaughtUp()
+    #expect(await eventually { await source.resumes == 3 })
+    #expect(await source.materializations == 0)
+    #expect(await store.rowClaims(for: materializationA) == [1, 2])
+
+    await lease.refresh(.snapshot)
+    #expect(await eventually { await source.materializations == 1 })
     #expect(await eventually { await lease.state() == .live })
-    #expect(await source.materializations == 1)
-    #expect(await store.rowClaims(for: materializationA) == [9])
+    #expect(await source.resumes == 3)
     #expect(await store.rowClaims(for: materializationA) == [9])
     #expect(try await store.materialization(for: identityA)?.snapshotFence.rawValue == "snapshot-1")
     try await lease.release()
@@ -622,7 +621,7 @@ struct CollectionCoordinatorLoadModeTests {
     #expect(await source.resumes == 1)
     #expect(await store.rowClaims(for: materializationA) == [9])
 
-    await lease.refresh(.resume)
+    await lease.refresh()
     #expect(await eventually { await source.resumes == 2 })
     #expect(await source.materializations == 2)
     try await lease.release()

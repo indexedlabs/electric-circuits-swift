@@ -5,11 +5,11 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 
 ## Unreleased
 
-- Fix: `CollectionLease.refresh()` snapshots again, as it did before 0.15.0. A refresh is a re-read
-  of the source, and 0.15.0 let it resume from the stored cursor instead, skipping the read a caller
-  asked for (for example an app re-reading every held demand after a long absence). Resume now
-  serves acquires only, and the next acquire after a transient failure still resumes. The next tag
-  is 0.15.2, a patch.
+- Add `CollectionLoadMode` (`.resume`, `.snapshot`) to `CollectionCoordinator.acquire(_:mode:)`
+  and `CollectionLease.refresh(_:)`. A plain acquire and `refresh()` resume from the stored cursor
+  when the source can; callers that need to read the source again name `.snapshot`. A snapshot the
+  caller asks for is owed until one commits, and the next acquire after a transient failure still
+  resumes. The next tag is 0.15.2, a patch.
 
 ## 0.15.1
 
