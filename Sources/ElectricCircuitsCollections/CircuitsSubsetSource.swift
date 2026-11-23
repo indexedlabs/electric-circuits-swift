@@ -478,8 +478,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
 }
 
 extension ShapeSubscriptionRetryPolicy {
-  /// Runs a claim request a source makes itself, before a subscription coordinator exists to
-  /// retry it: a feed create, a group load or a group re-join. A transient refusal (`408`,
+  /// Runs the feed-create request a source makes itself, before a subscription coordinator exists
+  /// to retry it. A transient refusal (`408`,
   /// `425`, `429` or `5xx`, `ClientError.retryableHTTP`) is answered by repeating the identical
   /// request, up to `maxRetries` times, each after this policy's backoff or the server's
   /// `Retry-After`, whichever is longer, and never longer than `maximumDelay`. An engine at its
@@ -507,8 +507,8 @@ extension ShapeSubscriptionRetryPolicy {
   }
 }
 
-/// Outcomes a re-join of the same feed or group from the same cursor would deterministically
-/// repeat: terminal stream receipts (404/410/`stream-closed`), a must-refetch marker, a
+/// Outcomes a retry of the same feed from the same cursor would deterministically repeat: terminal
+/// stream receipts (404/410/`stream-closed`), a must-refetch marker, a
 /// replacement shape on renewal, and non-retryable stream or HTTP failures. Transport loss,
 /// exhausted transient retries, an authentication refusal the app clears by refreshing its
 /// credentials (401, 403, 407), and local store failures say nothing about the stored cursor. A
@@ -657,7 +657,7 @@ private actor PendingSubsetFeedCleanup {
   }
 }
 
-/// Sessions that ended in an outcome a re-join of the same feed or group would repeat, keyed by
+/// Sessions that ended in an outcome a retry of the same feed would repeat, keyed by
 /// materialization and the fence they ran on. In memory only: a relaunch may try once more.
 /// A record with a different fence comes from a newer snapshot and is resumable again, so the
 /// entry is dropped then and the registry stays bounded by materializations with a failed resume.
