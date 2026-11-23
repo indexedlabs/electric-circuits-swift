@@ -283,6 +283,7 @@ public actor ShapeSubscriptionCoordinator {
   private let responseDecodingLimits: ResponseDecodingLimits
   private let telemetry: TelemetryReporter
   private let recreatePolicy: ShapeSubscriptionRecreatePolicy
+  private let onCaughtUp: (@Sendable (StreamCursor) async -> Void)?
   private var continuation: AsyncStream<ShapeSubscriptionState>.Continuation?
   private var handle: ShapeHandle?
   /// A claim the caller already holds, which the first start uses instead of creating one.
@@ -335,7 +336,8 @@ public actor ShapeSubscriptionCoordinator {
     kind: ShapeSubscriptionKind = .shape,
     recreatePolicy: ShapeSubscriptionRecreatePolicy = .init(),
     setupClaim: ShapeHandle? = nil,
-    setupClaimAge: Duration = .zero
+    setupClaimAge: Duration = .zero,
+    onCaughtUp: (@Sendable (StreamCursor) async -> Void)? = nil
   ) {
     let route: ShapeSubscriptionClaimRoute =
       switch kind {
@@ -346,7 +348,8 @@ public actor ShapeSubscriptionCoordinator {
       client: client, transport: transport, route: route, materializer: materializer,
       retryPolicy: retryPolicy, clock: clock, capacity: capacity,
       responseDecodingLimits: responseDecodingLimits, telemetry: telemetry,
-      recreatePolicy: recreatePolicy, setupClaim: setupClaim, setupClaimAge: setupClaimAge)
+      recreatePolicy: recreatePolicy, setupClaim: setupClaim, setupClaimAge: setupClaimAge,
+      onCaughtUp: onCaughtUp)
   }
 
   /// A coordinator for one shape group: it loads the group, reads the group's one stream and
@@ -390,10 +393,12 @@ public actor ShapeSubscriptionCoordinator {
     retryPolicy: ShapeSubscriptionRetryPolicy, clock: any ShapeSubscriptionClock,
     capacity: ShapeSubscriptionCapacity?, responseDecodingLimits: ResponseDecodingLimits,
     telemetry: TelemetryReporter, recreatePolicy: ShapeSubscriptionRecreatePolicy,
-    setupClaim: ShapeHandle? = nil, setupClaimAge: Duration = .zero
+    setupClaim: ShapeHandle? = nil, setupClaimAge: Duration = .zero,
+    onCaughtUp: (@Sendable (StreamCursor) async -> Void)? = nil
   ) {
     self.setupClaim = setupClaim
     self.setupClaimAge = setupClaimAge
+    self.onCaughtUp = onCaughtUp
     self.client = client
     self.transport = transport
     self.route = route
@@ -729,7 +734,8 @@ public actor ShapeSubscriptionCoordinator {
     let reader = ShapeStreamReader(
       streamURL: streamHandle.stream.url, transport: transport,
       materializer: CoordinatedMaterializer(base: materializer), telemetry: telemetry,
-      responseDecodingLimits: responseDecodingLimits, configuration: configuration)
+      responseDecodingLimits: responseDecodingLimits, configuration: configuration,
+      onCaughtUp: onCaughtUp)
     var retries = 0
     while isCurrent(generation) {
       // Unknown until this attempt's own read succeeds: a failed read must not leave the previous

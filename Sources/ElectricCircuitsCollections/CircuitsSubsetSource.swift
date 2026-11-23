@@ -185,12 +185,12 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
           try await runTail(
             TailStart(
               feed: feed, createdAt: feedCreatedAt, request: feedRequest, cursor: cursor,
-              sourceVersion: snapshotVersion, window: window),
+              gate: snapshotVersion, sourceVersion: snapshotVersion, window: window),
             lifecycle: lifecycle, transport: transport, apply: apply,
-            onFailure: { failure in
+            onFailure: { failure, refusedBatch in
               // The record this snapshot writes names this feed; a later resume from it would
               // meet the same outcome.
-              if Self.failureInvalidatesResume(failure) {
+              if refusedBatch || subsetFailureInvalidatesResume(failure) {
                 await resumeFailures.record(materializationID, fence: snapshotFence)
               }
             })
@@ -215,8 +215,10 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   /// serves for this request. Returns nil, so the coordinator snapshots, when:
   /// - the demand is a limited window (its live state is the page, which needs a query anyway);
   /// - the fence predates `subset-v2` and so does not name its feed, or the record has no cursor;
-  /// - the last resume from this same fence ended in a terminal stream outcome or a non-retryable
-  ///   failure other than an authentication refusal (`failureInvalidatesResume`);
+  /// - the last session on this same fence ended in a terminal stream outcome, a non-retryable
+  ///   failure other than an authentication refusal (`subsetFailureInvalidatesResume`), or a
+  ///   batch this source refused, such as a live envelope without `headers.lsn`: the stream serves
+  ///   that batch again at the stored cursor, and only a snapshot's frontier is past it;
   /// - the re-joined feed answers with a different stream URL. A replacement changes-only feed has
   ///   no history for the gap since the stored cursor, so only a new snapshot can close it. That
   ///   create is kept for the `materialize` call that follows on this source instance, so the
@@ -226,6 +228,12 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   /// Otherwise the session tails the same feed from the stored cursor and source version. Its
   /// subscription coordinator adopts this create's handle, so a resume POSTs `/subset-feeds`
   /// once and issues no frontier `HEAD` and no `/subsets/query`.
+  ///
+  /// The session calls `caughtUp` once it has read from the stored cursor to the stream's head,
+  /// having applied everything on the way. It asks the stream where the head is rather than
+  /// waiting at it: a long-poll tail starts with reads that carry no `live` parameter, which the
+  /// stream answers at once, and an SSE tail is told by the stream's control event
+  /// (`Contracts/native-v1-contract-v1.md`, "Live after a resume").
   public func resume(
     _ demand: CollectionDemand<Model>,
     identity: CollectionDemandIdentity,
@@ -234,7 +242,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   ) async throws -> CollectionResumeSession<Model, Key>? {
     let fence = SubsetSnapshotFence(rawValue: record.snapshotFence.rawValue)
     guard demand.limit == nil, demand.order.count <= 1, record.id == materializationID,
-      let cursor = record.cursor, case .v2(let fencedStream, _, _, let visibility)? = fence
+      let cursor = record.cursor,
+      case .v2(let fencedStream, let snapshotOffset, _, let visibility)? = fence
     else { return nil }
     guard await resumeFailures.allowsResume(materializationID, from: record.snapshotFence) else {
       return nil
@@ -257,23 +266,25 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     let storedFence = record.snapshotFence
     let start = TailStart(
       feed: feed, createdAt: createdAt, request: feedRequest, cursor: cursor,
-      sourceVersion: Self.resumedGate(record.sourceVersion, fencedVisibility: visibility),
-      window: nil)
+      gate: Self.resumedGate(
+        record.sourceVersion, fencedVisibility: visibility,
+        atSnapshotOffset: cursor.offset == snapshotOffset),
+      sourceVersion: record.sourceVersion, window: nil)
     return CollectionResumeSession(
       cursor: cursor,
       sourceVersion: record.sourceVersion,
       run: { apply, caughtUp in
         do {
           try await runTail(
-            start, lifecycle: lifecycle,
-            // The subscription coordinator uses this transport only for stream reads from the
-            // stored cursor onward, so an idle answer there is the resumed tail's up-to-date proof.
-            transport: CaughtUpObservingTransport(base: transport, caughtUp: caughtUp),
-            apply: apply,
-            onFailure: { failure in
+            start, lifecycle: lifecycle, transport: transport, apply: apply,
+            // The stored rows are current once the tail has read from the stored cursor to the
+            // stream's head (`Contracts/native-v1-contract-v1.md`, "Live after a resume").
+            caughtUp: caughtUp,
+            onFailure: { failure, refusedBatch in
               // Re-joining the same feed would repeat this outcome. Remember it so this source
-              // declines the fence rather than re-join a cursor the engine will not serve.
-              if Self.failureInvalidatesResume(failure) {
+              // declines the fence rather than re-join a cursor the engine will not serve, or
+              // one whose next batch it refuses.
+              if refusedBatch || subsetFailureInvalidatesResume(failure) {
                 await resumeFailures.record(materializationID, fence: storedFence)
               }
             })
@@ -314,18 +325,22 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
 
   private func createFeed(_ request: ShapeRequest) async throws -> ShapeHandle {
     try await recreatePolicy.recreatingOnGone(clock: clock) {
-      try await client.createSubsetFeed(request)
+      try await retryPolicy.retryingRefusedClaim(clock: clock) {
+        try await client.createSubsetFeed(request)
+      }
     }
   }
 
   /// Where a session's live tail starts: the feed handle its create returned and when that create
-  /// was sent, the identical request the subscription coordinator renews with, and the stored or
-  /// snapshot position.
+  /// was sent, the identical request the subscription coordinator renews with, the stored or
+  /// snapshot position, and the version the tail gates snapshot overlap at (the snapshot's own,
+  /// or a resumed tail's `resumedGate`).
   private struct TailStart: Sendable {
     let feed: ShapeHandle
     let createdAt: ContinuousClock.Instant
     let request: ShapeRequest
     let cursor: StreamCursor
+    let gate: CollectionSourceVersion
     let sourceVersion: CollectionSourceVersion
     let window: LimitedWindow<Model, Key>?
   }
@@ -334,15 +349,23 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
   /// coordinator adopts `start.feed`, the handle this session's create already returned, so its
   /// `start()` does not POST `/subset-feeds` again; it renews on that handle's lease schedule with
   /// the identical request. From `install` on, the coordinator owns that claim's release.
+  ///
+  /// With `caughtUp`, a resumed tail's, the stream is first read to its head without waiting
+  /// there, and `caughtUp` is called once every change up to that head has been applied.
   private func runTail(
     _ start: TailStart,
     lifecycle: CircuitsSubsetSessionLifecycle,
     transport: any HTTPTransport,
     apply: @escaping @Sendable (CollectionChangeBatch<Model, Key>) async throws -> Void,
-    onFailure: @escaping @Sendable (ShapeSubscriptionFailure) async -> Void = { _ in }
+    caughtUp: (@Sendable () async -> Void)? = nil,
+    onFailure:
+      @escaping @Sendable (ShapeSubscriptionFailure, _ refusedBatch: Bool) async -> Void = {
+        _, _ in
+      }
   ) async throws {
     let materializer = CircuitsCollectionTailMaterializer(
       cursor: start.cursor,
+      gate: start.gate,
       sourceVersion: start.sourceVersion,
       decodeRow: decodeRow,
       decodeKey: decodeKey,
@@ -351,6 +374,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       clock: clock,
       apply: apply
     )
+    let onCaughtUp: (@Sendable (StreamCursor) async -> Void)? =
+      if let caughtUp { { _ in await caughtUp() } } else { nil }
     let coordinator = ShapeSubscriptionCoordinator(
       client: client,
       transport: transport,
@@ -364,7 +389,8 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       kind: .subsetFeed,
       recreatePolicy: recreatePolicy,
       setupClaim: start.feed,
-      setupClaimAge: start.createdAt.duration(to: .now)
+      setupClaimAge: start.createdAt.duration(to: .now),
+      onCaughtUp: onCaughtUp
     )
     try await lifecycle.install(coordinator)
     let states = await coordinator.stateUpdates
@@ -375,11 +401,12 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
           try Task.checkCancellation()
           switch state {
           case .failed(let failure):
-            await onFailure(failure)
-            if let cause = await materializer.takeTerminalFailure() { throw cause }
+            let terminal = await materializer.takeTerminalFailure()
+            await onFailure(failure, terminal?.refusedBatch == true)
+            if let terminal { throw terminal.cause }
             throw CircuitsSubsetSourceError.subscription(failure)
           case .reseedRequired(let outcome):
-            await onFailure(.reseedRequired(outcome))
+            await onFailure(.reseedRequired(outcome), false)
             throw CircuitsSubsetSourceError.subscription(.reseedRequired(outcome))
           case .stopped:
             return
@@ -396,43 +423,38 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
     }
   }
 
-  /// The version a resumed tail gates snapshot overlap at, so it admits exactly what the
-  /// snapshot's own tail would have admitted from the stored cursor.
+  /// The gate a resumed tail reads its stream through, by the engine's rules for an envelope's
+  /// position (electric-circuits `docs/ARCHITECTURE.md`, "Native envelope positions").
   ///
-  /// While no change has been accepted past the snapshot, the stored version is the snapshot's
-  /// page version, and only its transaction visibility tells a commit the snapshot already holds
-  /// from one that was still in progress when it was taken: such a commit can sit after the
-  /// stored offset with an LSN below the snapshot's, and an LSN comparison would drop it. A store
-  /// need not keep that visibility with the version (`sourceVersion.snapshot`), so the fence
-  /// carries it and it is restored here. Once a change has been accepted, the stored version is
-  /// that change's LSN; the stream after the stored offset commits at or above it, so the LSN gate
-  /// can re-admit only snapshot-visible commits ordered after an invisible one below the
-  /// horizon, and the store's `supersedes` keeps their bytes from regressing a newer row. A
-  /// snapshot with no visibility (an older engine) was tailed by LSN from the start.
+  /// A snapshot may be consulted only for a key no stream envelope has been applied to since it
+  /// was taken (rule 2). A resumed tail does not know which keys those are, so it consults the
+  /// snapshot only while the stored cursor is still the snapshot's own offset: nothing has been
+  /// applied from the stream yet, and the snapshot's transaction visibility tells a commit the
+  /// snapshot already holds from one that was in progress when it was taken, which can sit after
+  /// the stored offset with an LSN below the snapshot's. A store need not keep that visibility
+  /// with the version (`sourceVersion.snapshot`), so the fence carries it and it is restored here.
+  ///
+  /// Once the cursor has moved, some key may have had an envelope applied, and a later envelope
+  /// for it is the stream's newer word on that key whatever the snapshot saw: a flip's verdict
+  /// names the transaction that caused it, which the snapshot may include, and still follows a
+  /// newer change to the same row. So the tail then skips nothing on the snapshot's account (rule
+  /// 3: when in doubt, apply), and the store's `supersedes` keeps an envelope the snapshot covers
+  /// from replacing a snapshot row. It keeps an LSN floor only when an applied change raised the
+  /// stored version above the snapshot's LSN: positions never decrease along a stream, so
+  /// anything below that floor is a replay. A snapshot with no visibility (an older engine) was
+  /// tailed by LSN from the start.
   static func resumedGate(
-    _ stored: CollectionSourceVersion, fencedVisibility: CollectionPageSnapshot?
+    _ stored: CollectionSourceVersion, fencedVisibility: CollectionPageSnapshot?,
+    atSnapshotOffset: Bool
   ) -> CollectionSourceVersion {
-    guard stored.snapshot == nil, let fencedVisibility, stored.order <= fencedVisibility.lsn
-    else { return stored }
-    return CollectionSourceVersion(
-      rawValue: stored.rawValue, order: stored.order, snapshot: fencedVisibility,
-      transactionID: stored.transactionID)
-  }
-
-  /// Outcomes a re-join of the same feed from the same cursor would deterministically repeat:
-  /// terminal stream receipts (404/410/`stream-closed`), a replacement shape on renewal, and
-  /// non-retryable stream or HTTP failures. Transport loss, exhausted transient retries, an
-  /// authentication refusal the app clears by refreshing its credentials (401, 403, 407), and local
-  /// store failures say nothing about the stored cursor.
-  private static func failureInvalidatesResume(_ failure: ShapeSubscriptionFailure) -> Bool {
-    switch failure {
-    case .client(.http(let status, _)) where [401, 403, 407].contains(status):
-      false
-    case .reseedRequired, .stream, .client:
-      true
-    case .transport, .materializerUnavailable, .materializer, .retryExhausted, .capacityExceeded:
-      false
+    guard let visibility = stored.snapshot ?? fencedVisibility else { return stored }
+    if atSnapshotOffset {
+      return CollectionSourceVersion(
+        rawValue: stored.rawValue, order: stored.order, snapshot: visibility,
+        transactionID: stored.transactionID)
     }
+    return CollectionSourceVersion(
+      rawValue: stored.rawValue, order: stored.order > visibility.lsn ? stored.order : 0)
   }
 
   static func pageVersion(_ response: SubsetResponse) -> CollectionSourceVersion? {
@@ -452,6 +474,53 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
       high <= UInt64(UInt32.max), low <= UInt64(UInt32.max)
     else { return nil }
     return CollectionSourceVersion(rawValue: value, order: (high << 32) | low)
+  }
+}
+
+extension ShapeSubscriptionRetryPolicy {
+  /// Runs a claim request a source makes itself, before a subscription coordinator exists to
+  /// retry it: a feed create, a group load or a group re-join. A transient refusal (`408`,
+  /// `425`, `429` or `5xx`, `ClientError.retryableHTTP`) is answered by repeating the identical
+  /// request, up to `maxRetries` times, each after this policy's backoff or the server's
+  /// `Retry-After`, whichever is longer, and never longer than `maximumDelay`. An engine at its
+  /// shape cap refuses a create this way (`503` with `Retry-After`) until a subscription is
+  /// released or lapses; the same request then succeeds. Past the budget the refusal is thrown
+  /// as it was received. Every other outcome, transport errors included, propagates unchanged:
+  /// the request names a stable subscription, so repeating it is a renewal, but only a server
+  /// that asked for a retry is given one here.
+  func retryingRefusedClaim<T: Sendable>(
+    clock: any ShapeSubscriptionClock, _ body: @Sendable () async throws -> T
+  ) async throws -> T {
+    var retries = 0
+    while true {
+      do {
+        return try await body()
+      } catch ClientError.retryableHTTP(let status, let retryAfter) {
+        guard retries < maxRetries else {
+          throw ClientError.retryableHTTP(status: status, retryAfter: retryAfter)
+        }
+        retries += 1
+        try await clock.sleep(for: delay(forRetry: retries, retryAfter: retryAfter))
+        try Task.checkCancellation()
+      }
+    }
+  }
+}
+
+/// Outcomes a re-join of the same feed or group from the same cursor would deterministically
+/// repeat: terminal stream receipts (404/410/`stream-closed`), a must-refetch marker, a
+/// replacement shape on renewal, and non-retryable stream or HTTP failures. Transport loss,
+/// exhausted transient retries, an authentication refusal the app clears by refreshing its
+/// credentials (401, 403, 407), and local store failures say nothing about the stored cursor. A
+/// batch the source itself refused is reported apart from the failure (`refusedBatch`).
+func subsetFailureInvalidatesResume(_ failure: ShapeSubscriptionFailure) -> Bool {
+  switch failure {
+  case .client(.http(let status, _)) where [401, 403, 407].contains(status):
+    false
+  case .reseedRequired, .stream, .client:
+    true
+  case .transport, .materializerUnavailable, .materializer, .retryExhausted, .capacityExceeded:
+    false
   }
 }
 
@@ -501,10 +570,14 @@ enum SubsetSnapshotFence: Equatable, Sendable {
           visibility?.horizonText ?? "",
         ]
       }
-    return parts.map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+    return Self.framed(parts)
   }
 
-  private static func components(of rawValue: String) -> [String]? {
+  static func framed(_ parts: [String]) -> String {
+    parts.map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+  }
+
+  static func components(of rawValue: String) -> [String]? {
     let bytes = Array(rawValue.utf8)
     var index = 0
     var parts: [String] = []
@@ -584,11 +657,11 @@ private actor PendingSubsetFeedCleanup {
   }
 }
 
-/// Resumes that ended in an outcome a re-join of the same feed would repeat, keyed by
-/// materialization and the fence they resumed from. In memory only: a relaunch may try once more.
+/// Sessions that ended in an outcome a re-join of the same feed or group would repeat, keyed by
+/// materialization and the fence they ran on. In memory only: a relaunch may try once more.
 /// A record with a different fence comes from a newer snapshot and is resumable again, so the
 /// entry is dropped then and the registry stays bounded by materializations with a failed resume.
-private actor FailedSubsetResumes {
+actor FailedSubsetResumes {
   private var fences: [CollectionMaterializationID: SnapshotFence] = [:]
 
   func record(_ materializationID: CollectionMaterializationID, fence: SnapshotFence) {
@@ -654,113 +727,6 @@ private actor CircuitsSubsetSessionLifecycle {
   }
 }
 
-/// Reports idle answers on a resumed tail's stream reads: over long-poll a `204` (the window
-/// elapsed at the tail) or an empty successful batch, neither closed; over SSE a `control` event
-/// naming the offset the read started from. A response carrying changes proves progress through
-/// the committed `apply` instead, and terminal answers stay with the reader.
-private struct CaughtUpObservingTransport: HTTPTransport {
-  let base: any HTTPTransport
-  let caughtUp: @Sendable () async -> Void
-
-  func prepare(_ request: URLRequest) -> URLRequest { base.prepare(request) }
-
-  /// Forwards the SSE read unchanged, so a resumed tail keeps the configured live read mode. The
-  /// bytes reach the reader first, then the scan.
-  func stream(
-    _ request: URLRequest,
-    onResponse: @Sendable (HTTPURLResponse) async throws -> Void,
-    onBytes: @Sendable (Data) async throws -> Void
-  ) async throws {
-    let offset = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?
-      .queryItems?.first { $0.name == "offset" }?.value
-    let scan = IdleControlScan(offset: offset)
-    let caughtUp = caughtUp
-    try await base.stream(request, onResponse: onResponse) { bytes in
-      try await onBytes(bytes)
-      if await scan.findsIdleControl(in: bytes) { await caughtUp() }
-    }
-  }
-
-  func send(_ request: URLRequest) async throws -> HTTPResponse {
-    let response = try await base.send(request)
-    await observe(response)
-    return response
-  }
-
-  func send(_ request: URLRequest, maximumResponseBytes: Int) async throws -> HTTPResponse {
-    let response = try await base.send(request, maximumResponseBytes: maximumResponseBytes)
-    await observe(response)
-    return response
-  }
-
-  private func observe(_ response: HTTPResponse) async {
-    let headers = response.response
-    guard headers.value(forHTTPHeaderField: "stream-closed")?.lowercased() != "true" else {
-      return
-    }
-    let status = headers.statusCode
-    if status == 204 || ((200..<300).contains(status) && Self.isEmptyBatch(response.data)) {
-      await caughtUp()
-    }
-  }
-
-  /// An empty body or a JSON `[]`, the same idle answers the stream reader skips.
-  private static func isEmptyBatch(_ data: Data) -> Bool {
-    guard data.count <= 64 else { return false }
-    let significant = data.filter { $0 != 0x20 && $0 != 0x09 && $0 != 0x0A && $0 != 0x0D }
-    return significant.isEmpty || significant.elementsEqual("[]".utf8)
-  }
-}
-
-/// Finds, in an SSE response's bytes, a `control` event whose `streamNextOffset` is the offset the
-/// read started from: the stream has nothing after it. Only control events are kept, and only up
-/// to a small bound; a data event's payload is the reader's.
-private actor IdleControlScan {
-  private let offset: String?
-  private var line = Data()
-  private var event: String?
-  private var data = Data()
-
-  init(offset: String?) {
-    self.offset = offset
-  }
-
-  func findsIdleControl(in bytes: Data) -> Bool {
-    guard let offset else { return false }
-    var found = false
-    for byte in bytes {
-      guard byte == 0x0A else {
-        if line.count < 4_096 { line.append(byte) }
-        continue
-      }
-      if line.last == 0x0D { line.removeLast() }
-      if line.isEmpty {
-        if event == "control", Self.isIdle(data, at: offset) { found = true }
-        event = nil
-        data = Data()
-      } else if let text = String(data: line, encoding: .utf8) {
-        if text.hasPrefix("event:") {
-          event = text.dropFirst("event:".count).trimmingCharacters(in: .whitespaces)
-        } else if text.hasPrefix("data:"), event == "control" || event == nil, data.count < 4_096 {
-          data.append(contentsOf: text.dropFirst("data:".count).drop { $0 == " " }.utf8)
-        }
-      }
-      line = Data()
-    }
-    return found
-  }
-
-  private struct Control: Decodable {
-    let streamNextOffset: String?
-    let streamClosed: Bool?
-  }
-
-  private static func isIdle(_ data: Data, at offset: String) -> Bool {
-    guard let control = try? JSONDecoder().decode(Control.self, from: data) else { return false }
-    return control.streamNextOffset == offset && control.streamClosed != true
-  }
-}
-
 /// The held page of a limited live demand.
 ///
 /// The feed carries every change under the base predicate, but a bounded page cannot apply them
@@ -801,18 +767,23 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
   private let retryPolicy: ShapeSubscriptionRetryPolicy
   private let clock: any ShapeSubscriptionClock
   private let applyBatch: @Sendable (CollectionChangeBatch<Model, Key>) async throws -> Void
-  /// The window error that ended this materializer. The subscription coordinator reports any
-  /// materializer error as `.materializer`, so the source keeps the typed cause here and rethrows
-  /// it from the session instead of the coordinator's summary.
-  private var terminalFailure: (any Error)?
+  /// The error that ended this materializer, other than a store's refusal to apply. The
+  /// subscription coordinator reports any materializer error as `.materializer`, so the source
+  /// keeps the typed cause here and rethrows it from the session instead of the coordinator's
+  /// summary. `refusedBatch` marks a batch this materializer could not turn into changes (a live
+  /// envelope without a parseable `headers.lsn`, a key or row that does not decode, a missing
+  /// value): the stream serves the same batch at the same cursor again, so reading on from the
+  /// stored cursor repeats the failure. A window's page failure says nothing about the batch.
+  private var terminalFailure: (cause: any Error, refusedBatch: Bool)?
 
-  func takeTerminalFailure() -> (any Error)? {
+  func takeTerminalFailure() -> (cause: any Error, refusedBatch: Bool)? {
     defer { terminalFailure = nil }
     return terminalFailure
   }
 
   init(
     cursor: StreamCursor,
+    gate: CollectionSourceVersion,
     sourceVersion: CollectionSourceVersion,
     decodeRow: @escaping @Sendable (ChangeRow) throws -> Model,
     decodeKey: @escaping @Sendable (String) throws -> Key,
@@ -822,7 +793,7 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
     apply: @escaping @Sendable (CollectionChangeBatch<Model, Key>) async throws -> Void
   ) {
     self.cursor = cursor
-    snapshotSourceVersion = sourceVersion
+    snapshotSourceVersion = gate
     self.sourceVersion = sourceVersion
     self.decodeRow = decodeRow
     self.decodeKey = decodeKey
@@ -890,6 +861,70 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
     return true
   }
 
+  /// Turns one stream batch into the changes to apply, or throws when the batch cannot be read.
+  /// It follows the engine's rules for an envelope's position (electric-circuits
+  /// `docs/ARCHITECTURE.md`, "Native envelope positions"):
+  /// - Every live envelope carries `headers.lsn`. One without a parseable position is refused,
+  ///   never applied as if it were ordered.
+  /// - Between envelopes a position only rejects a replay: an envelope for a key is applied when
+  ///   its `lsn` is at or above the last one applied to that key. Equal positions are ordinary
+  ///   (a transaction's second envelope for a key, a flip's raised verdict), and offset order
+  ///   decides among them.
+  /// - A snapshot is consulted only for a key no envelope has been applied to since, and never
+  ///   after the first envelope at or past its horizon: such an envelope is skipped when its
+  ///   `lsn` is below the horizon and its `txid` was visible to the snapshot (without a `txid`,
+  ///   when its `lsn` is below the snapshot's).
+  private func decode(
+    _ batch: ChangeBatch, changes: inout [CollectionChange<Model, Key>],
+    acceptedVersions: inout [CollectionSourceVersion], accepted: inout [Int],
+    rowVersions nextRowVersions: inout [String: CollectionSourceVersion],
+    passedHorizon: inout Bool, latest: inout CollectionSourceVersion
+  ) throws {
+    for (index, envelope) in batch.envelopes.enumerated() {
+      guard let rawVersion = envelope.headers.lsn,
+        let lsn = CircuitsSubsetSource<Model, Key>.postgresLSN(rawVersion)
+      else {
+        throw CircuitsSubsetSourceError.invalidLiveSourceVersion(envelope.headers.lsn)
+      }
+      let version = CollectionSourceVersion(
+        rawValue: lsn.rawValue, order: lsn.order,
+        transactionID: envelope.headers.txid.flatMap(CollectionPageSnapshot.xid32))
+      if let snapshot = snapshotSourceVersion.snapshot, version.order >= snapshot.horizon {
+        passedHorizon = true
+      }
+      if let rowVersion = nextRowVersions[envelope.key] {
+        guard version.supersedes(rowVersion) else { continue }
+      } else if passedHorizon {
+        // The ordered tail has retired the snapshot gate permanently.
+      } else if let snapshot = snapshotSourceVersion.snapshot {
+        if snapshot.includes(lsn: version.order, transactionID: version.transactionID) {
+          continue
+        }
+      } else {
+        guard version >= snapshotSourceVersion else { continue }
+      }
+      latest = max(latest, version)
+      acceptedVersions.append(version)
+      accepted.append(index)
+      // A window never applies tail rows, so it does not decode them either: the feed covers the
+      // whole predicate, including rows the page excludes (NULL sort keys among them), and a
+      // model decoder is entitled to reject those. The page is the only source of window rows.
+      guard window == nil else { continue }
+      // The last position applied to each key: the next envelope for it is applied when its
+      // position is at or above this one, and the snapshot is not consulted for it again.
+      nextRowVersions[envelope.key] = version
+      switch envelope.headers.operation {
+      case .delete:
+        do { changes.append(.delete(try decodeKey(envelope.key), sourceVersion: version)) } catch {
+          throw CircuitsSubsetSourceError.invalidLiveKey(envelope.key)
+        }
+      case .insert, .update, .upsert:
+        guard let value = envelope.value else { throw StreamError.missingValue(key: envelope.key) }
+        changes.append(.upsert(try decodeRow(value), sourceVersion: version))
+      }
+    }
+  }
+
   func currentCursor() async throws -> StreamCursor? { cursor }
 
   func apply(
@@ -925,48 +960,13 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
     var nextRowVersions = rowVersions
     var passedHorizon = passedSnapshotHorizon
     var latest = sourceVersion
-    for (index, envelope) in batch.envelopes.enumerated() {
-      guard let rawVersion = envelope.headers.lsn,
-        let lsn = CircuitsSubsetSource<Model, Key>.postgresLSN(rawVersion)
-      else {
-        throw CircuitsSubsetSourceError.invalidLiveSourceVersion(envelope.headers.lsn)
-      }
-      let version = CollectionSourceVersion(
-        rawValue: lsn.rawValue, order: lsn.order,
-        transactionID: envelope.headers.txid.flatMap(CollectionPageSnapshot.xid32))
-      if let snapshot = snapshotSourceVersion.snapshot, version.order >= snapshot.horizon {
-        passedHorizon = true
-      }
-      if let rowVersion = nextRowVersions[envelope.key] {
-        guard version.supersedes(rowVersion) else { continue }
-      } else if passedHorizon {
-        // The ordered tail has retired the snapshot gate permanently.
-      } else if let snapshot = snapshotSourceVersion.snapshot {
-        if snapshot.includes(lsn: version.order, transactionID: version.transactionID) {
-          continue
-        }
-      } else {
-        guard version >= snapshotSourceVersion else { continue }
-      }
-      latest = max(latest, version)
-      acceptedVersions.append(version)
-      accepted.append(index)
-      // A window never applies tail rows, so it does not decode them either: the feed covers the
-      // whole predicate, including rows the page excludes (NULL sort keys among them), and a
-      // model decoder is entitled to reject those. The page is the only source of window rows.
-      guard window == nil else { continue }
-      if snapshotSourceVersion.snapshot != nil || passedHorizon {
-        nextRowVersions[envelope.key] = version
-      }
-      switch envelope.headers.operation {
-      case .delete:
-        do { changes.append(.delete(try decodeKey(envelope.key), sourceVersion: version)) } catch {
-          throw CircuitsSubsetSourceError.invalidLiveKey(envelope.key)
-        }
-      case .insert, .update, .upsert:
-        guard let value = envelope.value else { throw StreamError.missingValue(key: envelope.key) }
-        changes.append(.upsert(try decodeRow(value), sourceVersion: version))
-      }
+    do {
+      try decode(
+        batch, changes: &changes, acceptedVersions: &acceptedVersions, accepted: &accepted,
+        rowVersions: &nextRowVersions, passedHorizon: &passedHorizon, latest: &latest)
+    } catch {
+      terminalFailure = (error, true)
+      throw error
     }
     var committedWindowKeys: Set<Key>?
     var committedPageVersion: CollectionSourceVersion?
@@ -976,7 +976,7 @@ private actor CircuitsCollectionTailMaterializer<Model: Sendable, Key: Hashable 
         (rows, pageVersion) = try await freshPage(
           window, notBefore: latest, reflecting: acceptedVersions)
       } catch {
-        if !(error is CancellationError) { terminalFailure = error }
+        if !(error is CancellationError) { terminalFailure = (error, false) }
         throw error
       }
       latest = max(latest, pageVersion)
