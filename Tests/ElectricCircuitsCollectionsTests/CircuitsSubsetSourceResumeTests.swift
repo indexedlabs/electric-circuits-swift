@@ -645,7 +645,7 @@ struct CircuitsSubsetSourceResumeTests {
     #expect(await transport.count("POST", "/v1/subsets/query") == 1)
 
     await transport.script("shape-1", [.idle])
-    await lease.refresh()
+    await lease.refresh(.resume)
     #expect(await eventually { await lease.state() == .live })
     #expect(await transport.count("POST", "/v1/subsets/query") == 1)
     #expect(await transport.count("POST", "/v1/subset-feeds") == 3)

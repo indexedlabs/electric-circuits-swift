@@ -23,8 +23,8 @@ public enum CollectionLoadState: Equatable, Sendable {
 /// carries after the stored cursor and never reads the source again.
 public enum CollectionLoadMode: Equatable, Sendable {
   /// Continue the stored copy from its cursor when the source can
-  /// (`CollectionSourceAdapter.resume`), and take a snapshot when it cannot. What
-  /// `CollectionCoordinator.acquire(_:)` and `CollectionLease.refresh()` do.
+  /// (`CollectionSourceAdapter.resume`), and take a snapshot when it cannot. This is what
+  /// `CollectionCoordinator.acquire(_:)` does; `CollectionLease.refresh()` remains a re-read.
   case resume
   /// Take a new snapshot and replace the stored copy's rows with it, without asking the source
   /// to resume. The demand owes that snapshot until one commits: an attempt that fails first is
@@ -68,9 +68,9 @@ public actor CollectionLease {
     return await stateAction(id)
   }
 
-  /// Replaces the demand's current attempt with a new one, as `refresh(.resume)` does.
+  /// Replaces the demand's current attempt with a new snapshot.
   public func refresh() async {
-    await refresh(.resume)
+    await refresh(.snapshot)
   }
 
   /// Replaces the demand's current attempt with a new one, for every lease that shares it.
