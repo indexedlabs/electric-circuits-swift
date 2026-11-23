@@ -193,9 +193,8 @@ struct CollectionCoordinatorResumeTests {
     #expect(await source.stops == 1)
   }
 
-  /// Only a snapshot rebinds a copy an earlier generation stored to this demand, so a later
-  /// launch's acquire snapshots that copy rather than resuming it.
-  @Test func aCopyAnEarlierGenerationStoredSnapshotsRatherThanResumes() async throws {
+  /// A later generation should resume the copy an earlier generation stored.
+  @Test func aCopyAnEarlierGenerationStoredResumes() async throws {
     let store = try await seededStore()
     let source = ResumingSource(snapshotRows: [9])
     let nextLaunch = CollectionScope(principal: "u", authorization: "a", generation: "g2")
@@ -204,14 +203,15 @@ struct CollectionCoordinatorResumeTests {
 
     let lease = await coordinator.acquire(demandA)
 
+    #expect(await eventually { await source.resumes == 1 })
+    await source.signalCaughtUp()
     #expect(await eventually { await lease.state() == .live })
-    #expect(await source.resumes == 0)
-    #expect(await source.materializations == 1)
+    #expect(await source.materializations == 0)
     let rebound = try #require(
       try await store.materialization(for: demandA.identity(for: rowDefinition, scope: nextLaunch)))
     #expect(rebound.id == materializationA)
     #expect(rebound.demand.scope == nextLaunch)
-    #expect(await store.rowClaims(for: materializationA) == [9])
+    #expect(await store.rowClaims(for: materializationA) == [1, 2])
     try await lease.release()
   }
 
