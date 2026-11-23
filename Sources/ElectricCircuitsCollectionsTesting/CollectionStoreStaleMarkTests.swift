@@ -305,6 +305,76 @@ public struct CollectionStoreStaleMarkTests<Store: CollectionStore>: Sendable {
     #expect(try await store.staleMaterializations().isEmpty)
   }
 
+  /// Providers that support rebind change only the demand, retaining the marked copy in place.
+  public func rebindPreservesTheStoredCopyAndItsStaleMark() async throws {
+    let store = try await makeStore()
+    let earlier = demand("push")
+    let later = CollectionDemandIdentity(
+      collection: earlier.collection,
+      scope: .init(
+        principal: scope.principal, authorization: scope.authorization,
+        generation: scope.generation + "-later"),
+      canonicalDemand: earlier.canonicalDemand, columns: earlier.columns)
+    let visibility = try #require(
+      CollectionPageSnapshot(lsn: 10, snapshot: "100:110:105", horizon: "0/20"))
+    try await store.replaceSnapshot(
+      .init(
+        rows: [row(1), row(2)], fence: .init(rawValue: "preserved-fence"),
+        sourceVersion: .init(rawValue: "0/A", order: 10, snapshot: visibility),
+        cursor: .init(offset: "stored-offset", lsn: "0/A")),
+      materializationID: id("push"), demand: earlier)
+    try await snapshot(store, "deck", rows: [1])
+    try await snapshot(store, "deck", rows: [], at: 20)
+    let stored = try #require(try await store.materialization(for: earlier))
+    let mark = try #require(try await store.staleMaterializations().first)
+    #expect(mark.record.id == id("push"))
+
+    #expect(try await store.rebindMaterialization(id("push"), to: later))
+
+    let rebound = try #require(try await store.materialization(for: later))
+    #expect(rebound.id == stored.id)
+    #expect(rebound.demand == later)
+    #expect(rebound.state == stored.state)
+    #expect(rebound.cursor == stored.cursor)
+    #expect(rebound.snapshotFence == stored.snapshotFence)
+    // Source-version equality compares only order; preserve the full stored representation too.
+    #expect(rebound.sourceVersion == stored.sourceVersion)
+    #expect(rebound.sourceVersion.rawValue == stored.sourceVersion.rawValue)
+    #expect(rebound.sourceVersion.snapshot == stored.sourceVersion.snapshot)
+    #expect(rebound.sourceVersion.transactionID == stored.sourceVersion.transactionID)
+    #expect(try await store.materialization(for: earlier) == rebound)
+    #expect(try await storedKeys(store, later) == [key(1), key(2)])
+    #expect(try await claimedKeys(store, id("push")) == [key(1), key(2)])
+    #expect(try await claimedKeys(store, id("deck")).isEmpty)
+    #expect(
+      try await store.staleMaterializations() == [
+        .init(record: rebound, markedAt: mark.markedAt, claimCount: mark.claimCount)
+      ])
+  }
+
+  public func rebindDeclinesAKeyHoldingAnotherCopyOrNone() async throws {
+    let store = try await makeStore()
+    try await snapshot(store, "deck", rows: [1])
+    try await snapshot(store, "push", rows: [1, 2])
+    try await snapshot(store, "deck", rows: [], at: 10)
+    let deck = try await store.materialization(for: demand("deck"))
+    let push = try await store.materialization(for: demand("push"))
+    let marks = try await store.staleMaterializations()
+
+    #expect(try await store.rebindMaterialization(id("deck"), to: demand("push")) == false)
+    #expect(try await store.rebindMaterialization(id("push"), to: demand("missing")) == false)
+    #expect(try await store.rebindMaterialization(id("missing"), to: demand("push")) == false)
+
+    #expect(try await store.materialization(for: demand("deck")) == deck)
+    #expect(try await store.materialization(for: demand("push")) == push)
+    #expect(try await store.materialization(for: demand("missing")) == nil)
+    #expect(try await store.staleMaterializations() == marks)
+    #expect(try await claimedKeys(store, id("deck")).isEmpty)
+    #expect(try await claimedKeys(store, id("push")) == [key(1), key(2)])
+    #expect(try await claimedKeys(store, id("missing")).isEmpty)
+    #expect(try await storedKeys(store, demand("push")) == [key(1), key(2)])
+  }
+
   private func id(_ owner: String) -> CollectionMaterializationID {
     .init(rawValue: owner)
   }

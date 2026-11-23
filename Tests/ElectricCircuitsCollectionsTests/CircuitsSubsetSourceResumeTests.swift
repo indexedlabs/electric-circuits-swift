@@ -230,9 +230,22 @@ private actor ResumeFeedTransport: HTTPTransport {
 }
 
 private actor ResumeRetryClock: ShapeSubscriptionClock {
+  private let holdsSleeps: Bool
   private(set) var sleeps: [Duration] = []
+  private(set) var cancelledSleeps = 0
 
-  func sleep(for duration: Duration) async throws { sleeps.append(duration) }
+  init(holdsSleeps: Bool = false) { self.holdsSleeps = holdsSleeps }
+
+  func sleep(for duration: Duration) async throws {
+    sleeps.append(duration)
+    guard holdsSleeps else { return }
+    do {
+      try await Task.sleep(for: .seconds(3_600))
+    } catch is CancellationError {
+      cancelledSleeps += 1
+      throw CancellationError()
+    }
+  }
 }
 
 private let resumeIssues = CollectionDefinition<ResumeIssue, Int64>(
@@ -246,7 +259,9 @@ private let openIdentity = openIssues.identity(
 
 private func makeSource(
   _ transport: ResumeFeedTransport, keyForRow: (@Sendable (ResumeIssue) throws -> Int64)? = nil,
-  liveReadMode: LiveReadMode = .longPoll
+  liveReadMode: LiveReadMode = .longPoll,
+  retryPolicy: ShapeSubscriptionRetryPolicy = .init(maxRetries: 0),
+  clock: any ShapeSubscriptionClock = ContinuousShapeSubscriptionClock()
 ) -> CircuitsSubsetSource<ResumeIssue, Int64> {
   CircuitsSubsetSource<ResumeIssue, Int64>(
     client: ElectricCircuitsClient(
@@ -255,7 +270,7 @@ private func makeSource(
     transport: transport,
     table: "public.issues",
     columns: ["id", "title"],
-    retryPolicy: ShapeSubscriptionRetryPolicy(maxRetries: 0),
+    retryPolicy: retryPolicy, clock: clock,
     decodeRow: ResumeIssue.init(row:),
     decodeKey: { key in
       guard let id = Int64(key) else { throw CircuitsSubsetSourceError.invalidLiveKey(key) }
@@ -326,6 +341,79 @@ struct CircuitsSubsetSourceResumeTests {
     #expect(await transport.count("POST", "/v1/subset-feeds") == 2)
     #expect(await clock.sleeps == [.seconds(2)])
     try await session.stop()
+  }
+
+  @Test(arguments: [500, 429], [0, 2])
+  func aFeedCreateRefusalIsRethrownAfterTheRetryBudget(status: Int, maxRetries: Int) async throws {
+    let refusals: [(status: Int, retryAfter: String?)] =
+      Array(repeating: (status, "2"), count: maxRetries) + [(status, "41")]
+    let transport = ResumeFeedTransport(feedRefusals: refusals)
+    let clock = ResumeRetryClock()
+    let source = makeSource(
+      transport, retryPolicy: .init(
+        maxRetries: maxRetries, baseDelay: .milliseconds(250), maximumDelay: .seconds(30),
+        jitterRatio: 0), clock: clock)
+
+    // Preserve the final server refusal, including Retry-After beyond the policy's sleep cap.
+    await #expect(throws: ClientError.retryableHTTP(status: status, retryAfter: .seconds(41))) {
+      _ = try await source.materialize(
+        openIssues, identity: openIdentity,
+        materializationID: CollectionMaterializationID(rawValue: "exhausted"))
+    }
+
+    #expect(await transport.count("POST", "/v1/subset-feeds") == maxRetries + 1)
+    #expect(await clock.sleeps == Array(repeating: .seconds(2), count: maxRetries))
+    #expect(await transport.count("HEAD", "/streams/shape-1") == 0)
+    #expect(await transport.count("POST", "/v1/subsets/query") == 0)
+  }
+
+  @Test func cancellingAFeedCreateDuringBackoffEndsTheWait() async throws {
+    let transport = ResumeFeedTransport(feedRefusals: [(503, "2")])
+    let clock = ResumeRetryClock(holdsSleeps: true)
+    let source = makeSource(transport, retryPolicy: .init(maxRetries: 1), clock: clock)
+    let attempt = Task {
+      try await source.materialize(
+        openIssues, identity: openIdentity,
+        materializationID: CollectionMaterializationID(rawValue: "cancelled"))
+    }
+    defer { attempt.cancel() }
+    try #require(await eventually { await clock.sleeps == [.seconds(2)] })
+
+    attempt.cancel()
+
+    await #expect(throws: CancellationError.self) { _ = try await attempt.value }
+    #expect(await clock.cancelledSleeps == 1)
+    #expect(await transport.count("POST", "/v1/subset-feeds") == 1)
+    #expect(await transport.count("POST", "/v1/subsets/query") == 0)
+    // The refused create minted no claim; cancellation neither retries it nor releases a claim.
+    #expect(await transport.count("DELETE", "/v1/shapes/shape-1") == 0)
+  }
+
+  @Test func aSnapshotAcquireCancelsAResumesFeedCreateBackoff() async throws {
+    let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
+    let stored = try await seedBySnapshot(ResumeFeedTransport(), store: store)
+    let transport = ResumeFeedTransport(feedRefusals: [(503, "2")])
+    let clock = ResumeRetryClock(holdsSleeps: true)
+    let coordinator = CollectionCoordinator(
+      definition: resumeIssues, scope: resumeScope,
+      source: makeSource(transport, retryPolicy: .init(maxRetries: 1), clock: clock), store: store)
+    let resumed = await coordinator.acquire(openIssues)
+    try #require(await eventually { await clock.sleeps == [.seconds(2)] })
+    #expect(await resumed.state() == .cached)
+    #expect(try await store.materialization(for: openIdentity) == stored)
+
+    let snapshot = await coordinator.acquire(openIssues, mode: .snapshot)
+
+    #expect(await eventually { await snapshot.state() == .live })
+    #expect(await resumed.state() == .live)
+    #expect(await clock.cancelledSleeps == 1)
+    #expect(await transport.count("POST", "/v1/subset-feeds") == 2)
+    #expect(await transport.count("HEAD", "/streams/shape-1") == 1)
+    #expect(await transport.count("POST", "/v1/subsets/query") == 1)
+    try await resumed.release()
+    try await snapshot.release()
+    // The cancelled resume created no claim; the replacement snapshot's landed claim is released.
+    #expect(await transport.count("DELETE", "/v1/shapes/shape-1") == 1)
   }
 
   @Test func aLiveEnvelopeWithoutLSNFallsBackToASnapshot() async throws {

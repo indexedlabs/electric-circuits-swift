@@ -93,20 +93,24 @@ below the horizon. It renews the same subset-feed claim through
 creating the claim a second time, and the producer cannot advance its local cursor until the
 consumer's atomic store callback returns.
 
-A demand the store already holds is resumed rather than re-materialized when the source allows it.
-When the store holds a copy bound to the demand, generation included, `CollectionCoordinator` first
-calls the adapter's `resume`, which returns a `CollectionResumeSession` (a live tail from the stored
-cursor and source version) or nil. A copy an earlier generation stored snapshots instead, because
-only a snapshot rebinds it to the current demand. So an app that starts a new generation on every
-launch resumes only within a launch: the first acquire after a relaunch snapshots, and later
-acquires in that launch resume. A resumed attempt skips `replaceSnapshot`: the demand stays
-`.cached` and reports `.live` once the tail commits a batch or answers an idle read (a long-poll
-`204` or empty batch, or an SSE control event at the stored offset), and feed deletes release claims
-through the ordinary store `apply`. Nil takes the snapshot path; the default implementation always
-returns nil. Stale revalidation always snapshots. A session whose feed refuses the stored cursor
-throws `CollectionResumeInvalidated`: until the tail goes live, the same attempt snapshots instead,
-so no lease sees a failure. A transient failure fails the attempt, and the next acquire resumes
-again; a plain `refresh()` resumes, while `refresh(.snapshot)` explicitly re-reads the source.
+A demand the store already holds resumes when the store and source allow it.
+`CollectionCoordinator.acquire(_:mode:)` defaults to `.resume` and finds the stored copy by its
+`cacheKey`, which excludes the generation. A copy an earlier launch stored is first bound to this
+generation's demand through `CollectionStore.rebindMaterialization`, preserving its rows, claims,
+cursor, fence, source version and stale mark. A provider using the default `false` snapshots
+instead; a throwing rebind fails the attempt as `.storeUnavailable`. Once bound, the adapter's
+`resume` returns a `CollectionResumeSession` from the stored cursor and source version, or nil to
+take a snapshot. Adapters that do not implement `resume` always return nil.
+
+A resumed attempt skips `replaceSnapshot` and stays `.cached` until the session calls `caughtUp`
+after reading to the stream's head. Only `caughtUp` reports `.live`; committing a batch on the way
+there does not. Adapter authors must call it or their resumed demands remain `.cached`. Feed
+deletes release claims through the ordinary store `apply`. A session whose feed refuses the stored
+cursor throws `CollectionResumeInvalidated`: until the tail goes live, the same attempt snapshots
+instead, so no lease sees a failure. A transient failure fails the attempt, and the next acquire
+resumes again. A plain `refresh()` and `refresh(.resume)` also resume; use `refresh(.snapshot)` or
+`acquire(_:mode: .snapshot)` to re-read the source. A requested snapshot is owed until one commits,
+whatever mode a retry names. Stale revalidation always snapshots.
 
 `CircuitsSubsetSource` fences each snapshot with the feed's stream URL and the snapshot's
 transaction visibility (`subset-v2`), and resumes by re-joining the identical feed request under
@@ -120,9 +124,10 @@ outcome or a non-retryable failure other than an authentication refusal (401, 40
 loss, exhausted retries and authentication refusals leave it resumable. A feed that answers with a
 different URL is kept for the snapshot that follows on the same source instance; an adapter that
 snapshots through another instance first calls `cleanupAbandonedMaterialization`, which releases it.
-On a feed that is already current, `.live` waits for the first idle answer: a long-poll `204` or
-empty batch, or over SSE the control event naming the stored offset, which the stream server sends
-as soon as a read opens at the tail.
+On resume, long-poll readers first read without `live` until an answer marks `stream-up-to-date`;
+SSE readers wait for `upToDate` on a control event. The reader then calls `onCaughtUp`, which the
+source forwards to the session's `caughtUp`. Even a feed that is already current proves it has
+reached the head this way, without waiting out a long-poll window.
 
 Each demand has two keys. `CollectionDemandIdentity.cacheKey` names the stored copy: the
 principal, authorization, collection, canonical predicate, order, limit and the source's columns

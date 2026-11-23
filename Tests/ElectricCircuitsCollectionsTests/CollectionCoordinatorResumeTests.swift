@@ -226,6 +226,63 @@ private actor HeldSnapshotStore: CollectionStore {
   }
 }
 
+/// Forward the existing provider operations while leaving rebind to each provider's witness.
+private protocol ResumeStoreProvider: CollectionStore where Model == ResumeRow, Key == Int {
+  var base: InMemoryCollectionStore<ResumeRow, Int> { get }
+}
+
+extension ResumeStoreProvider {
+  func materialization(for demand: CollectionDemandIdentity) async throws
+    -> CollectionMaterializationRecord?
+  {
+    try await base.materialization(for: demand)
+  }
+
+  func staleMaterializations() async throws -> [CollectionStaleMaterialization] {
+    try await base.staleMaterializations()
+  }
+
+  func clearStale(
+    _ materializationID: CollectionMaterializationID, ifMarkedAt position: CollectionSourceVersion
+  ) async throws {
+    try await base.clearStale(materializationID, ifMarkedAt: position)
+  }
+
+  func replaceSnapshot(
+    _ snapshot: CollectionSnapshot<ResumeRow>, materializationID: CollectionMaterializationID,
+    demand: CollectionDemandIdentity
+  ) async throws {
+    try await base.replaceSnapshot(snapshot, materializationID: materializationID, demand: demand)
+  }
+
+  func apply(
+    _ batch: CollectionChangeBatch<ResumeRow, Int>, to materializationID: CollectionMaterializationID
+  ) async throws {
+    try await base.apply(batch, to: materializationID)
+  }
+
+  func removeMaterialization(_ materializationID: CollectionMaterializationID) async throws {
+    try await base.removeMaterialization(materializationID)
+  }
+}
+
+/// Deliberately inherits CollectionStore's default rebind implementation, as an older provider does.
+private struct SnapshotOnlyStore: ResumeStoreProvider {
+  let base: InMemoryCollectionStore<ResumeRow, Int>
+}
+
+private struct FailingRebindStore: ResumeStoreProvider {
+  let base: InMemoryCollectionStore<ResumeRow, Int>
+
+  struct RebindFailure: Error {}
+
+  func rebindMaterialization(
+    _: CollectionMaterializationID, to _: CollectionDemandIdentity
+  ) async throws -> Bool {
+    throw RebindFailure()
+  }
+}
+
 private let resumeScope = CollectionScope(principal: "u", authorization: "a", generation: "g")
 private let bareRows = CollectionDefinition<ResumeRow, Int>(
   id: CollectionID(rawValue: "rows"), key: \.id)
@@ -329,8 +386,10 @@ struct CollectionCoordinatorResumeTests {
   /// A later launch's demand finds the copy an earlier generation stored by its `cacheKey`. The
   /// store binds that copy to this generation without a snapshot, and the tail continues it.
   @Test func aCopyAnEarlierGenerationStoredResumesBoundToThisGeneration() async throws {
-    let store = try await seededStore()
+    let store = try await seededStore(markingA: true)
     let stored = try #require(try await store.materialization(for: identityA))
+    let storedRows = await store.rows()
+    let storedMark = try #require(try await store.staleMaterializations().first)
     let source = ResumingSource(snapshotRows: [9])
     let nextLaunch = CollectionScope(principal: "u", authorization: "a", generation: "g2")
     let nextIdentity = demandA.identity(for: rowDefinition, scope: nextLaunch)
@@ -348,13 +407,63 @@ struct CollectionCoordinatorResumeTests {
     #expect(rebound.demand == nextIdentity)
     #expect(rebound.cursor == stored.cursor)
     #expect(rebound.snapshotFence == stored.snapshotFence)
+    #expect(rebound.sourceVersion == stored.sourceVersion)
+    #expect(rebound.sourceVersion.rawValue == stored.sourceVersion.rawValue)
+    #expect(await store.rows() == storedRows)
     #expect(await store.rowClaims(for: materializationA) == [1, 2])
+    #expect(
+      try await store.staleMaterializations() == [
+        CollectionStaleMaterialization(
+          record: rebound, markedAt: storedMark.markedAt, claimCount: storedMark.claimCount)
+      ])
 
     // The copy is this generation's now: its eviction removes it.
     try await lease.release()
     try await coordinator.evict(demandA)
     #expect(try await store.materialization(for: nextIdentity) == nil)
     #expect(await store.rows().isEmpty)
+  }
+
+  @Test func aProviderUsingTheDefaultRebindSkipsResumeAndSnapshotsOnce() async throws {
+    let base = try await seededStore()
+    let store = SnapshotOnlyStore(base: base)
+    let source = ResumingSource(snapshotRows: [9])
+    let nextLaunch = CollectionScope(principal: "u", authorization: "a", generation: "g2")
+    let nextIdentity = demandA.identity(for: rowDefinition, scope: nextLaunch)
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: nextLaunch, source: source, store: store)
+
+    let lease = await coordinator.acquire(demandA)
+
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await source.resumes == 0)
+    #expect(await source.materializations == 1)
+    #expect(await base.rowClaims(for: materializationA) == [9])
+    #expect(try await base.materialization(for: nextIdentity)?.demand == nextIdentity)
+    try await lease.release()
+  }
+
+  @Test func aThrowingRebindFailsAsStoreUnavailableWithoutSnapshotting() async throws {
+    let base = try await seededStore(markingA: true)
+    let stored = try await base.materialization(for: identityA)
+    let storedRows = await base.rows()
+    let storedMarks = try await base.staleMaterializations()
+    let source = ResumingSource(snapshotRows: [9])
+    let nextLaunch = CollectionScope(principal: "u", authorization: "a", generation: "g2")
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: nextLaunch, source: source,
+      store: FailingRebindStore(base: base))
+
+    let lease = await coordinator.acquire(demandA)
+
+    #expect(await eventually { await lease.state() == .failed(.storeUnavailable) })
+    #expect(await source.resumes == 0)
+    #expect(await source.materializations == 0)
+    #expect(try await base.materialization(for: identityA) == stored)
+    #expect(await base.rows() == storedRows)
+    #expect(await base.rowClaims(for: materializationA) == [1, 2])
+    #expect(try await base.staleMaterializations() == storedMarks)
+    try await lease.release()
   }
 
   @Test func aResumeStartingAwayFromTheStoredCursorSnapshotsInstead() async throws {

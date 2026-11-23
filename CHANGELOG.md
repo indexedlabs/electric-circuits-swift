@@ -3,13 +3,33 @@
 All notable changes to `ElectricCircuitsSwift` are documented here. Release impact follows the
 [Semantic Versioning policy](Policies/SEMVER.md).
 
-## Unreleased
+## Unreleased (0.16.0)
 
+- **Breaking public behavior, with additive public API.** Changing the refresh default and the
+  resumed-session readiness obligation falls under the major-change category in
+  `Policies/SEMVER.md`. The next pre-1.0 release is 0.16.0; this is not a patch or a purely additive
+  change. Callers and adapter authors must review the migrations below.
 - Add `CollectionLoadMode` (`.resume`, `.snapshot`) to `CollectionCoordinator.acquire(_:mode:)`
-  and `CollectionLease.refresh(_:)`. A plain acquire and `refresh()` resume from the stored cursor
-  when the source can; callers that need to read the source again name `.snapshot`. A snapshot the
-  caller asks for is owed until one commits, and the next acquire after a transient failure still
-  resumes. The next tag is 0.15.2, a patch.
+  and `CollectionLease.refresh(_:)`. This reverses the Unreleased 0.15.2 fix from PR #23 that made
+  `refresh()` always re-read. A plain `refresh()` now resumes; callers that need a re-read must
+  call `refresh(.snapshot)`. This follows the load-mode rule (`#g-load-mode`) of the accepted
+  `proposal-ios-sync-load-phases`. A plain acquire also defaults to resume. A requested snapshot
+  is owed until one commits, whatever mode a retry names.
+- `acquire(_:)` now resumes copies stored by an earlier generation, found by cache key. Add the
+  defaulted `CollectionStore.rebindMaterialization(_:to:)` requirement: a provider may bind that
+  copy to the current demand without changing rows, claims, cursor, fence, source version or stale
+  mark. Its default returns `false`, so providers that have not implemented it still snapshot
+  across launches. A throwing rebind fails the attempt as `.storeUnavailable`.
+- Add `ShapeStreamReader.onCaughtUp` (property and initializer parameter) and
+  `ShapeSubscriptionCoordinator(onCaughtUp:)`. A resumed demand reports `.live` only from its
+  `CollectionResumeSession`'s `caughtUp` callback, after the stream head is reached. Adapter
+  authors must call it: an adapter that commits batches but never calls `caughtUp` stays `.cached`.
+- Single-scope feed creation now retries `ClientError.retryableHTTP` (408, 425, 429 and every 5xx),
+  waiting the longer of the policy backoff and `Retry-After`, capped at `maximumDelay`, up to
+  `maxRetries`. The final refusal is rethrown unchanged. With the default eight retries and
+  30-second ceiling, a persistent refusal can now keep a demand `.refreshing` or `.cached` for
+  roughly one minute, or up to four minutes with `Retry-After`, before failing; it previously
+  failed immediately. Cancelling the attempt interrupts the retry wait.
 
 ## 0.15.1
 

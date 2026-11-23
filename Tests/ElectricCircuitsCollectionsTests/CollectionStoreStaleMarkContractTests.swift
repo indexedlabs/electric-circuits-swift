@@ -84,4 +84,12 @@ struct CollectionStoreStaleMarkContractTests {
   @Test func laterGenerationBindsTheEarlierCopy() async throws {
     try await contract.laterGenerationBindsTheEarlierCopy()
   }
+
+  @Test func rebindPreservesTheStoredCopyAndItsStaleMark() async throws {
+    try await contract.rebindPreservesTheStoredCopyAndItsStaleMark()
+  }
+
+  @Test func rebindDeclinesAKeyHoldingAnotherCopyOrNone() async throws {
+    try await contract.rebindDeclinesAKeyHoldingAnotherCopyOrNone()
+  }
 }
