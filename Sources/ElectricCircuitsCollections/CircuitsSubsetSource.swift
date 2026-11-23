@@ -325,7 +325,7 @@ public struct CircuitsSubsetSource<Model: Sendable, Key: Hashable & Sendable>:
 
   private func createFeed(_ request: ShapeRequest) async throws -> ShapeHandle {
     try await recreatePolicy.recreatingOnGone(clock: clock) {
-      try await retryPolicy.retryingRefusedClaim(clock: clock) {
+      try await retryPolicy.retryingRefusedFeedCreate(clock: clock) {
         try await client.createSubsetFeed(request)
       }
     }
@@ -488,7 +488,7 @@ extension ShapeSubscriptionRetryPolicy {
   /// as it was received. Every other outcome, transport errors included, propagates unchanged:
   /// the request names a stable subscription, so repeating it is a renewal, but only a server
   /// that asked for a retry is given one here.
-  func retryingRefusedClaim<T: Sendable>(
+  func retryingRefusedFeedCreate<T: Sendable>(
     clock: any ShapeSubscriptionClock, _ body: @Sendable () async throws -> T
   ) async throws -> T {
     var retries = 0
