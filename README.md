@@ -105,8 +105,8 @@ acquires in that launch resume. A resumed attempt skips `replaceSnapshot`: the d
 through the ordinary store `apply`. Nil takes the snapshot path; the default implementation always
 returns nil. Stale revalidation always snapshots. A session whose feed refuses the stored cursor
 throws `CollectionResumeInvalidated`: until the tail goes live, the same attempt snapshots instead,
-so no lease sees a failure. A transient failure fails the attempt, and the next attempt resumes
-again.
+so no lease sees a failure. A transient failure fails the attempt, and the next acquire resumes
+again; a `refresh()` always re-reads.
 
 `CircuitsSubsetSource` fences each snapshot with the feed's stream URL and the snapshot's
 transaction visibility (`subset-v2`), and resumes by re-joining the identical feed request under

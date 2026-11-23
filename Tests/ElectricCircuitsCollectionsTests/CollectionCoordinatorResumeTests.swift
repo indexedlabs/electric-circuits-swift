@@ -243,13 +243,32 @@ struct CollectionCoordinatorResumeTests {
     #expect(await source.materializations == 0)
     #expect(await store.rowClaims(for: materializationA) == [1, 2])
 
-    // A resume the source could not set up says nothing about the stored cursor, so the retry
-    // asks again rather than re-querying the page.
+    // A refresh re-reads the source, so it snapshots rather than asking to resume.
     await lease.refresh()
-    #expect(await eventually { await source.resumes == 2 })
-    #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
-    #expect(await source.materializations == 0)
-    #expect(await store.rowClaims(for: materializationA) == [1, 2])
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await source.resumes == 1)
+    #expect(await source.materializations == 1)
+    #expect(await store.rowClaims(for: materializationA) == [9])
+    try await lease.release()
+  }
+
+  /// A refresh is a re-read: it snapshots a copy an acquire would resume.
+  @Test func aRefreshSnapshotsACopyAnAcquireResumes() async throws {
+    let store = try await seededStore()
+    let source = ResumingSource(snapshotRows: [9])
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: resumeScope, source: source, store: store)
+
+    let lease = await coordinator.acquire(demandA)
+    #expect(await eventually { await source.resumes == 1 })
+    await source.signalCaughtUp()
+    #expect(await eventually { await lease.state() == .live })
+
+    await lease.refresh()
+    #expect(await eventually { await source.materializations == 1 })
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await source.resumes == 1)
+    #expect(await store.rowClaims(for: materializationA) == [9])
     try await lease.release()
   }
 
@@ -273,8 +292,8 @@ struct CollectionCoordinatorResumeTests {
   }
 
   /// A transient failure says nothing about the stored cursor: the attempt fails without a
-  /// snapshot, and the retry resumes again rather than re-querying the page.
-  @Test func aTransientResumedTailFailureResumesAgainOnRetry() async throws {
+  /// snapshot, and the next acquire resumes again rather than re-querying the page.
+  @Test func aTransientResumedTailFailureResumesAgainOnTheNextAcquire() async throws {
     let store = try await seededStore()
     let source = ResumingSource(mode: .transientTailFailure, snapshotRows: [9])
     let coordinator = CollectionCoordinator(
@@ -284,11 +303,13 @@ struct CollectionCoordinatorResumeTests {
     #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
     #expect(await source.materializations == 0)
 
-    await lease.refresh()
+    try await lease.release()
+
+    let again = await coordinator.acquire(demandA)
     #expect(await eventually { await source.resumes == 2 })
     #expect(await source.materializations == 0)
     #expect(await store.rowClaims(for: materializationA) == [1, 2])
-    try await lease.release()
+    try await again.release()
   }
 
   /// Once the resumed tail has been reported live, a refused cursor fails the attempt as a
