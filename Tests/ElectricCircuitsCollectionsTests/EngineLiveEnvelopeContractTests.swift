@@ -67,7 +67,7 @@ struct EngineLiveEnvelopeContractTests {
     let record = try #require(try await store.materialization(for: identity))
     #expect(record.cursor == session.snapshot.cursor)
     #expect(record.cursor?.offset == ContractEngine.start)
-    // The failed session released its claim once and read the stream once.
+    // The failed session released its feed once and read the stream once.
     #expect(await engine.count(.release) == 1)
     #expect(await engine.count(.streamRead) == 1)
   }
@@ -109,8 +109,6 @@ struct EngineLiveEnvelopeContractTests {
     #expect(record.cursor?.offset == afterRefused)
     try await lease.release()
   }
-
-  /// One refused envelope fails the whole group batch, the positioned envelope beside it included.
 
 }
 
@@ -346,40 +344,4 @@ struct EngineEnvelopePositionTests {
     try await lease.release()
   }
 
-  /// The group tail follows the same rules, per table and key.
-
-}
-
-/// The fixture's group: `lists` owned by `u1` and the `items` in those lists.
-func contractGroupDemand() -> CollectionGroupDemand {
-  CollectionGroupDemand(members: [
-    CollectionGroupMember(
-      definition: contractLists, table: "lists", unsafePredicateIdentity: "owner=u1",
-      sourcePredicate: .leaf(column: "owner", op: .eq, value: .string("u1")),
-      decodeRow: ContractList.init(row:), decodeKey: contractKey),
-    CollectionGroupMember(
-      definition: contractItems, table: "items", unsafePredicateIdentity: "list in u1's lists",
-      sourcePredicate: .in(
-        column: "list_id",
-        subquery: PredicateSubquery(
-          table: "lists", project: "id",
-          where: .leaf(column: "owner", op: .eq, value: .string("u1")))),
-      decodeRow: ContractItem.init(row:), decodeKey: contractKey),
-  ])
-}
-
-let contractGroupRows =
-  #"[{"table":"public.lists","value":{"id":1,"owner":"u1"}},"#
-  + #"{"table":"public.items","value":{"id":1,"list_id":1,"title":"one"}},"#
-  + #"{"table":"public.items","value":{"id":2,"list_id":1,"title":"two"}}]"#
-
-func contractGroupSource(_ engine: ContractEngine, liveReadMode: LiveReadMode = .longPoll)
-  -> CircuitsSubsetGroupSource
-{
-  CircuitsSubsetGroupSource(
-    client: ElectricCircuitsClient(
-      baseURL: URL(string: "https://engine.test")!, transport: engine,
-      configuration: .init(liveReadMode: liveReadMode)),
-    transport: engine,
-    retryPolicy: ShapeSubscriptionRetryPolicy(maxRetries: 0))
 }

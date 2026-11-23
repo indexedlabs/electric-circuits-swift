@@ -1,0 +1,126 @@
+{
+  "engine": "1be10fb",
+  "schema": "lists(id int, owner text), items(id int, list_id int, title text)",
+  "steps": [
+    {
+      "what": "update a row in the scope",
+      "statement": "UPDATE items SET title = 'one-b' WHERE id = 1"
+    },
+    {
+      "what": "insert a row into the scope",
+      "statement": "INSERT INTO items (id, list_id, title) VALUES (4, 1, 'four')"
+    },
+    {
+      "what": "delete a row the stream delivered",
+      "statement": "DELETE FROM items WHERE id = 4"
+    }
+  ],
+  "plain": {
+    "where": {
+      "col": "list_id",
+      "op": "eq",
+      "value": 1
+    },
+    "envelopes": [
+      {
+        "type": "public.items",
+        "key": "1",
+        "value": {
+          "id": 1,
+          "list_id": 1,
+          "title": "one-b"
+        },
+        "headers": {
+          "operation": "upsert",
+          "txid": "767",
+          "lsn": "0/1BF2D00",
+          "commit_ts": 1794939418174
+        }
+      },
+      {
+        "type": "public.items",
+        "key": "4",
+        "value": {
+          "id": 4,
+          "list_id": 1,
+          "title": "four"
+        },
+        "headers": {
+          "operation": "upsert",
+          "txid": "769",
+          "lsn": "0/1BF2E40",
+          "commit_ts": 1794939418270
+        }
+      },
+      {
+        "type": "public.items",
+        "key": "4",
+        "headers": {
+          "operation": "delete",
+          "txid": "771",
+          "lsn": "0/1BF2F48",
+          "commit_ts": 1794939418478
+        }
+      }
+    ],
+    "offsets": [
+      "0000000000000000_0000000000000461"
+    ]
+  },
+  "subquery": {
+    "where": {
+      "col": "list_id",
+      "in": {
+        "table": "lists",
+        "project": "id",
+        "where": {
+          "col": "owner",
+          "op": "eq",
+          "value": "u1"
+        }
+      }
+    },
+    "envelopes": [
+      {
+        "type": "public.items",
+        "key": "1",
+        "value": {
+          "id": 1,
+          "list_id": 1,
+          "title": "one-b"
+        },
+        "headers": {
+          "operation": "upsert",
+          "txid": "767",
+          "commit_ts": 1794939418174
+        }
+      },
+      {
+        "type": "public.items",
+        "key": "4",
+        "value": {
+          "id": 4,
+          "list_id": 1,
+          "title": "four"
+        },
+        "headers": {
+          "operation": "upsert",
+          "txid": "769",
+          "commit_ts": 1794939418270
+        }
+      },
+      {
+        "type": "public.items",
+        "key": "4",
+        "headers": {
+          "operation": "delete",
+          "txid": "771",
+          "commit_ts": 1794939418478
+        }
+      }
+    ],
+    "offsets": [
+      "0000000000000000_0000000000000407"
+    ]
+  }
+}

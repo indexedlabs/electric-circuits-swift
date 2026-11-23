@@ -13,3 +13,12 @@ encode/decode-only example. It follows the Rust durable-stream client in
 
 The stream reader tests additionally exercise the HTTP-only framing cases: `live=long-poll`, an
 idle `204`, a terminal `stream-closed: true` response, and terminal `404`/`410` responses.
+
+## Engine live envelopes
+
+`engine-live-envelopes.json` records the plain and subquery changes-only feeds used by
+`EngineLiveEnvelopeContractTests`. The checked-in capture is from engine `1be10fb`, before the
+engine's position fix; its plain feed carries `headers.lsn`, while the subquery feed deliberately
+has no position so the SDK's refusal path stays covered. Engine main at `5b2cf3e` stamps
+`headers.lsn` on every change, including removals. Group streams and the probe executable's group
+paths are intentionally absent from this single-scope change.

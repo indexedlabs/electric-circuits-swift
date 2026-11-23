@@ -7,8 +7,9 @@ import Testing
   import FoundationNetworking
 #endif
 
-/// The envelopes a real engine wrote, captured by the engine repository's
-/// `conformance-swift-client.test.ts` through this package's probe (`Tests/Fixtures/README.md`).
+/// Envelopes captured from the engine's changes-only feeds. The fixture deliberately contains
+/// only the single-scope feeds covered by this package; group and re-join paths belong to the
+/// follow-up issue.
 struct EngineEnvelopeFixture: Decodable {
   struct Stream: Decodable {
     let envelopes: [JSONValue]
@@ -20,7 +21,6 @@ struct EngineEnvelopeFixture: Decodable {
   let engine: String
   let plain: Stream
   let subquery: Stream
-  let group: Stream
 
   static func load() throws -> EngineEnvelopeFixture {
     let url = URL(fileURLWithPath: #filePath)
@@ -57,24 +57,6 @@ struct ContractItem: Equatable, Sendable {
   }
 }
 
-/// A row of the fixture's `lists` table.
-struct ContractList: Equatable, Sendable {
-  let id: Int64
-  let owner: String
-
-  init(id: Int64, owner: String) {
-    self.id = id
-    self.owner = owner
-  }
-
-  init(row: ChangeRow) throws {
-    guard case .int(let id) = row["id"], case .string(let owner) = row["owner"] else {
-      throw ContractDecodeFailure()
-    }
-    self.init(id: id, owner: owner)
-  }
-}
-
 struct ContractDecodeFailure: Error {}
 
 func contractKey(_ key: String) throws -> Int64 {
@@ -82,30 +64,14 @@ func contractKey(_ key: String) throws -> Int64 {
   return id
 }
 
-/// The engine's surface as the SDK uses it, with the engine's rules for what a stream is:
+/// The single-scope engine surface used by the contract tests:
 ///
-/// - A stream is positional. A read at an offset answers the batch stored at that offset, however
-///   often it is asked, and says so when that batch ends at the stream's head
-///   (`stream-up-to-date`). A batch here is one `append`, so a reader that is several appends
-///   behind gets them one read at a time and only the last is marked.
-/// - A read without `live` (a catch-up read) never waits: at the head it answers an empty batch
-///   marked up to date. A `live=long-poll` read at the head waits for the poll window, which no
-///   test sits through; `idle` ends it for the next such reads with a `204`. A `live=sse` read
-///   sends each batch and its control, sends an up-to-date control at once when it opens at the
-///   head, and stays open.
-/// - A changes-only feed is shared by its request, whatever subscription claims it, and keeps its
-///   stream after a release. `retireFeed()` is the engine retiring it: the next create mints another.
-/// - A group belongs to its subscription. A load under a subscription that holds a group renews
-///   it on the same stream; any other load creates a group on a new stream. A re-join
-///   (`POST /v1/subsets/rejoin`) claims the group its subscription holds and answers the claim
-///   with no rows, or `412` when there is none; it never creates one. What a release does to a
-///   group, and whether the route exists at all, are the initializer's `releasesGroups` and
-///   `rejoinRoute`.
-/// - A claim has an identity. A feed create, a group load and a re-join answer the identity of
-///   the claim their subscription holds afterwards (`claim`): the one it had when the request
-///   named it (`?claim=…`), a new one otherwise. A release that names a claim releases it only
-///   while it is the one held, and is a success either way; one that names none releases
-///   whatever claim the subscription holds. `heldClaim` is what a subscription holds now.
+/// - A stream is positional. A read at an offset answers the batch stored at that offset and says
+///   when that batch ends at the stream's head (`stream-up-to-date`).
+/// - A read without `live` never waits: at the head it answers an empty batch marked up to date. A
+///   `live=long-poll` read at the head waits until the test appends or idles it.
+/// - A changes-only feed keeps its stream after release. `retireFeed()` models the engine retiring
+///   it so the next create mints another stream.
 actor ContractEngine: HTTPTransport {
   struct Request: Equatable, Sendable {
     let kind: Kind
@@ -114,13 +80,10 @@ actor ContractEngine: HTTPTransport {
     let offset: String?
     /// A stream read's `live` parameter; nil for a catch-up read.
     var live: String? = nil
-    /// The claim the request named in `?claim=…`: the one a release releases, or the one the
-    /// caller of a create, a load or a re-join holds.
-    var claim: String? = nil
   }
 
   enum Kind: Hashable, Sendable {
-    case feedCreate, frontier, snapshotQuery, groupLoad, groupRejoin, streamRead, release
+    case feedCreate, frontier, snapshotQuery, streamRead, release
   }
 
   static let start = "0000000000000000_0000000000000000"
@@ -134,40 +97,9 @@ actor ContractEngine: HTTPTransport {
   private var parked: [UUID: CheckedContinuation<Void, Never>] = [:]
   private var feedGeneration = 1
   private var snapshotBodies: [String]
-  private var groups: [String: String] = [:]
-  private var groupCount = 0
-  /// The identity of the claim each subscription holds.
-  private var claims: [String: String] = [:]
-  private var claimCount = 0
-  private var groupRows: String
-  private let groupPosition: String
-  private let releasesGroups: Bool
-  private let rejoinRoute: Bool
-  /// Refusals the next claim requests of a kind answer, one each, before anything else.
-  private var claimRefusals: [Kind: [(status: Int, retryAfter: String?)]] = [:]
 
-  /// `snapshots` answer successive `/v1/subsets/query` calls (the last repeats); `groupRows` is
-  /// the `rows` array every group load answers with, and `groupPosition` its `lsn`, `snapshot`
-  /// and `horizon` members.
-  ///
-  /// With `releasesGroups` true a release retires the group and its stream, as an engine that
-  /// keeps a group only while it is claimed does. With false a released group is kept for its
-  /// subscription to come back to, as the engine that has the re-join route keeps it (and as the
-  /// engine at `1be10fb` happened to, for a release that names the group's own id). `lapseGroup`
-  /// is the engine retiring a group either way.
-  ///
-  /// With `rejoinRoute` false the engine has no `POST /v1/subsets/rejoin` and answers it `404`,
-  /// as the engine at `1be10fb` does.
-  init(
-    snapshots: [String], groupRows: String = "[]",
-    groupPosition: String = #""lsn":"0/1BF2C98","snapshot":"767:767:","horizon":"0/1BF2C98""#,
-    releasesGroups: Bool = true, rejoinRoute: Bool = true
-  ) {
+  init(snapshots: [String]) {
     snapshotBodies = snapshots
-    self.groupRows = groupRows
-    self.groupPosition = groupPosition
-    self.releasesGroups = releasesGroups
-    self.rejoinRoute = rejoinRoute
   }
 
   static func streamURL(_ stream: String) -> String { streamBase + stream }
@@ -196,44 +128,8 @@ actor ContractEngine: HTTPTransport {
     wake()
   }
 
-  /// The next `kind` requests (a feed create, a group load or a group re-join) are refused with
-  /// `status`, one each, as an engine at its shape cap refuses a create: `503` with `Retry-After`.
-  func refuseClaims(_ kind: Kind, status: Int, retryAfter: String? = nil, count: Int = 1) {
-    claimRefusals[kind, default: []] += Array(repeating: (status, retryAfter), count: count)
-  }
-
-  private func refusal(of kind: Kind, to request: URLRequest) -> HTTPResponse? {
-    guard var pending = claimRefusals[kind], !pending.isEmpty else { return nil }
-    let refused = pending.removeFirst()
-    claimRefusals[kind] = pending
-    return reply(
-      #"{"error":"refused"}"#, to: request, status: refused.status,
-      headers: refused.retryAfter.map { ["Retry-After": $0] } ?? [:])
-  }
-
   /// The engine retires the feed: the next create for the same request mints another stream.
   func retireFeed() { feedGeneration += 1 }
-
-  /// The engine retires a group: its lease lapsed and nobody came back for it.
-  func lapseGroup(subscription: String) {
-    groups.removeValue(forKey: subscription)
-    claims.removeValue(forKey: subscription)
-  }
-
-  /// The identity of the claim `subscription` holds, or nil when it holds none.
-  func heldClaim(_ subscription: String) -> String? { claims[subscription] }
-
-  /// Takes or renews `subscription`'s claim as the engine does: the identity is kept for a
-  /// request that names it and is new for any other.
-  private func grant(_ subscription: String, to request: URLRequest) -> String {
-    let named = requests.last?.claim
-    if let held = claims[subscription], held == named { return held }
-    claimCount += 1
-    claims[subscription] = "claim-\(claimCount)"
-    return "claim-\(claimCount)"
-  }
-
-  func setGroupRows(_ rows: String) { groupRows = rows }
 
   var feedStream: String { "s\(feedGeneration)" }
 
@@ -282,16 +178,15 @@ actor ContractEngine: HTTPTransport {
           ?? components?.queryItems?.first { $0.name == "subscription" }?.value,
         stream: path.contains("/shape/") ? path.components(separatedBy: "/shape/").last : nil,
         offset: components?.queryItems?.first { $0.name == "offset" }?.value,
-        live: components?.queryItems?.first { $0.name == "live" }?.value,
-        claim: components?.queryItems?.first { $0.name == "claim" }?.value))
+        live: components?.queryItems?.first { $0.name == "live" }?.value))
   }
 
-  private struct Claim: Decodable {
+  private struct FeedRequest: Decodable {
     let subscription: String?
   }
 
   private func subscription(of request: URLRequest) -> String? {
-    request.httpBody.flatMap { try? JSONDecoder().decode(Claim.self, from: $0) }?.subscription
+    request.httpBody.flatMap { try? JSONDecoder().decode(FeedRequest.self, from: $0) }?.subscription
   }
 
   func send(_ request: URLRequest) async throws -> HTTPResponse {
@@ -300,63 +195,17 @@ actor ContractEngine: HTTPTransport {
     case ("POST", "/v1/subset-feeds"):
       let subscription = subscription(of: request)
       record(.feedCreate, request, subscription: subscription)
-      if let refused = refusal(of: .feedCreate, to: request) { return refused }
       let stream = feedStream
-      let claim = grant(subscription ?? "", to: request)
       return reply(
         #"{"shapeId":"\#(stream)","table":"public.items","streamPath":"shape/\#(stream)","#
-          + #""streamUrl":"\#(Self.streamURL(stream))","subscription":"\#(subscription ?? "")","#
-          + #""claim":"\#(claim)"}"#,
+          + #""streamUrl":"\#(Self.streamURL(stream))","subscription":"\#(subscription ?? "")"}"#,
         to: request)
     case ("POST", "/v1/subsets/query"):
       record(.snapshotQuery, request)
       let body = snapshotBodies.count > 1 ? snapshotBodies.removeFirst() : snapshotBodies[0]
       return reply(body, to: request)
-    case ("POST", "/v1/subsets/load"):
-      let subscription = subscription(of: request) ?? ""
-      record(.groupLoad, request, subscription: subscription)
-      if let refused = refusal(of: .groupLoad, to: request) { return refused }
-      if groups[subscription] == nil {
-        groupCount += 1
-        groups[subscription] = "group-\(groupCount)"
-      }
-      let stream = groups[subscription]!
-      let claim = grant(subscription, to: request)
-      return reply(
-        #"{"groupId":"shape/\#(stream)","shapeId":"shape/\#(stream)","claim":"\#(claim)","#
-          + #""subscription":"\#(subscription)","streamPath":"shape/\#(stream)","#
-          + #""streamUrl":"\#(Self.streamURL(stream))","offset":"\#(tails[stream] ?? Self.start)","#
-          + #"\#(groupPosition),"rows":\#(groupRows),"#
-          + #""results":[{"key":"lists","table":"public.lists","shapeId":"s11"},"#
-          + #"{"key":"items","table":"public.items","shapeId":"s12"}]}"#,
-        to: request)
-    case ("POST", "/v1/subsets/rejoin"):
-      let subscription = subscription(of: request) ?? ""
-      record(.groupRejoin, request, subscription: subscription)
-      guard rejoinRoute else { return reply("Not Found", to: request, status: 404) }
-      if let refused = refusal(of: .groupRejoin, to: request) { return refused }
-      guard let stream = groups[subscription] else {
-        return reply(#"{"error":"no such group"}"#, to: request, status: 412)
-      }
-      // A load's answer less the snapshot: no `rows`, `lsn`, `snapshot` or `horizon`.
-      let claim = grant(subscription, to: request)
-      return reply(
-        #"{"groupId":"shape/\#(stream)","shapeId":"shape/\#(stream)","claim":"\#(claim)","#
-          + #""subscription":"\#(subscription)","streamPath":"shape/\#(stream)","#
-          + #""streamUrl":"\#(Self.streamURL(stream))","offset":"\#(tails[stream] ?? Self.start)","#
-          + #""results":[{"key":"lists","table":"public.lists","shapeId":"s11"},"#
-          + #"{"key":"items","table":"public.items","shapeId":"s12"}]}"#,
-        to: request)
     case ("DELETE", _) where path.hasPrefix("/v1/shapes/"):
       record(.release, request)
-      let released = requests.last?.subscription
-      let named = requests.last?.claim
-      // A release that names a claim the subscription no longer holds changes nothing.
-      if let released, named == nil || claims[released] == named {
-        claims.removeValue(forKey: released)
-        // An engine that keeps a group only while it is claimed retires it here.
-        if path.contains("group-"), releasesGroups { groups.removeValue(forKey: released) }
-      }
       return reply("", to: request)
     case ("HEAD", _):
       record(.frontier, request)
@@ -446,8 +295,6 @@ actor ContractEngine: HTTPTransport {
 
 let contractItems = CollectionDefinition<ContractItem, Int64>(
   id: CollectionID(rawValue: "items"), key: \.id)
-let contractLists = CollectionDefinition<ContractList, Int64>(
-  id: CollectionID(rawValue: "lists"), key: \.id)
 
 /// The fixture's plain scope: `items` in list 1.
 let listOneItems = CollectionDemand<ContractItem>(
