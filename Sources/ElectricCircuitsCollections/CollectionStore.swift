@@ -61,6 +61,28 @@ public protocol CollectionStore<Model, Key>: Sendable {
   /// now-unclaimed canonical rows and its stale mark in the same transaction. Only this method
   /// and `clearStale(_:ifMarkedAt:)` clear marks; eviction does not mark other holders.
   func removeMaterialization(_ materializationID: CollectionMaterializationID) async throws
+
+  /// Records `demand` as the current demand of the copy stored under `demand.cacheKey`, when
+  /// that copy is `materializationID`, and changes nothing else: its rows, claims, snapshot
+  /// fence, source version, cursor and stale mark stay as they are. Returns whether it did.
+  ///
+  /// A later generation's coordinator calls this before it continues, from the stored cursor, a
+  /// copy an earlier generation stored; a snapshot would have rebound the copy through
+  /// `replaceSnapshot` instead. The default returns false, as a provider that binds a copy only
+  /// by snapshot must, and so does a key that holds another copy or none. On false the
+  /// coordinator snapshots. A provider whose `materialization(for:)` already reports the
+  /// requested demand is never asked.
+  func rebindMaterialization(
+    _ materializationID: CollectionMaterializationID, to demand: CollectionDemandIdentity
+  ) async throws -> Bool
+}
+
+extension CollectionStore {
+  public func rebindMaterialization(
+    _: CollectionMaterializationID, to _: CollectionDemandIdentity
+  ) async throws -> Bool {
+    false
+  }
 }
 
 public enum CollectionStoreError: Error, Equatable, Sendable {
@@ -336,6 +358,19 @@ public actor InMemoryCollectionStore<Model: Sendable, Key: Hashable & Sendable>:
     claims = nextClaims
     recordsByKey = nextRecords
     demandByMaterialization = nextDemandByMaterialization
+  }
+
+  public func rebindMaterialization(
+    _ materializationID: CollectionMaterializationID, to demand: CollectionDemandIdentity
+  ) async throws -> Bool {
+    guard let record = recordsByKey[demand.cacheKey], record.id == materializationID,
+      demandByMaterialization[materializationID]?.cacheKey == demand.cacheKey
+    else { return false }
+    recordsByKey[demand.cacheKey] = CollectionMaterializationRecord(
+      id: record.id, demand: demand, state: record.state, snapshotFence: record.snapshotFence,
+      sourceVersion: record.sourceVersion, cursor: record.cursor)
+    demandByMaterialization[materializationID] = demand
+    return true
   }
 
   /// Retains a tombstone until every materialization in its domain has durably applied the delete's

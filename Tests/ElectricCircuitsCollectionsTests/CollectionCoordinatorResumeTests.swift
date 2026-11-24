@@ -25,21 +25,32 @@ private actor ResumingSource: CollectionSourceAdapter {
     case refusedCursor
     /// Resume, report one idle poll, then refuse the cursor.
     case refusedCursorAfterCatchUp
+    /// Resume, commit one batch on the first signal and report caught up on the second.
+    case appliesThenCatchesUp
   }
 
   struct ResumeFailure: Error {}
 
   private let mode: Mode
   private let snapshotRows: [Int]
+  /// How many of the first `materialize` calls fail, as a source that is briefly unavailable.
+  private var failingMaterializations: Int
   private(set) var materializations = 0
   private(set) var resumes = 0
   private(set) var stops = 0
+  /// Batches a resumed session's `apply` has returned from.
+  private(set) var appliedBatches = 0
   private var sessions: [Int: AsyncStream<Void>.Continuation] = [:]
   private var nextSession = 0
+  private var holdsStops = false
+  private var heldStops: [CheckedContinuation<Void, Never>] = []
+  /// Stops that have been asked for and are held.
+  private(set) var stopsWaiting = 0
 
-  init(mode: Mode = .resume, snapshotRows: [Int] = []) {
+  init(mode: Mode = .resume, snapshotRows: [Int] = [], failingMaterializations: Int = 0) {
     self.mode = mode
     self.snapshotRows = snapshotRows
+    self.failingMaterializations = failingMaterializations
   }
 
   func materialize(
@@ -47,6 +58,10 @@ private actor ResumingSource: CollectionSourceAdapter {
     materializationID _: CollectionMaterializationID
   ) async throws -> CollectionSourceSession<ResumeRow, Int> {
     materializations += 1
+    if failingMaterializations > 0 {
+      failingMaterializations -= 1
+      throw ResumeFailure()
+    }
     let order = UInt64(200 + materializations)
     let (index, events) = openSession()
     return CollectionSourceSession(
@@ -66,7 +81,8 @@ private actor ResumingSource: CollectionSourceAdapter {
     resumes += 1
     let cursor: StreamCursor
     switch mode {
-    case .resume, .transientTailFailure, .refusedCursor, .refusedCursorAfterCatchUp:
+    case .resume, .transientTailFailure, .refusedCursor, .refusedCursorAfterCatchUp,
+      .appliesThenCatchesUp:
       guard let stored = record.cursor else { return nil }
       cursor = stored
     case .wrongCursor:
@@ -78,8 +94,23 @@ private actor ResumingSource: CollectionSourceAdapter {
     let mode = mode
     return CollectionResumeSession(
       cursor: cursor, sourceVersion: record.sourceVersion,
-      run: { _, caughtUp in
+      run: { apply, caughtUp in
         switch mode {
+        case .appliesThenCatchesUp:
+          var applied = false
+          for await _ in events {
+            guard applied else {
+              try await apply(
+                CollectionChangeBatch(
+                  changes: [.upsert(ResumeRow(id: 3), sourceVersion: version(11))],
+                  expectedCursor: cursor, cursor: StreamCursor(offset: "a-11"),
+                  sourceVersion: version(11)))
+              applied = true
+              await self.noteApplied()
+              continue
+            }
+            await caughtUp()
+          }
         case .transientTailFailure:
           throw ResumeFailure()
         case .refusedCursor:
@@ -101,6 +132,8 @@ private actor ResumingSource: CollectionSourceAdapter {
     for session in sessions.values { session.yield(()) }
   }
 
+  private func noteApplied() { appliedBatches += 1 }
+
   private func openSession() -> (Int, AsyncStream<Void>) {
     nextSession += 1
     let stream = AsyncStream<Void>.makeStream()
@@ -108,10 +141,145 @@ private actor ResumingSource: CollectionSourceAdapter {
     return (nextSession, stream.stream)
   }
 
-  private func stop(_ index: Int) {
+  /// Holds every later `stop` until `releaseStops()`, as a slow release request does.
+  func holdStops() { holdsStops = true }
+
+  func releaseStops() {
+    holdsStops = false
+    for continuation in heldStops { continuation.resume() }
+    heldStops.removeAll()
+  }
+
+  private func stop(_ index: Int) async {
+    if holdsStops {
+      stopsWaiting += 1
+      await withCheckedContinuation { heldStops.append($0) }
+    }
     guard let session = sessions.removeValue(forKey: index) else { return }
     stops += 1
     session.finish()
+  }
+}
+
+/// A store whose snapshot commits wait while it is held, so a test can place one against a
+/// refresh that is replacing the attempt that read it.
+private actor HeldSnapshotStore: CollectionStore {
+  typealias Model = ResumeRow
+  typealias Key = Int
+
+  let base = InMemoryCollectionStore<ResumeRow, Int>(key: \.id)
+  private var holding = false
+  private var held: [CheckedContinuation<Void, Never>] = []
+  /// Snapshots that were read and are waiting to commit.
+  private(set) var waiting = 0
+
+  func hold() { holding = true }
+
+  func release() {
+    holding = false
+    for continuation in held { continuation.resume() }
+    held.removeAll()
+  }
+
+  func materialization(for demand: CollectionDemandIdentity) async throws
+    -> CollectionMaterializationRecord?
+  {
+    try await base.materialization(for: demand)
+  }
+
+  func staleMaterializations() async throws -> [CollectionStaleMaterialization] {
+    try await base.staleMaterializations()
+  }
+
+  func clearStale(
+    _ materializationID: CollectionMaterializationID, ifMarkedAt position: CollectionSourceVersion
+  ) async throws {
+    try await base.clearStale(materializationID, ifMarkedAt: position)
+  }
+
+  func replaceSnapshot(
+    _ snapshot: CollectionSnapshot<ResumeRow>, materializationID: CollectionMaterializationID,
+    demand: CollectionDemandIdentity
+  ) async throws {
+    if holding {
+      waiting += 1
+      await withCheckedContinuation { held.append($0) }
+    }
+    try await base.replaceSnapshot(snapshot, materializationID: materializationID, demand: demand)
+  }
+
+  func apply(
+    _ batch: CollectionChangeBatch<ResumeRow, Int>,
+    to materializationID: CollectionMaterializationID
+  ) async throws {
+    try await base.apply(batch, to: materializationID)
+  }
+
+  func removeMaterialization(_ materializationID: CollectionMaterializationID) async throws {
+    try await base.removeMaterialization(materializationID)
+  }
+
+  func rebindMaterialization(
+    _ materializationID: CollectionMaterializationID, to demand: CollectionDemandIdentity
+  ) async throws -> Bool {
+    try await base.rebindMaterialization(materializationID, to: demand)
+  }
+}
+
+/// Forward the existing provider operations while leaving rebind to each provider's witness.
+private protocol ResumeStoreProvider: CollectionStore where Model == ResumeRow, Key == Int {
+  var base: InMemoryCollectionStore<ResumeRow, Int> { get }
+}
+
+extension ResumeStoreProvider {
+  func materialization(for demand: CollectionDemandIdentity) async throws
+    -> CollectionMaterializationRecord?
+  {
+    try await base.materialization(for: demand)
+  }
+
+  func staleMaterializations() async throws -> [CollectionStaleMaterialization] {
+    try await base.staleMaterializations()
+  }
+
+  func clearStale(
+    _ materializationID: CollectionMaterializationID, ifMarkedAt position: CollectionSourceVersion
+  ) async throws {
+    try await base.clearStale(materializationID, ifMarkedAt: position)
+  }
+
+  func replaceSnapshot(
+    _ snapshot: CollectionSnapshot<ResumeRow>, materializationID: CollectionMaterializationID,
+    demand: CollectionDemandIdentity
+  ) async throws {
+    try await base.replaceSnapshot(snapshot, materializationID: materializationID, demand: demand)
+  }
+
+  func apply(
+    _ batch: CollectionChangeBatch<ResumeRow, Int>, to materializationID: CollectionMaterializationID
+  ) async throws {
+    try await base.apply(batch, to: materializationID)
+  }
+
+  func removeMaterialization(_ materializationID: CollectionMaterializationID) async throws {
+    try await base.removeMaterialization(materializationID)
+  }
+}
+
+/// Deliberately inherits CollectionStore's default rebind implementation, as an older provider does.
+private struct SnapshotOnlyStore: ResumeStoreProvider {
+  let base: InMemoryCollectionStore<ResumeRow, Int>
+}
+
+private struct FailingRebindStore: ResumeStoreProvider {
+  let base: InMemoryCollectionStore<ResumeRow, Int>
+
+  struct RebindFailure: Error {}
+
+  func rebindMaterialization(
+    _: CollectionMaterializationID, to _: CollectionDemandIdentity
+  ) async throws -> Bool {
+    throw RebindFailure()
   }
 }
 
@@ -193,12 +361,75 @@ struct CollectionCoordinatorResumeTests {
     #expect(await source.stops == 1)
   }
 
-  /// Only a snapshot rebinds a copy an earlier generation stored to this demand, so a later
-  /// launch's acquire snapshots that copy rather than resuming it.
-  @Test func aCopyAnEarlierGenerationStoredSnapshotsRatherThanResumes() async throws {
+  /// A batch the resumed tail commits does not report the demand live: the feed may hold more
+  /// after it. Only the session's `caughtUp` does, once it has read to the feed's head.
+  @Test func aResumedTailThatCommittedABatchStaysCachedUntilItCatchesUp() async throws {
     let store = try await seededStore()
+    let source = ResumingSource(mode: .appliesThenCatchesUp, snapshotRows: [9])
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: resumeScope, source: source, store: store)
+
+    let lease = await coordinator.acquire(demandA)
+    #expect(await eventually { await source.resumes == 1 })
+    await source.signalCaughtUp()
+    #expect(await eventually { await source.appliedBatches == 1 })
+    #expect(await store.rowClaims(for: materializationA) == [1, 2, 3])
+    #expect(try await store.materialization(for: identityA)?.cursor?.offset == "a-11")
+    #expect(await lease.state() == .cached)
+
+    await source.signalCaughtUp()
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await source.materializations == 0)
+    try await lease.release()
+  }
+
+  /// A later launch's demand finds the copy an earlier generation stored by its `cacheKey`. The
+  /// store binds that copy to this generation without a snapshot, and the tail continues it.
+  @Test func aCopyAnEarlierGenerationStoredResumesBoundToThisGeneration() async throws {
+    let store = try await seededStore(markingA: true)
+    let stored = try #require(try await store.materialization(for: identityA))
+    let storedRows = await store.rows()
+    let storedMark = try #require(try await store.staleMaterializations().first)
     let source = ResumingSource(snapshotRows: [9])
     let nextLaunch = CollectionScope(principal: "u", authorization: "a", generation: "g2")
+    let nextIdentity = demandA.identity(for: rowDefinition, scope: nextLaunch)
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: nextLaunch, source: source, store: store)
+
+    let lease = await coordinator.acquire(demandA)
+    #expect(await eventually { await source.resumes == 1 })
+    await source.signalCaughtUp()
+
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await source.materializations == 0)
+    let rebound = try #require(try await store.materialization(for: nextIdentity))
+    #expect(rebound.id == materializationA)
+    #expect(rebound.demand == nextIdentity)
+    #expect(rebound.cursor == stored.cursor)
+    #expect(rebound.snapshotFence == stored.snapshotFence)
+    #expect(rebound.sourceVersion == stored.sourceVersion)
+    #expect(rebound.sourceVersion.rawValue == stored.sourceVersion.rawValue)
+    #expect(await store.rows() == storedRows)
+    #expect(await store.rowClaims(for: materializationA) == [1, 2])
+    #expect(
+      try await store.staleMaterializations() == [
+        CollectionStaleMaterialization(
+          record: rebound, markedAt: storedMark.markedAt, claimCount: storedMark.claimCount)
+      ])
+
+    // The copy is this generation's now: its eviction removes it.
+    try await lease.release()
+    try await coordinator.evict(demandA)
+    #expect(try await store.materialization(for: nextIdentity) == nil)
+    #expect(await store.rows().isEmpty)
+  }
+
+  @Test func aProviderUsingTheDefaultRebindSkipsResumeAndSnapshotsOnce() async throws {
+    let base = try await seededStore()
+    let store = SnapshotOnlyStore(base: base)
+    let source = ResumingSource(snapshotRows: [9])
+    let nextLaunch = CollectionScope(principal: "u", authorization: "a", generation: "g2")
+    let nextIdentity = demandA.identity(for: rowDefinition, scope: nextLaunch)
     let coordinator = CollectionCoordinator(
       definition: rowDefinition, scope: nextLaunch, source: source, store: store)
 
@@ -207,11 +438,31 @@ struct CollectionCoordinatorResumeTests {
     #expect(await eventually { await lease.state() == .live })
     #expect(await source.resumes == 0)
     #expect(await source.materializations == 1)
-    let rebound = try #require(
-      try await store.materialization(for: demandA.identity(for: rowDefinition, scope: nextLaunch)))
-    #expect(rebound.id == materializationA)
-    #expect(rebound.demand.scope == nextLaunch)
-    #expect(await store.rowClaims(for: materializationA) == [9])
+    #expect(await base.rowClaims(for: materializationA) == [9])
+    #expect(try await base.materialization(for: nextIdentity)?.demand == nextIdentity)
+    try await lease.release()
+  }
+
+  @Test func aThrowingRebindFailsAsStoreUnavailableWithoutSnapshotting() async throws {
+    let base = try await seededStore(markingA: true)
+    let stored = try await base.materialization(for: identityA)
+    let storedRows = await base.rows()
+    let storedMarks = try await base.staleMaterializations()
+    let source = ResumingSource(snapshotRows: [9])
+    let nextLaunch = CollectionScope(principal: "u", authorization: "a", generation: "g2")
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: nextLaunch, source: source,
+      store: FailingRebindStore(base: base))
+
+    let lease = await coordinator.acquire(demandA)
+
+    #expect(await eventually { await lease.state() == .failed(.storeUnavailable) })
+    #expect(await source.resumes == 0)
+    #expect(await source.materializations == 0)
+    #expect(try await base.materialization(for: identityA) == stored)
+    #expect(await base.rows() == storedRows)
+    #expect(await base.rowClaims(for: materializationA) == [1, 2])
+    #expect(try await base.staleMaterializations() == storedMarks)
     try await lease.release()
   }
 
@@ -243,32 +494,13 @@ struct CollectionCoordinatorResumeTests {
     #expect(await source.materializations == 0)
     #expect(await store.rowClaims(for: materializationA) == [1, 2])
 
-    // A refresh re-reads the source, so it snapshots rather than asking to resume.
-    await lease.refresh()
-    #expect(await eventually { await lease.state() == .live })
-    #expect(await source.resumes == 1)
-    #expect(await source.materializations == 1)
-    #expect(await store.rowClaims(for: materializationA) == [9])
-    try await lease.release()
-  }
-
-  /// A refresh is a re-read: it snapshots a copy an acquire would resume.
-  @Test func aRefreshSnapshotsACopyAnAcquireResumes() async throws {
-    let store = try await seededStore()
-    let source = ResumingSource(snapshotRows: [9])
-    let coordinator = CollectionCoordinator(
-      definition: rowDefinition, scope: resumeScope, source: source, store: store)
-
-    let lease = await coordinator.acquire(demandA)
-    #expect(await eventually { await source.resumes == 1 })
-    await source.signalCaughtUp()
-    #expect(await eventually { await lease.state() == .live })
-
-    await lease.refresh()
-    #expect(await eventually { await source.materializations == 1 })
-    #expect(await eventually { await lease.state() == .live })
-    #expect(await source.resumes == 1)
-    #expect(await store.rowClaims(for: materializationA) == [9])
+    // A resume the source could not set up says nothing about the stored cursor, so the retry
+    // asks again rather than re-querying the page.
+    await lease.refresh(.resume)
+    #expect(await eventually { await source.resumes == 2 })
+    #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
+    #expect(await source.materializations == 0)
+    #expect(await store.rowClaims(for: materializationA) == [1, 2])
     try await lease.release()
   }
 
@@ -292,8 +524,8 @@ struct CollectionCoordinatorResumeTests {
   }
 
   /// A transient failure says nothing about the stored cursor: the attempt fails without a
-  /// snapshot, and the next acquire resumes again rather than re-querying the page.
-  @Test func aTransientResumedTailFailureResumesAgainOnTheNextAcquire() async throws {
+  /// snapshot, and the retry resumes again rather than re-querying the page.
+  @Test func aTransientResumedTailFailureResumesAgainOnRetry() async throws {
     let store = try await seededStore()
     let source = ResumingSource(mode: .transientTailFailure, snapshotRows: [9])
     let coordinator = CollectionCoordinator(
@@ -303,13 +535,11 @@ struct CollectionCoordinatorResumeTests {
     #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
     #expect(await source.materializations == 0)
 
-    try await lease.release()
-
-    let again = await coordinator.acquire(demandA)
+    await lease.refresh(.resume)
     #expect(await eventually { await source.resumes == 2 })
     #expect(await source.materializations == 0)
     #expect(await store.rowClaims(for: materializationA) == [1, 2])
-    try await again.release()
+    try await lease.release()
   }
 
   /// Once the resumed tail has been reported live, a refused cursor fails the attempt as a
@@ -424,5 +654,218 @@ struct CollectionCoordinatorResumeTests {
     try await screen.release()
     pass.cancel()
     await pass.value
+  }
+}
+
+/// The caller decides, per acquire and per refresh, whether a stored copy may continue from its
+/// cursor (`.resume`) or must be read again (`.snapshot`).
+@Suite("Collection coordinator load mode")
+struct CollectionCoordinatorLoadModeTests {
+  @Test func aRefreshSnapshotsACopyAnAcquireResumes() async throws {
+    let store = try await seededStore()
+    let source = ResumingSource(snapshotRows: [9])
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: resumeScope, source: source, store: store)
+    let lease = await coordinator.acquire(demandA)
+    #expect(await eventually { await source.resumes == 1 })
+    await source.signalCaughtUp()
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await source.materializations == 0)
+    #expect(await store.rowClaims(for: materializationA) == [1, 2])
+
+    // A plain refresh re-reads even though the stored copy could resume.
+    await lease.refresh()
+    #expect(await eventually { await source.materializations == 1 })
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await source.resumes == 1)
+    #expect(await source.stops == 1)
+    #expect(await store.rowClaims(for: materializationA) == [9])
+    #expect(try await store.materialization(for: identityA)?.snapshotFence.rawValue == "snapshot-1")
+    try await lease.release()
+
+    // The next plain acquire continues the copy the refresh stored.
+    let acquired = await coordinator.acquire(demandA)
+    #expect(await eventually { await source.resumes == 2 })
+    #expect(await source.materializations == 1)
+    #expect(await store.rowClaims(for: materializationA) == [9])
+    try await acquired.release()
+  }
+
+  @Test func anExplicitResumeRefreshContinuesTheStoredCopy() async throws {
+    let store = try await seededStore()
+    let stored = try await store.materialization(for: identityA)
+    let source = ResumingSource(snapshotRows: [9])
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: resumeScope, source: source, store: store)
+    let lease = await coordinator.acquire(demandA)
+    #expect(await eventually { await source.resumes == 1 })
+    await source.signalCaughtUp()
+    #expect(await eventually { await lease.state() == .live })
+
+    await lease.refresh(.resume)
+
+    #expect(await eventually { await source.resumes == 2 })
+    #expect(await source.materializations == 0)
+    #expect(await source.stops == 1)
+    #expect(await store.rowClaims(for: materializationA) == [1, 2])
+    #expect(try await store.materialization(for: identityA) == stored)
+    #expect(await lease.state() == .cached)
+    await source.signalCaughtUp()
+    #expect(await eventually { await lease.state() == .live })
+    try await lease.release()
+  }
+
+  @Test func aSnapshotAcquireLoadsAStoredCopyWithoutAskingTheSourceToResume() async throws {
+    let store = try await seededStore()
+    let source = ResumingSource(snapshotRows: [9])
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: resumeScope, source: source, store: store)
+
+    let lease = await coordinator.acquire(demandA, mode: .snapshot)
+
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await source.resumes == 0)
+    #expect(await source.materializations == 1)
+    #expect(await store.rowClaims(for: materializationA) == [9])
+    try await lease.release()
+
+    // The same acquire with `.resume`, as without a mode, continues what that snapshot stored.
+    let resumed = await coordinator.acquire(demandA, mode: .resume)
+    #expect(await eventually { await source.resumes == 1 })
+    #expect(await source.materializations == 1)
+    try await resumed.release()
+  }
+
+  /// A snapshot the caller asked for is owed until one commits: the attempt that fails first is
+  /// followed by a snapshot even when the retry says resume is allowed. After it, resume is
+  /// allowed again.
+  @Test func aSnapshotStaysOwedUntilOneCommits() async throws {
+    let store = try await seededStore()
+    let source = ResumingSource(snapshotRows: [9], failingMaterializations: 1)
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: resumeScope, source: source, store: store)
+    let lease = await coordinator.acquire(demandA)
+    #expect(await eventually { await source.resumes == 1 })
+
+    await lease.refresh()
+    #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
+    #expect(await source.materializations == 1)
+    #expect(await store.rowClaims(for: materializationA) == [1, 2])
+
+    await lease.refresh(.resume)
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await source.materializations == 2)
+    #expect(await source.resumes == 1)
+    #expect(await store.rowClaims(for: materializationA) == [9])
+
+    await lease.refresh(.resume)
+    #expect(await eventually { await source.resumes == 2 })
+    #expect(await source.materializations == 2)
+    try await lease.release()
+  }
+
+  /// A snapshot refresh is answered by an attempt that starts after it. The attempt it replaces
+  /// can still commit a snapshot it read before the refresh was asked for; that snapshot does
+  /// not settle the request, and the replacement does not resume from it.
+  @Test func aSnapshotRefreshIsNotSettledByASnapshotReadBeforeIt() async throws {
+    let store = HeldSnapshotStore()
+    let source = ResumingSource(snapshotRows: [9])
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: resumeScope, source: source, store: store)
+    await store.hold()
+    let lease = await coordinator.acquire(demandA)
+    // The first attempt has read its snapshot and waits to commit it.
+    #expect(await eventually { await store.waiting == 1 })
+
+    await source.holdStops()
+    let refresh = Task { await lease.refresh(.snapshot) }
+    // The refresh is asked for, and is stopping the first attempt's session.
+    #expect(await eventually { await source.stopsWaiting == 1 })
+    await store.release()
+    #expect(await eventually { await lease.state() == .live })
+    #expect(try await store.materialization(for: identityA)?.snapshotFence.rawValue == "snapshot-1")
+
+    await source.releaseStops()
+    await refresh.value
+    #expect(await eventually { await source.materializations == 2 })
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await source.resumes == 0)
+    #expect(try await store.materialization(for: identityA)?.snapshotFence.rawValue == "snapshot-2")
+    try await lease.release()
+  }
+
+  /// A lease that asks for a snapshot and joins a demand whose attempt resumed replaces that
+  /// attempt, whether or not it had reported live: a resumed tail never read the source.
+  @Test(arguments: [false, true])
+  func aSnapshotAcquireReplacesAResumedAttemptItJoins(alreadyLive: Bool) async throws {
+    let store = try await seededStore()
+    let source = ResumingSource(snapshotRows: [9])
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: resumeScope, source: source, store: store)
+    let screen = await coordinator.acquire(demandA)
+    #expect(await eventually { await source.resumes == 1 })
+    if alreadyLive {
+      await source.signalCaughtUp()
+      #expect(await eventually { await screen.state() == .live })
+    }
+
+    let second = await coordinator.acquire(demandA, mode: .snapshot)
+
+    #expect(await eventually { await source.materializations == 1 })
+    #expect(await eventually { await second.state() == .live })
+    #expect(await screen.state() == .live)
+    #expect(await source.resumes == 1)
+    #expect(await source.stops == 1)
+    #expect(await store.rowClaims(for: materializationA) == [9])
+    try await screen.release()
+    try await second.release()
+  }
+
+  /// A lease that joins while the demand's last lease is being released is served by the
+  /// attempt that starts after the release, not by the one on its way out. Asked for a snapshot,
+  /// that attempt takes one, though the store now holds a copy it could resume.
+  @Test func aSnapshotAcquireDuringAReleaseSnapshotsInTheAttemptThatFollows() async throws {
+    let store = try await seededStore()
+    let source = ResumingSource(snapshotRows: [9])
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: resumeScope, source: source, store: store)
+    let first = await coordinator.acquire(demandA, mode: .snapshot)
+    #expect(await eventually { await first.state() == .live })
+
+    await source.holdStops()
+    let releasing = Task { try await first.release() }
+    #expect(await eventually { await source.stopsWaiting == 1 })
+    let second = await coordinator.acquire(demandA, mode: .snapshot)
+    await source.releaseStops()
+    try await releasing.value
+
+    #expect(await eventually { await source.materializations == 2 })
+    #expect(await eventually { await second.state() == .live })
+    #expect(await source.resumes == 0)
+    try await second.release()
+  }
+
+  /// An attempt that took its own snapshot already read the source, so a later lease that asks
+  /// for a snapshot shares it. `refresh(.snapshot)` is the way to read again regardless.
+  @Test func aSnapshotAcquireSharesAnAttemptThatSnapshotted() async throws {
+    let store = try await seededStore()
+    let source = ResumingSource(snapshotRows: [9])
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: resumeScope, source: source, store: store)
+    let first = await coordinator.acquire(demandA, mode: .snapshot)
+    #expect(await eventually { await first.state() == .live })
+
+    let second = await coordinator.acquire(demandA, mode: .snapshot)
+    // A replaced attempt would report `.refreshing` from the acquire on.
+    #expect(await second.state() == .live)
+    #expect(await source.materializations == 1)
+    #expect(await source.stops == 0)
+
+    await second.refresh(.snapshot)
+    #expect(await eventually { await source.materializations == 2 })
+    #expect(await eventually { await first.state() == .live })
+    #expect(await source.resumes == 0)
+    try await first.release()
+    try await second.release()
   }
 }

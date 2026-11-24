@@ -73,7 +73,8 @@ OpenAPI document. Given `ShapeResponse.streamUrl`:
 | Operation | Request | Result | Stable semantics |
 | --- | --- | --- | --- |
 | frontier | `HEAD streamUrl` | `stream-next-offset` header | The nonempty header is the opaque resume cursor. Its absence on success is malformed. It fences a subset snapshot: create feed → `HEAD` frontier → snapshot → read from that frontier, under the same source receipt. |
-| read | `GET streamUrl?offset=<opaque>&live=long-poll` | JSON array and `stream-next-offset` | Apply rows and checkpoint atomically. A nonempty array without a next offset is malformed. Empty array, empty body, or `204` may still advance the cursor when the header differs. |
+| read to the head | `GET streamUrl?offset=<opaque>` with no `live` | JSON array, `stream-next-offset` and optional `stream-up-to-date` | Answers without waiting with the entries after the offset, or an empty array at the head. Apply rows and checkpoint atomically. `stream-up-to-date` marks an answer that ends at the stream's head; the client sends `Cache-Control: no-cache` for this read. |
+| read | `GET streamUrl?offset=<opaque>&live=long-poll` | JSON array and `stream-next-offset` | Apply rows and checkpoint atomically. A nonempty array without a next offset is malformed. Empty array, empty body, or `204` may still advance the cursor when the header differs. At the head the server may hold the request for its poll window, so resumed reads use the head read first. |
 | live read (SSE) | `GET streamUrl?offset=<opaque>&live=sse` | `event: data` and `event: control` frames | Each data frame is followed by a control whose `streamNextOffset` ends that batch; apply and checkpoint at the control. A read that opens at the tail first sends a control with `upToDate: true` and `streamNextOffset` equal to the requested offset, and repeats it while idle, so an idle answer arrives without new data (durable-streams-rust `handle_sse`, required by its conformance suite). `streamClosed: true` is terminal. |
 
 An envelope is `{ type, key, value?, old?, headers }`. `headers.operation` is `insert`, `update`,
@@ -101,6 +102,33 @@ rows, since the cursor it holds still sits before the marker and the next read w
 discarding the retired generation's materialization scope and cursor; never reuse its offset. Other
 transport/nonterminal HTTP failures are retryable only under the caller/coordinator's bounded retry
 policy. Reset/recreate starts a new scope keyed by principal, template, subscription, and generation.
+
+## Live envelope position
+
+Every change on the engine's changes-only streams carries a parseable PostgreSQL LSN in
+`headers.lsn`, including removals for rows that left a scope while held only by a snapshot (engine
+removals fix #70) and subquery changes and deletes (engine commit-position fix #71, on engine main
+at `5b2cf3e`). Along one stream positions never decrease; equal positions are ordered by stream
+offset. A client applies a change for a key when its position is at or above the last position it
+applied for that key, and treats lower positions as replays.
+
+A snapshot is consulted only for a key that has received no live envelope since the snapshot was
+taken. A resumed tail consults its snapshot only while its cursor is still the snapshot's own
+frontier, then applies later envelopes without using the snapshot as a filter. A row envelope is
+the row or its absence, so a positioned delete removes a row the snapshot supplied even when the
+feed never delivered that row before.
+
+An envelope without a parseable `headers.lsn` is refused as an invalid live source version. The
+whole batch is rejected before any row or cursor change, and the next attempt loads by snapshot;
+the stream serves that batch again at the same cursor.
+
+## Live after a resume
+
+A resumed source reports `cached` until it has applied every answer through the stream's head, then
+reports `live`. The source first reads without `live` so a long-poll does not wait at the head;
+`stream-up-to-date` or an SSE control with `upToDate: true` marks the answer that reaches the head.
+An answer carrying changes is committed before the source reports `live`; a batch alone does not
+prove that no later batch is already stored.
 
 ## Feed continuity
 

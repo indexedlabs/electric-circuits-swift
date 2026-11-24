@@ -14,6 +14,25 @@ public enum CollectionLoadState: Equatable, Sendable {
   case failed(CollectionLoadFailure)
 }
 
+/// What an attempt may start from when the store already holds a copy of its demand.
+///
+/// The caller owns the policy. `.resume` fits wherever continuing from the stored cursor is good
+/// enough: a first load in a launch, a retry after a failure. `.snapshot` fits wherever the
+/// stored rows themselves are in doubt (the scope was marked stale, its authority was read
+/// again, another holder handed it over), because a resumed tail applies only what the feed
+/// carries after the stored cursor and never reads the source again.
+public enum CollectionLoadMode: Equatable, Sendable {
+  /// Continue the stored copy from its cursor when the source can
+  /// (`CollectionSourceAdapter.resume`), and take a snapshot when it cannot. What
+  /// `CollectionCoordinator.acquire(_:)` and `CollectionLease.refresh(.resume)` do.
+  case resume
+  /// Take a new snapshot and replace the stored copy's rows with it, without asking the source
+  /// to resume, as a plain `CollectionLease.refresh()` does. The demand owes that snapshot until
+  /// one commits: an attempt that fails first is followed by another snapshot, whatever mode
+  /// asks for it. The debt ends with the demand's last lease.
+  case snapshot
+}
+
 /// An eviction cannot invalidate a materialization while it has an active or transitioning lease.
 public enum CollectionEvictionError: Error, Equatable, Sendable {
   case activeDemand
@@ -26,7 +45,7 @@ public actor CollectionLease {
 
   fileprivate nonisolated let id: UUID
   private let stateAction: @Sendable (UUID) async -> CollectionLoadState
-  private let refreshAction: @Sendable (UUID) async -> Void
+  private let refreshAction: @Sendable (UUID, CollectionLoadMode) async -> Void
   private let releaseAction: @Sendable (UUID) async throws -> Void
   private var released = false
 
@@ -34,7 +53,7 @@ public actor CollectionLease {
     id: UUID,
     stateUpdates: AsyncStream<CollectionLoadState>,
     stateAction: @escaping @Sendable (UUID) async -> CollectionLoadState,
-    refreshAction: @escaping @Sendable (UUID) async -> Void,
+    refreshAction: @escaping @Sendable (UUID, CollectionLoadMode) async -> Void,
     releaseAction: @escaping @Sendable (UUID) async throws -> Void
   ) {
     self.id = id
@@ -49,12 +68,23 @@ public actor CollectionLease {
     return await stateAction(id)
   }
 
-  /// Stops the lease's session and materializes the demand again with a new snapshot and feed.
-  /// A refresh always re-reads the source, even when the store holds a copy that an acquire
-  /// would resume from its stored cursor.
+  /// Always re-reads the source by replacing the demand's current attempt with a new snapshot,
+  /// as `refresh(.snapshot)` does, for every lease that shares it. To continue from the stored
+  /// cursor instead, call `refresh(.resume)`.
   public func refresh() async {
+    await refresh(.snapshot)
+  }
+
+  /// Replaces the demand's current attempt with a new one, for every lease that shares it.
+  ///
+  /// With `.resume` the new attempt continues the stored copy from its cursor when the source
+  /// can and snapshots otherwise: the way to retry after a failure. With `.snapshot` it takes a
+  /// new snapshot, which replaces the stored rows: the way to read the source again when the
+  /// stored rows are in doubt, and the default for plain `refresh()`. A snapshot the demand
+  /// still owes (`CollectionLoadMode.snapshot`) is taken in either mode.
+  public func refresh(_ mode: CollectionLoadMode) async {
     guard !released else { return }
-    await refreshAction(id)
+    await refreshAction(id, mode)
   }
 
   public func release() async throws {
@@ -122,10 +152,17 @@ public actor CollectionCoordinator<
     var releaseTask: Task<Void, Error>?
     var awaitsEviction: Bool
     var snapshotRowCount: Int?
-    /// The next attempt must take the snapshot path even when the store holds an exact record.
-    /// Set by the stale pass and by every refresh, each a re-read; cleared once a snapshot
-    /// commits, so after a refresh's snapshot fails the entry's next restart snapshots too.
+    /// The attempt must take the snapshot path even when the store holds a copy it could
+    /// resume. Set by a lease that asks for a snapshot (`CollectionLoadMode.snapshot`), which is
+    /// also how the stale pass revalidates; cleared once a snapshot commits.
     var requiresSnapshot = false
+    /// A snapshot is owed by the attempt that starts next, not by the one in place: a
+    /// `refresh(.snapshot)`, which replaces the attempt in place, or a lease that asked for a
+    /// snapshot while that attempt was already on its way out. The outgoing attempt may still
+    /// commit a snapshot it read before the request, and that commit clears `requiresSnapshot`;
+    /// so the request waits here, and `startAttempt` turns it into `requiresSnapshot` for the
+    /// attempt it starts.
+    var nextAttemptRequiresSnapshot = false
     /// The attempt currently continuing a stored cursor through `source.resume`, if any.
     var resumingAttempt: UUID?
   }
@@ -586,14 +623,11 @@ public actor CollectionCoordinator<
         activeIdentity.cacheKey == storedIdentity.cacheKey
       {
         // Revalidation is a fresh snapshot: a resumed tail neither reports a row count nor
-        // proves, once this lease releases it, that it reached the drop position.
-        let lease = acquire(demand, requiringSnapshot: true)
+        // proves, once this lease releases it, that it reached the drop position. So the pass
+        // asks as any caller does, and a resumed attempt its lease joins is replaced.
+        let lease = acquire(demand, mode: .snapshot)
         staleLeaseIDs[id] = lease.id
-        if let joined = entries[activeIdentity], joined.resumingAttempt == joined.attempt {
-          // The shared entry's current attempt chose to resume before this lease joined it, so
-          // it will never report a snapshot. Restart it; the new attempt sees the requirement.
-          await lease.refresh()
-        }
+        await entries[activeIdentity]?.refreshTask?.value
         rowsReturned = try await staleSnapshotRowCount(for: lease, identity: activeIdentity)
         let refreshedID = entries[activeIdentity]?.materializationID
         guard stalePassMayRun(token) else { throw CancellationError() }
@@ -665,8 +699,31 @@ public actor CollectionCoordinator<
     return max(0, Double(components.seconds) + Double(components.attoseconds) / 1e18)
   }
 
+  /// Takes a lease on `demand`, as `acquire(_:mode:)` does with `.resume`.
   public func acquire(_ demand: CollectionDemand<Model>) -> CollectionLease {
-    acquire(demand, requiringSnapshot: false)
+    acquire(demand, mode: .resume)
+  }
+
+  /// Takes a lease on `demand`, sharing the attempt of every other lease on the same demand.
+  ///
+  /// With `.resume`, a demand the store already holds continues from its stored cursor when the
+  /// source can, and snapshots otherwise. With `.snapshot` it is loaded by a new snapshot, which
+  /// replaces the stored rows, as every acquire was before a source could resume. A lease that
+  /// joins a demand another lease already holds shares that demand's attempt: `.snapshot`
+  /// replaces an attempt that resumed, and leaves one that took its own snapshot, however long
+  /// ago, as it is. To read the source again regardless, call `refresh()` on the lease.
+  public func acquire(_ demand: CollectionDemand<Model>, mode: CollectionLoadMode)
+    -> CollectionLease
+  {
+    let lease = acquire(demand, requiringSnapshot: mode == .snapshot)
+    if mode == .snapshot, let identity = demandByLease[lease.id], let joined = entries[identity],
+      joined.resumingAttempt == joined.attempt
+    {
+      // The attempt this lease joined chose to resume before the lease asked for a snapshot,
+      // so it will never take one. Replace it with one that does.
+      _ = beginRefresh(identity, requiringSnapshot: true)
+    }
+    return lease
   }
 
   private func acquire(
@@ -679,12 +736,21 @@ public actor CollectionCoordinator<
 
     if var entry = entries[identity] {
       entry.leases[leaseID] = updates.continuation
-      if requiringSnapshot { entry.requiresSnapshot = true }
       let shouldRetry = {
         guard case .failed = entry.state else { return false }
         return entry.task == nil && entry.stop == nil && entry.releaseToken == nil
           && !entry.awaitsEviction
       }()
+      if requiringSnapshot {
+        if entry.releaseToken != nil || entry.refreshTask != nil {
+          // The attempt in place is on its way out; the one that follows serves this lease.
+          entry.nextAttemptRequiresSnapshot = true
+        } else if shouldRetry || entry.snapshotRowCount == nil {
+          // The attempt this lease joins settles the request once it has committed a snapshot
+          // of its own; only an attempt still to start, or still to commit, owes one.
+          entry.requiresSnapshot = true
+        }
+      }
       if shouldRetry {
         entry.attempt = UUID()
         entry.state = .unavailable
@@ -724,7 +790,7 @@ public actor CollectionCoordinator<
       id: leaseID,
       stateUpdates: updates.stream,
       stateAction: { await self.state(for: $0) },
-      refreshAction: { await self.refresh(leaseID: $0) },
+      refreshAction: { await self.refresh(leaseID: $0, mode: $1) },
       releaseAction: { try await self.release(leaseID: $0) }
     )
   }
@@ -756,6 +822,10 @@ public actor CollectionCoordinator<
     entry.task = task
     entry.snapshotRowCount = nil
     entry.resumingAttempt = nil
+    if entry.nextAttemptRequiresSnapshot {
+      entry.requiresSnapshot = true
+      entry.nextAttemptRequiresSnapshot = false
+    }
     entries[identity] = entry
   }
 
@@ -774,10 +844,11 @@ public actor CollectionCoordinator<
       guard updateEntry(identity: identity, attempt: attempt, state: .cached) else { return }
       guard var entry = entries[identity], entry.attempt == attempt else { return }
       entry.materializationID = cached.id
-      // Only a snapshot rebinds a copy an earlier generation stored to this demand
-      // (`replaceSnapshot`); a resumed tail would leave it bound to that generation, which
-      // `evict(_:)` and the stale pass key on. So only a copy already bound here resumes.
-      let resumes = !entry.requiresSnapshot && cached.demand == identity
+      // The copy under this `cacheKey` resumes whichever generation stored it. `evict(_:)` and
+      // the stale pass key on the copy's binding, so a copy an earlier generation stored is
+      // bound to this demand first: by the store (`rebindMaterialization`, in `runResumed`)
+      // when it resumes, or by `replaceSnapshot` when it snapshots.
+      let resumes = !entry.requiresSnapshot && cached.demand.cacheKey == identity.cacheKey
       if resumes { entry.resumingAttempt = attempt }
       entries[identity] = entry
       if resumes, await runResumed(from: cached, identity: identity, attempt: attempt) { return }
@@ -867,14 +938,19 @@ public actor CollectionCoordinator<
     }
   }
 
-  /// Continues an exact cached materialization from its committed cursor. Returns false when the
-  /// source declines, the stored record moved while it was asked, or the feed refuses the stored
-  /// cursor (`CollectionResumeInvalidated`) before the tail went live, and the attempt must take
-  /// the snapshot path; true when this attempt has finished, failed or been superseded. A
-  /// transient failure fails the attempt and leaves the cursor resumable by the next acquire; a
-  /// refresh always snapshots.
+  /// Continues the stored copy for this demand from its committed cursor, whichever generation
+  /// stored it. Returns false when the store cannot bind an earlier generation's copy without a
+  /// snapshot, the source declines, the stored record moved while it was asked, or the feed
+  /// refuses the stored cursor (`CollectionResumeInvalidated`) before the tail went live, and the
+  /// attempt must take the snapshot path; true when this attempt has finished, failed or been
+  /// superseded. A transient failure fails the attempt and leaves the cursor resumable by the
+  /// next one.
   ///
   /// The snapshot path's per-acquire invariants, and how a resumed attempt keeps them:
+  /// - Binding: a copy an earlier generation stored is bound to this demand by
+  ///   `rebindMaterialization` before the tail runs, as `replaceSnapshot` would have bound it, so
+  ///   `evict(_:)` and the stale pass treat it as this generation's. The precondition on `init`
+  ///   (the earlier generation has released its leases) is what makes that safe.
   /// - Rows and claims: there is no `replaceSnapshot`, so no omission pass marks other holders
   ///   and no provider claim takeover runs. Neither is owed: the stored claims are exactly what
   ///   this materialization's snapshot and feed established up to the stored cursor (any takeover
@@ -886,9 +962,10 @@ public actor CollectionCoordinator<
   ///   again after the source call, and the first batch expects that cursor, so the store's
   ///   compare-and-set rejects an interleaved writer instead of the tail skipping or replaying.
   /// - `snapshotRowCount` stays nil because no snapshot was taken. The stale pass, which needs
-  ///   one, acquires with `requiresSnapshot` and refreshes a resumed attempt it joins.
+  ///   one, acquires in snapshot mode, which replaces a resumed attempt it joins.
   /// - Readiness: the demand stays `.cached` (its rows are already local) and reports `.live` only
-  ///   after the tail commits a batch or answers an idle poll from the stored cursor.
+  ///   when the session says the tail has read to the feed's head (`caughtUp`). A batch the tail
+  ///   commits on the way there changes the store, not the state.
   private func runResumed(
     from record: CollectionMaterializationRecord,
     identity: CollectionDemandIdentity,
@@ -896,6 +973,25 @@ public actor CollectionCoordinator<
   ) async -> Bool {
     guard let entry = entries[identity], entry.attempt == attempt, !entry.leases.isEmpty else {
       return true
+    }
+    if record.demand != identity {
+      // An earlier generation stored this copy. Bind it to this demand before asking the source,
+      // so a store that binds only by snapshot costs no request before the snapshot path.
+      let rebound: Bool
+      do {
+        rebound = try await store.rebindMaterialization(record.id, to: identity)
+      } catch is CancellationError {
+        return true
+      } catch {
+        fail(identity: identity, attempt: attempt, with: .storeUnavailable)
+        return true
+      }
+      guard let current = entries[identity], current.attempt == attempt, !current.leases.isEmpty
+      else { return true }
+      guard rebound else {
+        clearResumingAttempt(identity: identity, attempt: attempt)
+        return false
+      }
     }
     let resumed: CollectionResumeSession<Model, Key>?
     do {
@@ -949,9 +1045,9 @@ public actor CollectionCoordinator<
     do {
       try await session.run(
         { batch in
+          // A committed batch is not yet live: the feed may hold more after it.
           try Task.checkCancellation()
           try await self.apply(batch, identity: identity, attempt: attempt)
-          await self.markResumedLive(identity: identity, attempt: attempt)
         },
         { await self.markResumedLive(identity: identity, attempt: attempt) }
       )
@@ -986,7 +1082,7 @@ public actor CollectionCoordinator<
     return true
   }
 
-  /// The resumed tail has read past its stored cursor: report the cached demand live. A refresh,
+  /// The resumed tail has read to its feed's head: report the cached demand live. A refresh,
   /// failure or replacement attempt already owns the state, so only `.cached` advances.
   private func markResumedLive(identity: CollectionDemandIdentity, attempt: UUID) {
     guard let entry = entries[identity], entry.attempt == attempt, entry.state == .cached else {
@@ -1105,14 +1201,27 @@ public actor CollectionCoordinator<
     }
   }
 
-  private func refresh(leaseID: UUID) async {
-    guard let identity = demandByLease[leaseID], var entry = entries[identity],
-      entry.releaseToken == nil
-    else { return }
-    if let task = entry.refreshTask {
-      await task.value
-      return
+  private func refresh(leaseID: UUID, mode: CollectionLoadMode) async {
+    guard let identity = demandByLease[leaseID] else { return }
+    await beginRefresh(identity, requiringSnapshot: mode == .snapshot)?.value
+  }
+
+  /// Starts replacing the demand's current attempt and returns the task that does, or the one
+  /// already doing so; nil while the demand's last lease is being released. With
+  /// `requiringSnapshot` the attempt that starts next snapshots, whichever caller began the
+  /// replacement and whatever the attempt being replaced commits on its way out.
+  private func beginRefresh(
+    _ identity: CollectionDemandIdentity, requiringSnapshot: Bool = false
+  ) -> Task<Void, Never>? {
+    guard var entry = entries[identity] else { return nil }
+    if requiringSnapshot {
+      // Kept even when nothing is started here: the attempt that follows a release in flight,
+      // for a lease that joined during it, takes the snapshot.
+      entry.nextAttemptRequiresSnapshot = true
+      entries[identity] = entry
     }
+    guard entry.releaseToken == nil else { return nil }
+    if let task = entry.refreshTask { return task }
     let token = UUID()
     let task = Task { [weak self] in
       guard let self else { return }
@@ -1123,7 +1232,7 @@ public actor CollectionCoordinator<
     entry.state = .refreshing
     entries[identity] = entry
     for continuation in entry.leases.values { continuation.yield(.refreshing) }
-    await task.value
+    return task
   }
 
   private func release(leaseID: UUID) async throws {
@@ -1202,9 +1311,6 @@ public actor CollectionCoordinator<
     entry.refreshToken = nil
     entry.refreshTask = nil
     entry.state = .unavailable
-    // A refresh is a re-read of the source: its attempt snapshots even when the store holds a
-    // copy it could resume. Resume serves acquires.
-    entry.requiresSnapshot = true
     entries[identity] = entry
     for continuation in entry.leases.values { continuation.yield(.unavailable) }
     startAttempt(for: identity, attempt: nextAttempt)
@@ -1288,9 +1394,9 @@ public actor CollectionCoordinator<
   /// in flight are fenced behind it and receive a fresh source attempt after it completes. Only a
   /// copy still bound to this coordinator's demand (its generation included) is removed: once
   /// another generation's snapshot has bound the copy, it is that generation's, and a retired
-  /// generation's eviction leaves it. A copy an earlier launch stored and this launch has not
-  /// loaded is bound to the earlier launch's demand, so this does nothing for it; remove such
-  /// copies through the store, as an app's age-based eviction does.
+  /// generation's eviction leaves it. A copy an earlier launch stored and this launch has neither
+  /// loaded nor resumed is bound to the earlier launch's demand, so this does nothing for it;
+  /// remove such copies through the store, as an app's age-based eviction does.
   public func evict(_ demand: CollectionDemand<Model>) async throws {
     let identity = demand.identity(for: definition, scope: scope, columns: source.columns)
     if let task = evictionTasks[identity.cacheKey] {

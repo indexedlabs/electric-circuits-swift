@@ -521,11 +521,25 @@ public struct ShapeStreamReader: Sendable {
   public let initialCursor: StreamCursor
   public let telemetry: TelemetryReporter
   public let responseDecodingLimits: ResponseDecodingLimits
+  /// Called once, when the reader has first read to the stream's head; see `init`.
+  public let onCaughtUp: (@Sendable (StreamCursor) async -> Void)?
   private let resumesFromMaterializer: Bool
   private let liveReadState: LiveReadState
   private let silenceTimeout: Duration
   private static let sseSilenceTimeout: Duration = .seconds(45)
 
+  /// `onCaughtUp` asks the reader to read to the stream's head before it tails, and to say when
+  /// it is there. A reader that starts from a cursor stored earlier uses it to learn whether what
+  /// it holds is current, without waiting for a change or for a long-poll window to run out.
+  ///
+  /// With it, a long-poll reader's reads carry no `live` parameter until one is answered as up
+  /// to date: the stream answers such a read at once, with whatever follows the offset, where it
+  /// holds a long-poll at the head for the poll window. An SSE reader sends no other request: the
+  /// stream's control event says when a read has reached the head. Either way the closure is
+  /// called once per reader, with the committed cursor, after every change the up-to-date answer
+  /// carried has been applied, and never while an answer that was not up to date is the last one
+  /// read. The reader then continues with live reads. Without it (the default) every read is a
+  /// live read and nothing is reported.
   public init(
     streamURL: URL,
     transport: any HTTPTransport,
@@ -533,12 +547,14 @@ public struct ShapeStreamReader: Sendable {
     startingAt cursor: StreamCursor? = nil,
     telemetry: TelemetryReporter = .noop,
     responseDecodingLimits: ResponseDecodingLimits = .default,
-    configuration: ElectricCircuitsClient.Configuration = .default
+    configuration: ElectricCircuitsClient.Configuration = .default,
+    onCaughtUp: (@Sendable (StreamCursor) async -> Void)? = nil
   ) {
     self.init(
       streamURL: streamURL, transport: transport, materializer: materializer,
       startingAt: cursor, telemetry: telemetry, responseDecodingLimits: responseDecodingLimits,
-      configuration: configuration, sseSilenceTimeout: Self.sseSilenceTimeout)
+      configuration: configuration, onCaughtUp: onCaughtUp,
+      sseSilenceTimeout: Self.sseSilenceTimeout)
   }
 
   init(
@@ -549,16 +565,19 @@ public struct ShapeStreamReader: Sendable {
     telemetry: TelemetryReporter = .noop,
     responseDecodingLimits: ResponseDecodingLimits = .default,
     configuration: ElectricCircuitsClient.Configuration = .default,
+    onCaughtUp: (@Sendable (StreamCursor) async -> Void)? = nil,
     sseSilenceTimeout: Duration
   ) {
     self.liveReadState = LiveReadState(
       configuration: configuration,
-      maximumEventBytes: responseDecodingLimits.maximumDecodedResponseBytes)
+      maximumEventBytes: responseDecodingLimits.maximumDecodedResponseBytes,
+      owesHeadReport: onCaughtUp != nil)
     self.streamURL = streamURL
     self.transport = transport
     self.materializer = materializer
     self.telemetry = telemetry
     self.responseDecodingLimits = responseDecodingLimits
+    self.onCaughtUp = onCaughtUp
     self.silenceTimeout = sseSilenceTimeout
     initialCursor = cursor ?? .beginning
     resumesFromMaterializer = cursor == nil
@@ -603,20 +622,46 @@ public struct ShapeStreamReader: Sendable {
         }
         await liveReadState.setMaximumEventBytes(await response.maximumEventBytes)
         (cursor, expectedCursor) = await response.checkpoint()
-      } else if let result = try await poll(at: cursor) {
-        cursor = try await commit(result, expecting: expectedCursor)
-        expectedCursor = cursor
+      } else {
+        // Until the head has been reported, a read must not wait at it: see `init`.
+        let catchingUp = await liveReadState.owesHeadReport
+        let answer = try await poll(at: cursor, live: !catchingUp)
+        if let result = answer.result {
+          cursor = try await commit(result, expecting: expectedCursor)
+          expectedCursor = cursor
+        }
+        // A read without `live` that brought nothing and moved nowhere found nothing after the
+        // cursor, whether or not the server marks its answers.
+        if catchingUp, answer.upToDate || answer.result == nil {
+          await reportCaughtUp(at: cursor)
+        }
       }
     }
+  }
+
+  /// Reports the stream's head to `onCaughtUp`, once per reader however many reads reach it.
+  private func reportCaughtUp(at cursor: StreamCursor) async {
+    guard let onCaughtUp, await liveReadState.takeHeadReport() else { return }
+    await onCaughtUp(cursor)
   }
 
   private actor LiveReadState {
     private let configuration: ElectricCircuitsClient.Configuration
     private var fellBack = false
     private(set) var maximumEventBytes: Int
-    init(configuration: ElectricCircuitsClient.Configuration, maximumEventBytes: Int) {
+    /// Whether `onCaughtUp` is still to be called. It outlasts a retry, like the SSE fallback.
+    private(set) var owesHeadReport: Bool
+    init(
+      configuration: ElectricCircuitsClient.Configuration, maximumEventBytes: Int,
+      owesHeadReport: Bool
+    ) {
       self.configuration = configuration
       self.maximumEventBytes = maximumEventBytes
+      self.owesHeadReport = owesHeadReport
+    }
+    func takeHeadReport() -> Bool {
+      defer { owesHeadReport = false }
+      return owesHeadReport
     }
     /// Resolved before each live read; a fallback from SSE outlasts any later answer.
     var mode: LiveReadMode { fellBack ? .longPoll : configuration.liveReadMode }
@@ -688,7 +733,7 @@ public struct ShapeStreamReader: Sendable {
   }
 
   private func readSSE(at cursor: StreamCursor, into receiver: SSEReadSession) async throws {
-    var request = try streamRequest(at: cursor, mode: .sse)
+    var request = try streamRequest(at: cursor, live: .sse)
     request = transport.prepare(request)
     let span = telemetry.beginSpan(
       name: "electric.stream.sse", kind: .client,
@@ -854,6 +899,7 @@ public struct ShapeStreamReader: Sendable {
           }
           lastActivity = clock.now
           sawControl = true
+          var committedHere = false
           if let offset = control.streamNextOffset, !offset.isEmpty, offset != cursor.offset {
             let lsn = pending.envelopes.reversed().compactMap { $0.headers.lsn }.first ?? cursor.lsn
             committing = true
@@ -871,9 +917,23 @@ public struct ShapeStreamReader: Sendable {
             pending = ChangeBatch()
             pendingServerTime = nil
             pendingReceivedAt = nil
+            committedHere = true
           }
           if control.streamClosed == true {
             throw StreamError.terminal(path: reader.streamURL.path, status: 200, reason: .closed)
+          }
+          // The stream has nothing after the committed cursor when the control that names it
+          // says so, or brought nothing: the stream sends one of those when a read opens at
+          // the head, and repeats it while idle.
+          if control.streamNextOffset == cursor.offset, pending.isEmpty,
+            control.upToDate == true || !committedHere
+          {
+            committing = true
+            defer {
+              committing = false
+              lastActivity = clock.now
+            }
+            await reader.reportCaughtUp(at: cursor)
           }
         default: break
         }
@@ -884,6 +944,7 @@ public struct ShapeStreamReader: Sendable {
     private struct Control: Decodable {
       let streamNextOffset: String?
       let streamClosed: Bool?
+      let upToDate: Bool?
     }
   }
 
@@ -897,12 +958,25 @@ public struct ShapeStreamReader: Sendable {
     var receivedAt: Int64 = LiveDelivery.now()
   }
 
-  private func streamRequest(at cursor: StreamCursor, mode: LiveReadMode) throws -> URLRequest {
+  /// One read's answer: what to commit, and whether the stream said it ends at the head.
+  private struct PollAnswer: Sendable {
+    /// Nil when the answer carried neither changes nor a new offset.
+    let result: PollResult?
+    /// The answer carried `stream-up-to-date`: the stream held nothing after it when it was
+    /// written.
+    let upToDate: Bool
+  }
+
+  /// A read from `cursor`. `mode` is its `live` parameter; without one the stream answers at
+  /// once with whatever follows the offset, which is how a reader asks where the head is.
+  private func streamRequest(at cursor: StreamCursor, live mode: LiveReadMode?) throws
+    -> URLRequest
+  {
     var components = URLComponents(url: streamURL, resolvingAgainstBaseURL: false)
     var query = components?.queryItems ?? []
     query.removeAll { $0.name == "offset" || $0.name == "live" }
     query.append(URLQueryItem(name: "offset", value: cursor.offset))
-    query.append(URLQueryItem(name: "live", value: mode.rawValue))
+    if let mode { query.append(URLQueryItem(name: "live", value: mode.rawValue)) }
     components?.queryItems = query
     guard let url = components?.url else { throw StreamError.invalidResponse }
 
@@ -910,11 +984,18 @@ public struct ShapeStreamReader: Sendable {
     request.httpMethod = "GET"
     request.setValue(
       mode == .sse ? "text/event-stream" : "application/json", forHTTPHeaderField: "Accept")
+    if mode == nil {
+      // The answer says whether the offset is the head now. The stream server lets a read
+      // without `live` be cached, and a cached answer would say where the head was.
+      request.cachePolicy = .reloadIgnoringLocalCacheData
+      request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+    }
     return request
   }
 
-  private func poll(at cursor: StreamCursor) async throws -> PollResult? {
-    var request = try streamRequest(at: cursor, mode: .longPoll)
+  /// One long-poll, or with `live` false one read that does not wait at the head.
+  private func poll(at cursor: StreamCursor, live: Bool) async throws -> PollAnswer {
+    var request = try streamRequest(at: cursor, live: live ? .longPoll : nil)
     request = transport.prepare(request)
     let span = telemetry.beginSpan(
       name: "electric.stream.poll", kind: .client,
@@ -947,6 +1028,11 @@ public struct ShapeStreamReader: Sendable {
     ]
     let nextOffset = headers.value(forHTTPHeaderField: "stream-next-offset")
     let closed = headers.value(forHTTPHeaderField: "stream-closed")?.lowercased() == "true"
+    // Present on an answer that ends at the head; servers write it as `true` or `1`.
+    let upToDate =
+      headers.value(forHTTPHeaderField: "stream-up-to-date").map {
+        !["false", "0"].contains($0.lowercased())
+      } ?? false
 
     if closed {
       telemetry.endSpan(span, attributes: attributes)
@@ -962,7 +1048,8 @@ public struct ShapeStreamReader: Sendable {
     if headers.statusCode == 204 {
       telemetry.endSpan(span, attributes: attributes)
       telemetry.recordCounter("electric.http.requests", attributes: attributes)
-      return emptyPollResult(nextOffset: nextOffset, preserving: cursor)
+      return PollAnswer(
+        result: emptyPollResult(nextOffset: nextOffset, preserving: cursor), upToDate: upToDate)
     }
     guard (200..<300).contains(headers.statusCode) else {
       telemetry.endSpan(span, attributes: attributes)
@@ -984,7 +1071,8 @@ public struct ShapeStreamReader: Sendable {
 
     // Rust's `DsClient::read` treats a successful empty body like an empty JSON array.
     if response.data.allSatisfy({ $0 == 0x20 || $0 == 0x09 || $0 == 0x0A || $0 == 0x0D }) {
-      return emptyPollResult(nextOffset: nextOffset, preserving: cursor)
+      return PollAnswer(
+        result: emptyPollResult(nextOffset: nextOffset, preserving: cursor), upToDate: upToDate)
     }
     let batch: ChangeBatch
     do {
@@ -999,18 +1087,21 @@ public struct ShapeStreamReader: Sendable {
         observed: min(entries, responseDecodingLimits.maximumChangeEventsPerStreamBatch + 1))
     }
     guard !batch.isEmpty else {
-      return emptyPollResult(nextOffset: nextOffset, preserving: cursor)
+      return PollAnswer(
+        result: emptyPollResult(nextOffset: nextOffset, preserving: cursor), upToDate: upToDate)
     }
     guard let nextOffset, !nextOffset.isEmpty else {
       throw StreamError.missingNextOffset(path: streamURL.path)
     }
     let lsn = batch.envelopes.reversed().compactMap { $0.headers.lsn }.first ?? cursor.lsn
-    return PollResult(
-      batch: batch, cursor: StreamCursor(offset: nextOffset, lsn: lsn), mode: .longPoll,
-      serverSentAt: headers.value(forHTTPHeaderField: LiveDelivery.serverTimeHeader).flatMap {
-        Int64($0)
-      },
-      receivedAt: receivedAt)
+    return PollAnswer(
+      result: PollResult(
+        batch: batch, cursor: StreamCursor(offset: nextOffset, lsn: lsn), mode: .longPoll,
+        serverSentAt: headers.value(forHTTPHeaderField: LiveDelivery.serverTimeHeader).flatMap {
+          Int64($0)
+        },
+        receivedAt: receivedAt),
+      upToDate: upToDate)
   }
 
   private func emptyPollResult(nextOffset: String?, preserving cursor: StreamCursor) -> PollResult?

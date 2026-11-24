@@ -32,25 +32,33 @@ private struct ResumeIssue: Equatable, Sendable {
 /// shape and otherwise parks, cancellably, until the test scripts one.
 private actor ResumeFeedTransport: HTTPTransport {
   enum StreamReply: Sendable {
-    case batch(String, next: String)
+    /// A batch; `upToDate` marks it as ending at the stream's head (`stream-up-to-date`, or
+    /// `upToDate` on its SSE control).
+    case batch(String, next: String, upToDate: Bool = false)
     /// A `204` with no next offset: the long-poll window elapsed at the tail.
     case idle
+    /// The stream has nothing after the read's offset. A read without `live` and an SSE read are
+    /// told so at once; a long-poll is not, and waits out its window, so it never takes this.
+    case atHead
     case status(Int)
   }
 
   private(set) var requests: [URLRequest] = []
   private var feedShapes: [String]
+  private var feedRefusals: [(status: Int, retryAfter: String?)]
   private var queryBodies: [String]
   private var streams: [String: [StreamReply]] = [:]
   private var parked: [UUID: CheckedContinuation<Void, Never>] = [:]
 
   init(
     feedShapes: [String] = ["shape-1"],
+    feedRefusals: [(status: Int, retryAfter: String?)] = [],
     queryBodies: [String] = [
       #"{"rows":[{"id":1,"title":"One"},{"id":3,"title":"Three"}],"lsn":"0/10"}"#
     ]
   ) {
     self.feedShapes = feedShapes
+    self.feedRefusals = feedRefusals
     self.queryBodies = queryBodies
   }
 
@@ -78,6 +86,12 @@ private actor ResumeFeedTransport: HTTPTransport {
     let path = request.url?.path ?? ""
     switch (request.httpMethod ?? "", path) {
     case ("POST", "/v1/subset-feeds"):
+      if !feedRefusals.isEmpty {
+        let refusal = feedRefusals.removeFirst()
+        return reply(
+          "", to: request, status: refusal.status,
+          headers: refusal.retryAfter.map { ["Retry-After": $0] } ?? [:])
+      }
       let shape = feedShapes.count > 1 ? feedShapes.removeFirst() : feedShapes[0]
       return reply(
         #"{"shapeId":"\#(shape)","table":"public.issues","streamPath":"/streams/\#(shape)","streamUrl":"https://streams.test/streams/\#(shape)"}"#,
@@ -89,12 +103,30 @@ private actor ResumeFeedTransport: HTTPTransport {
       return reply(body, to: request)
     case ("GET", _) where path.hasPrefix("/streams/"):
       let shape = String(path.dropFirst("/streams/".count))
-      while streams[shape, default: []].isEmpty { try await park() }
+      let query = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems
+      let longPoll = query?.contains { $0.name == "live" } == true
+      while true {
+        if let next = streams[shape]?.first {
+          if case .atHead = next, longPoll {
+            // Held for the poll window, which no test sits through.
+          } else {
+            break
+          }
+        }
+        try await park()
+      }
       switch streams[shape, default: []].removeFirst() {
-      case .batch(let body, let next):
-        return reply(body, to: request, headers: ["stream-next-offset": next])
+      case .batch(let body, let next, let upToDate):
+        var headers = ["stream-next-offset": next]
+        if upToDate { headers["stream-up-to-date"] = "true" }
+        return reply(body, to: request, headers: headers)
       case .idle:
         return reply("", to: request, status: 204)
+      case .atHead:
+        let offset = query?.first { $0.name == "offset" }?.value ?? ""
+        return reply(
+          "[]", to: request,
+          headers: ["stream-next-offset": offset, "stream-up-to-date": "true"])
       case .status(let status):
         return reply("", to: request, status: status)
       }
@@ -131,24 +163,39 @@ private actor ResumeFeedTransport: HTTPTransport {
         url: request.url!, statusCode: 200, httpVersion: nil,
         headerFields: ["Content-Type": "text/event-stream"])!)
     switch next {
-    case .batch(let body, let nextOffset):
+    case .batch(let body, let nextOffset, let upToDate):
+      let flag = upToDate ? #","upToDate":true"# : ""
       try await onBytes(Data("event: data\ndata: \(body)\n\n".utf8))
       try await onBytes(
-        Data("event: control\ndata: {\"streamNextOffset\":\"\(nextOffset)\"}\n\n".utf8))
+        Data("event: control\ndata: {\"streamNextOffset\":\"\(nextOffset)\"\(flag)}\n\n".utf8))
     case .idle:
       try await onBytes(
         Data("event: control\ndata: {\"streamNextOffset\":\"\(offset)\"}\n\n".utf8))
+      while true { try await park() }
+    case .atHead:
+      try await onBytes(
+        Data(
+          "event: control\ndata: {\"streamNextOffset\":\"\(offset)\",\"upToDate\":true}\n\n"
+            .utf8))
       while true { try await park() }
     case .status:
       return
     }
   }
 
-  /// The `live` mode of every stream read of `shape`, in order.
+  /// The `live` mode of every stream read of `shape` that named one, in order.
   func liveModes(_ shape: String) -> [String] {
-    requests.filter { $0.httpMethod == "GET" && $0.url?.path == "/streams/\(shape)" }.compactMap {
-      URLComponents(url: $0.url!, resolvingAgainstBaseURL: false)?.queryItems?
-        .first { $0.name == "live" }?.value
+    reads(shape).compactMap(\.live)
+  }
+
+  /// Every stream read of `shape`, in order: its `offset`, and its `live` mode or nil for a
+  /// catch-up read.
+  func reads(_ shape: String) -> [(offset: String?, live: String?)] {
+    requests.filter { $0.httpMethod == "GET" && $0.url?.path == "/streams/\(shape)" }.map {
+      let query = URLComponents(url: $0.url!, resolvingAgainstBaseURL: false)?.queryItems
+      return (
+        query?.first { $0.name == "offset" }?.value, query?.first { $0.name == "live" }?.value
+      )
     }
   }
 
@@ -182,6 +229,25 @@ private actor ResumeFeedTransport: HTTPTransport {
   }
 }
 
+private actor ResumeRetryClock: ShapeSubscriptionClock {
+  private let holdsSleeps: Bool
+  private(set) var sleeps: [Duration] = []
+  private(set) var cancelledSleeps = 0
+
+  init(holdsSleeps: Bool = false) { self.holdsSleeps = holdsSleeps }
+
+  func sleep(for duration: Duration) async throws {
+    sleeps.append(duration)
+    guard holdsSleeps else { return }
+    do {
+      try await Task.sleep(for: .seconds(3_600))
+    } catch is CancellationError {
+      cancelledSleeps += 1
+      throw CancellationError()
+    }
+  }
+}
+
 private let resumeIssues = CollectionDefinition<ResumeIssue, Int64>(
   id: CollectionID(rawValue: "issues"), key: \.id)
 private let resumeScope = CollectionScope(principal: "u", authorization: "a", generation: "g")
@@ -193,7 +259,9 @@ private let openIdentity = openIssues.identity(
 
 private func makeSource(
   _ transport: ResumeFeedTransport, keyForRow: (@Sendable (ResumeIssue) throws -> Int64)? = nil,
-  liveReadMode: LiveReadMode = .longPoll
+  liveReadMode: LiveReadMode = .longPoll,
+  retryPolicy: ShapeSubscriptionRetryPolicy = .init(maxRetries: 0),
+  clock: any ShapeSubscriptionClock = ContinuousShapeSubscriptionClock()
 ) -> CircuitsSubsetSource<ResumeIssue, Int64> {
   CircuitsSubsetSource<ResumeIssue, Int64>(
     client: ElectricCircuitsClient(
@@ -202,7 +270,7 @@ private func makeSource(
     transport: transport,
     table: "public.issues",
     columns: ["id", "title"],
-    retryPolicy: ShapeSubscriptionRetryPolicy(maxRetries: 0),
+    retryPolicy: retryPolicy, clock: clock,
     decodeRow: ResumeIssue.init(row:),
     decodeKey: { key in
       guard let id = Int64(key) else { throw CircuitsSubsetSourceError.invalidLiveKey(key) }
@@ -218,7 +286,7 @@ private typealias ResumeCoordinator = CollectionCoordinator<
 >
 
 /// A fresh coordinator and source over a surviving store, in the same generation: a re-acquire
-/// within one launch, the case resume serves (a later launch's generation snapshots).
+/// within one launch. `RelaunchResumeTests` covers a later launch's generation.
 private func relaunch(
   _ transport: ResumeFeedTransport, store: InMemoryCollectionStore<ResumeIssue, Int64>,
   liveReadMode: LiveReadMode = .longPoll
@@ -254,6 +322,139 @@ private let shapeTwo = "36:https://streams.test/streams/shape-2"
 
 @Suite("Native Circuits subset source resume")
 struct CircuitsSubsetSourceResumeTests {
+  @Test func aFeedCreate503WaitsForRetryAfterAndRetries() async throws {
+    let transport = ResumeFeedTransport(feedRefusals: [(503, "2")])
+    let clock = ResumeRetryClock()
+    let source = CircuitsSubsetSource<ResumeIssue, Int64>(
+      client: ElectricCircuitsClient(
+        baseURL: URL(string: "https://engine.test")!, transport: transport),
+      transport: transport, table: "public.issues", retryPolicy: .init(
+        maxRetries: 1, baseDelay: .milliseconds(250), maximumDelay: .seconds(30), jitterRatio: 0),
+      clock: clock, decodeRow: ResumeIssue.init(row:), decodeKey: { key in
+        guard let id = Int64(key) else { throw CircuitsSubsetSourceError.invalidLiveKey(key) }
+        return id
+      })
+    let identity = openIssues.identity(for: resumeIssues, scope: resumeScope)
+    let session = try await source.materialize(
+      openIssues, identity: identity, materializationID: CollectionMaterializationID(rawValue: "retry"))
+
+    #expect(await transport.count("POST", "/v1/subset-feeds") == 2)
+    #expect(await clock.sleeps == [.seconds(2)])
+    try await session.stop()
+  }
+
+  @Test(arguments: [500, 429], [0, 2])
+  func aFeedCreateRefusalIsRethrownAfterTheRetryBudget(status: Int, maxRetries: Int) async throws {
+    let refusals: [(status: Int, retryAfter: String?)] =
+      Array(repeating: (status, "2"), count: maxRetries) + [(status, "41")]
+    let transport = ResumeFeedTransport(feedRefusals: refusals)
+    let clock = ResumeRetryClock()
+    let source = makeSource(
+      transport, retryPolicy: .init(
+        maxRetries: maxRetries, baseDelay: .milliseconds(250), maximumDelay: .seconds(30),
+        jitterRatio: 0), clock: clock)
+
+    // Preserve the final server refusal, including Retry-After beyond the policy's sleep cap.
+    await #expect(throws: ClientError.retryableHTTP(status: status, retryAfter: .seconds(41))) {
+      _ = try await source.materialize(
+        openIssues, identity: openIdentity,
+        materializationID: CollectionMaterializationID(rawValue: "exhausted"))
+    }
+
+    #expect(await transport.count("POST", "/v1/subset-feeds") == maxRetries + 1)
+    #expect(await clock.sleeps == Array(repeating: .seconds(2), count: maxRetries))
+    #expect(await transport.count("HEAD", "/streams/shape-1") == 0)
+    #expect(await transport.count("POST", "/v1/subsets/query") == 0)
+  }
+
+  @Test func cancellingAFeedCreateDuringBackoffEndsTheWait() async throws {
+    let transport = ResumeFeedTransport(feedRefusals: [(503, "2")])
+    let clock = ResumeRetryClock(holdsSleeps: true)
+    let source = makeSource(transport, retryPolicy: .init(maxRetries: 1), clock: clock)
+    let attempt = Task {
+      try await source.materialize(
+        openIssues, identity: openIdentity,
+        materializationID: CollectionMaterializationID(rawValue: "cancelled"))
+    }
+    defer { attempt.cancel() }
+    try #require(await eventually { await clock.sleeps == [.seconds(2)] })
+
+    attempt.cancel()
+
+    await #expect(throws: CancellationError.self) { _ = try await attempt.value }
+    #expect(await clock.cancelledSleeps == 1)
+    #expect(await transport.count("POST", "/v1/subset-feeds") == 1)
+    #expect(await transport.count("POST", "/v1/subsets/query") == 0)
+    // The refused create minted no claim; cancellation neither retries it nor releases a claim.
+    #expect(await transport.count("DELETE", "/v1/shapes/shape-1") == 0)
+  }
+
+  @Test func aSnapshotAcquireCancelsAResumesFeedCreateBackoff() async throws {
+    let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
+    let stored = try await seedBySnapshot(ResumeFeedTransport(), store: store)
+    let transport = ResumeFeedTransport(feedRefusals: [(503, "2")])
+    let clock = ResumeRetryClock(holdsSleeps: true)
+    let coordinator = CollectionCoordinator(
+      definition: resumeIssues, scope: resumeScope,
+      source: makeSource(transport, retryPolicy: .init(maxRetries: 1), clock: clock), store: store)
+    let resumed = await coordinator.acquire(openIssues)
+    try #require(await eventually { await clock.sleeps == [.seconds(2)] })
+    #expect(await resumed.state() == .cached)
+    #expect(try await store.materialization(for: openIdentity) == stored)
+
+    let snapshot = await coordinator.acquire(openIssues, mode: .snapshot)
+
+    #expect(await eventually { await snapshot.state() == .live })
+    #expect(await resumed.state() == .live)
+    #expect(await clock.cancelledSleeps == 1)
+    #expect(await transport.count("POST", "/v1/subset-feeds") == 2)
+    #expect(await transport.count("HEAD", "/streams/shape-1") == 1)
+    #expect(await transport.count("POST", "/v1/subsets/query") == 1)
+    try await resumed.release()
+    try await snapshot.release()
+    // The cancelled resume created no claim; the replacement snapshot's landed claim is released.
+    #expect(await transport.count("DELETE", "/v1/shapes/shape-1") == 1)
+  }
+
+  @Test func aLiveEnvelopeWithoutLSNFallsBackToASnapshot() async throws {
+    let transport = ResumeFeedTransport(queryBodies: [
+      #"{"rows":[{"id":1,"title":"One"}],"lsn":"0/10"}"#,
+      #"{"rows":[{"id":1,"title":"Fresh"}],"lsn":"0/40"}"#,
+    ])
+    let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
+    _ = try await seedBySnapshot(transport, store: store)
+    await transport.script(
+      "shape-1",
+      [.batch(
+        #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"bad"},"headers":{"operation":"update"}}]"#,
+        next: "11", upToDate: true)])
+
+    let lease = await relaunch(transport, store: store).acquire(openIssues)
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await transport.count("POST", "/v1/subsets/query") == 2)
+    #expect(await store.rows() == [1: ResumeIssue(id: 1, title: "Fresh")])
+    try await lease.release()
+  }
+
+  @Test func aPositionedDeleteRemovesARowHeldOnlyByTheSnapshot() async throws {
+    let transport = ResumeFeedTransport(queryBodies: [
+      #"{"rows":[{"id":1,"title":"One"},{"id":2,"title":"Two"}],"lsn":"0/10"}"#
+    ])
+    let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
+    _ = try await seedBySnapshot(transport, store: store)
+    await transport.script(
+      "shape-1",
+      [.batch(
+        #"[{"type":"public.issues","key":"2","headers":{"operation":"delete","lsn":"0/20"}}]"#,
+        next: "11", upToDate: true)])
+
+    let lease = await relaunch(transport, store: store).acquire(openIssues)
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await store.rows() == [1: ResumeIssue(id: 1, title: "One")])
+    #expect(await transport.count("POST", "/v1/subsets/query") == 1)
+    try await lease.release()
+  }
+
   @Test func resumingTheSameFeedTailsFromTheStoredCursorWithoutASnapshot() async throws {
     let transport = ResumeFeedTransport()
     let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
@@ -271,15 +472,13 @@ struct CircuitsSubsetSourceResumeTests {
           next: "11"),
         .batch(
           #"[{"type":"public.issues","key":"3","headers":{"operation":"delete","lsn":"0/30"}}]"#,
-          next: "12"),
+          next: "12", upToDate: true),
       ])
     let lease = await relaunch(transport, store: store).acquire(openIssues)
 
     #expect(await eventually { await lease.state() == .live })
-    #expect(
-      await eventually {
-        try await store.materialization(for: openIdentity)?.cursor?.offset == "12"
-      })
+    // Live means read to the head: both batches are committed by then.
+    #expect(try await store.materialization(for: openIdentity)?.cursor?.offset == "12")
     #expect(
       await store.rows() == [
         1: ResumeIssue(id: 1, title: "One, edited"), 2: ResumeIssue(id: 2, title: "Two"),
@@ -323,22 +522,116 @@ struct CircuitsSubsetSourceResumeTests {
     try await lease.release()
   }
 
-  @Test func resumedDemandStaysCachedUntilAnIdlePollProvesTheTailIsCurrent() async throws {
+  /// A long-poll at the stream's head is held for the poll window (about 30 s), so a resumed
+  /// long-poll tail does not start with one: its first read has no `live` parameter, which the
+  /// stream answers at once. The demand stays cached until that answer, goes live on it without
+  /// a change or a snapshot, and the tail then long-polls from the same offset.
+  @Test func aResumedLongPollTailAsksForTheHeadFirstAndGoesLiveOnTheAnswer() async throws {
     let transport = ResumeFeedTransport()
     let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
     let seeded = try await seedBySnapshot(transport, store: store)
 
     let lease = await relaunch(transport, store: store).acquire(openIssues)
     #expect(await eventually { await transport.streamOffsets("shape-1").count == 2 })
-    // The resumed read is parked at the tail: its rows are local, but nothing proves the
-    // stored cursor is still current yet.
+    // The resumed read is unanswered: its rows are local, but nothing says yet that the stored
+    // cursor is still the stream's head.
     #expect(await lease.state() == .cached)
 
-    await transport.script("shape-1", [.idle])
+    await transport.script("shape-1", [.atHead])
     #expect(await eventually { await lease.state() == .live })
+    #expect(await eventually { await transport.reads("shape-1").count == 3 })
+    let resumed = await transport.reads("shape-1").dropFirst()
+    #expect(resumed.map(\.live) == [nil, "long-poll"])
+    #expect(resumed.map(\.offset) == ["10", "10"])
     #expect(try await store.materialization(for: openIdentity) == seeded)
     #expect(await transport.count("POST", "/v1/subsets/query") == 1)
     #expect(await transport.count("POST", "/v1/subset-feeds") == 2)
+    #expect(await transport.count("HEAD", "/streams/shape-1") == 1)
+    try await lease.release()
+  }
+
+  /// A committed batch does not make a resumed demand live: the stream may hold more. The demand
+  /// stays cached, with the first batch in the store, until the batch the stream marks as ending
+  /// at its head is committed too.
+  @Test(arguments: [LiveReadMode.longPoll, .sse])
+  func aResumedTailStaysCachedUntilItHasReadToTheHead(mode: LiveReadMode) async throws {
+    let transport = ResumeFeedTransport()
+    let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
+    _ = try await seedBySnapshot(transport, store: store)
+    await transport.script(
+      "shape-1",
+      [
+        .batch(
+          #"[{"type":"public.issues","key":"2","value":{"id":2,"title":"Two"},"headers":{"operation":"insert","lsn":"0/20"}}]"#,
+          next: "11")
+      ])
+
+    let lease = await relaunch(transport, store: store, liveReadMode: mode).acquire(openIssues)
+    // The first batch is committed and the tail has asked for what follows it.
+    #expect(await eventually { await transport.streamOffsets("shape-1").last == "11" })
+    #expect(try await store.materialization(for: openIdentity)?.cursor?.offset == "11")
+    #expect(await store.rows()[2] == ResumeIssue(id: 2, title: "Two"))
+    #expect(await lease.state() == .cached)
+
+    await transport.script(
+      "shape-1",
+      [
+        .batch(
+          #"[{"type":"public.issues","key":"3","headers":{"operation":"delete","lsn":"0/30"}}]"#,
+          next: "12", upToDate: true)
+      ])
+    #expect(await eventually { await lease.state() == .live })
+    #expect(try await store.materialization(for: openIdentity)?.cursor?.offset == "12")
+    #expect(await transport.count("POST", "/v1/subsets/query") == 1)
+    if mode == .longPoll {
+      // Reads up to the head never wait; the tail long-polls only once it is there.
+      #expect(await eventually { await transport.reads("shape-1").count == 4 })
+      #expect(
+        await transport.reads("shape-1").dropFirst().map(\.live) == [nil, nil, "long-poll"])
+    }
+    try await lease.release()
+  }
+
+  /// The caller can ask for the snapshot a resumable feed would not otherwise take: the scope
+  /// was marked stale, or its authority was read again. The refresh re-joins the feed, reads its
+  /// frontier and queries the page, whether the caller names snapshot or uses plain refresh.
+  /// An explicit resume refresh then continues from the new snapshot's cursor.
+  @Test(arguments: [false, true])
+  func aSnapshotRefreshQueriesThePageAgainOnAFeedItCouldResume(explicitMode: Bool) async throws {
+    let transport = ResumeFeedTransport(queryBodies: [
+      #"{"rows":[{"id":1,"title":"One"},{"id":3,"title":"Three"}],"lsn":"0/10"}"#,
+      #"{"rows":[{"id":1,"title":"Fresh"}],"lsn":"0/40"}"#,
+    ])
+    let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
+    let seeded = try await seedBySnapshot(transport, store: store)
+    await transport.script("shape-1", [.atHead])
+    let lease = await relaunch(transport, store: store).acquire(openIssues)
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await transport.count("POST", "/v1/subsets/query") == 1)
+
+    if explicitMode {
+      await lease.refresh(.snapshot)
+    } else {
+      await lease.refresh()
+    }
+
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await transport.count("POST", "/v1/subsets/query") == 2)
+    #expect(await transport.count("HEAD", "/streams/shape-1") == 2)
+    #expect(await transport.count("POST", "/v1/subset-feeds") == 3)
+    #expect(await store.rows() == [1: ResumeIssue(id: 1, title: "Fresh")])
+    #expect(await store.rowClaims(for: seeded.id) == [1])
+    let refreshed = try #require(try await store.materialization(for: openIdentity))
+    #expect(refreshed.id == seeded.id)
+    #expect(
+      refreshed.snapshotFence.rawValue == "9:subset-v2|\(shapeOne)|2:10|4:0/40|0:|0:")
+
+    // The snapshot is taken; the next refresh may continue from its cursor.
+    await transport.script("shape-1", [.atHead])
+    await lease.refresh(.resume)
+    #expect(await eventually { await lease.state() == .live })
+    #expect(await transport.count("POST", "/v1/subsets/query") == 2)
+    #expect(await transport.count("POST", "/v1/subset-feeds") == 4)
     try await lease.release()
   }
 
@@ -432,29 +725,27 @@ struct CircuitsSubsetSourceResumeTests {
 
   /// A failure that says nothing about the stored cursor, an exhausted transient retry or an
   /// authentication refusal the app clears by refreshing its token, fails the resumed attempt
-  /// without a snapshot and leaves the cursor resumable: the next acquire, on the same source
-  /// instance, re-joins the feed and reads on from the stored offset.
+  /// without a snapshot and leaves the cursor resumable: the retry, on the same source instance,
+  /// re-joins the feed and reads on from the stored offset.
   @Test(arguments: [503, 401])
-  func aFailureThatSaysNothingAboutTheCursorResumesAgainOnTheNextAcquire(status: Int) async throws {
+  func aFailureThatSaysNothingAboutTheCursorResumesAgainOnRetry(status: Int) async throws {
     let transport = ResumeFeedTransport()
     let store = InMemoryCollectionStore<ResumeIssue, Int64>(key: \.id)
     let seeded = try await seedBySnapshot(transport, store: store)
     await transport.script("shape-1", [.status(status)])
 
-    let coordinator = relaunch(transport, store: store)
-    let lease = await coordinator.acquire(openIssues)
+    let lease = await relaunch(transport, store: store).acquire(openIssues)
     #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
     #expect(await transport.count("POST", "/v1/subsets/query") == 1)
-    try await lease.release()
 
     await transport.script("shape-1", [.idle])
-    let again = await coordinator.acquire(openIssues)
-    #expect(await eventually { await again.state() == .live })
+    await lease.refresh(.resume)
+    #expect(await eventually { await lease.state() == .live })
     #expect(await transport.count("POST", "/v1/subsets/query") == 1)
     #expect(await transport.count("POST", "/v1/subset-feeds") == 3)
     #expect(await transport.streamOffsets("shape-1").suffix(2) == ["10", "10"])
     #expect(try await store.materialization(for: openIdentity) == seeded)
-    try await again.release()
+    try await lease.release()
   }
 
   @Test func aVersionOneFenceSnapshotsAndIsRewrittenAsVersionTwo() async throws {
@@ -568,7 +859,7 @@ struct CircuitsSubsetSourceResumeTests {
       [
         .batch(
           #"[{"type":"public.issues","key":"1","value":{"id":1,"title":"Already in the snapshot"},"headers":{"operation":"update","lsn":"0/F0","txid":"104"}},{"type":"public.issues","key":"2","value":{"id":2,"title":"Committed during snapshot"},"headers":{"operation":"insert","lsn":"0/FF","txid":"105"}}]"#,
-          next: "11")
+          next: "11", upToDate: true)
       ])
     let lease = await relaunch(transport, store: store).acquire(openIssues)
 
