@@ -496,7 +496,7 @@ struct CollectionCoordinatorResumeTests {
 
     // A resume the source could not set up says nothing about the stored cursor, so the retry
     // asks again rather than re-querying the page.
-    await lease.refresh()
+    await lease.refresh(.resume)
     #expect(await eventually { await source.resumes == 2 })
     #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
     #expect(await source.materializations == 0)
@@ -535,7 +535,7 @@ struct CollectionCoordinatorResumeTests {
     #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
     #expect(await source.materializations == 0)
 
-    await lease.refresh()
+    await lease.refresh(.resume)
     #expect(await eventually { await source.resumes == 2 })
     #expect(await source.materializations == 0)
     #expect(await store.rowClaims(for: materializationA) == [1, 2])
@@ -661,7 +661,7 @@ struct CollectionCoordinatorResumeTests {
 /// cursor (`.resume`) or must be read again (`.snapshot`).
 @Suite("Collection coordinator load mode")
 struct CollectionCoordinatorLoadModeTests {
-  @Test func aSnapshotRefreshReadsTheSourceAgainWhereAPlainRefreshResumes() async throws {
+  @Test func aRefreshSnapshotsACopyAnAcquireResumes() async throws {
     let store = try await seededStore()
     let source = ResumingSource(snapshotRows: [9])
     let coordinator = CollectionCoordinator(
@@ -670,20 +670,48 @@ struct CollectionCoordinatorLoadModeTests {
     #expect(await eventually { await source.resumes == 1 })
     await source.signalCaughtUp()
     #expect(await eventually { await lease.state() == .live })
-
-    // A plain refresh, and one that says resume is allowed, continue the stored cursor.
-    await lease.refresh()
-    await lease.refresh(.resume)
-    #expect(await eventually { await source.resumes == 3 })
     #expect(await source.materializations == 0)
     #expect(await store.rowClaims(for: materializationA) == [1, 2])
 
-    await lease.refresh(.snapshot)
+    // A plain refresh re-reads even though the stored copy could resume.
+    await lease.refresh()
     #expect(await eventually { await source.materializations == 1 })
     #expect(await eventually { await lease.state() == .live })
-    #expect(await source.resumes == 3)
+    #expect(await source.resumes == 1)
+    #expect(await source.stops == 1)
     #expect(await store.rowClaims(for: materializationA) == [9])
     #expect(try await store.materialization(for: identityA)?.snapshotFence.rawValue == "snapshot-1")
+    try await lease.release()
+
+    // The next plain acquire continues the copy the refresh stored.
+    let acquired = await coordinator.acquire(demandA)
+    #expect(await eventually { await source.resumes == 2 })
+    #expect(await source.materializations == 1)
+    #expect(await store.rowClaims(for: materializationA) == [9])
+    try await acquired.release()
+  }
+
+  @Test func anExplicitResumeRefreshContinuesTheStoredCopy() async throws {
+    let store = try await seededStore()
+    let stored = try await store.materialization(for: identityA)
+    let source = ResumingSource(snapshotRows: [9])
+    let coordinator = CollectionCoordinator(
+      definition: rowDefinition, scope: resumeScope, source: source, store: store)
+    let lease = await coordinator.acquire(demandA)
+    #expect(await eventually { await source.resumes == 1 })
+    await source.signalCaughtUp()
+    #expect(await eventually { await lease.state() == .live })
+
+    await lease.refresh(.resume)
+
+    #expect(await eventually { await source.resumes == 2 })
+    #expect(await source.materializations == 0)
+    #expect(await source.stops == 1)
+    #expect(await store.rowClaims(for: materializationA) == [1, 2])
+    #expect(try await store.materialization(for: identityA) == stored)
+    #expect(await lease.state() == .cached)
+    await source.signalCaughtUp()
+    #expect(await eventually { await lease.state() == .live })
     try await lease.release()
   }
 
@@ -719,18 +747,18 @@ struct CollectionCoordinatorLoadModeTests {
     let lease = await coordinator.acquire(demandA)
     #expect(await eventually { await source.resumes == 1 })
 
-    await lease.refresh(.snapshot)
+    await lease.refresh()
     #expect(await eventually { await lease.state() == .failed(.sourceUnavailable) })
     #expect(await source.materializations == 1)
     #expect(await store.rowClaims(for: materializationA) == [1, 2])
 
-    await lease.refresh()
+    await lease.refresh(.resume)
     #expect(await eventually { await lease.state() == .live })
     #expect(await source.materializations == 2)
     #expect(await source.resumes == 1)
     #expect(await store.rowClaims(for: materializationA) == [9])
 
-    await lease.refresh()
+    await lease.refresh(.resume)
     #expect(await eventually { await source.resumes == 2 })
     #expect(await source.materializations == 2)
     try await lease.release()

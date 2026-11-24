@@ -5,16 +5,17 @@ All notable changes to `ElectricCircuitsSwift` are documented here. Release impa
 
 ## Unreleased (0.16.0)
 
-- **Breaking public behavior, with additive public API.** Changing the refresh default and the
-  resumed-session readiness obligation falls under the major-change category in
+- **Breaking public behavior, with additive public API.** The resumed-session readiness
+  obligation changes public lifecycle behavior under the major-change category in
   `Policies/SEMVER.md`. The next pre-1.0 release is 0.16.0; this is not a patch or a purely additive
   change. Callers and adapter authors must review the migrations below.
 - Add `CollectionLoadMode` (`.resume`, `.snapshot`) to `CollectionCoordinator.acquire(_:mode:)`
-  and `CollectionLease.refresh(_:)`. This reverses the Unreleased 0.15.2 fix from PR #23 that made
-  `refresh()` always re-read. A plain `refresh()` now resumes; callers that need a re-read must
-  call `refresh(.snapshot)`. This follows the load-mode rule (`#g-load-mode`) of the accepted
-  `proposal-ios-sync-load-phases`. A plain acquire also defaults to resume. A requested snapshot
-  is owed until one commits, whatever mode a retry names.
+  and `CollectionLease.refresh(_:)`. A plain `refresh()` keeps re-reading the source, preserving
+  the Unreleased 0.15.2 fix from PR #23; `refresh(.snapshot)` explicitly requests the same behavior.
+  The new `refresh(.resume)` continues the stored copy from its cursor when the source can. A
+  plain acquire still defaults to resume. These defaults follow the load-mode rule (`#g-load-mode`)
+  of the accepted `proposal-ios-sync-load-phases`. A requested snapshot is owed until one commits,
+  whatever mode a retry names.
 - `acquire(_:)` now resumes copies stored by an earlier generation, found by cache key. Add the
   defaulted `CollectionStore.rebindMaterialization(_:to:)` requirement: a provider may bind that
   copy to the current demand without changing rows, claims, cursor, fence, source version or stale

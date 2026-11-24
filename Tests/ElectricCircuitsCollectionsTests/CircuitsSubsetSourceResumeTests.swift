@@ -594,8 +594,10 @@ struct CircuitsSubsetSourceResumeTests {
 
   /// The caller can ask for the snapshot a resumable feed would not otherwise take: the scope
   /// was marked stale, or its authority was read again. The refresh re-joins the feed, reads its
-  /// frontier and queries the page; a plain refresh after it resumes again.
-  @Test func aSnapshotRefreshQueriesThePageAgainOnAFeedItCouldResume() async throws {
+  /// frontier and queries the page, whether the caller names snapshot or uses plain refresh.
+  /// An explicit resume refresh then continues from the new snapshot's cursor.
+  @Test(arguments: [false, true])
+  func aSnapshotRefreshQueriesThePageAgainOnAFeedItCouldResume(explicitMode: Bool) async throws {
     let transport = ResumeFeedTransport(queryBodies: [
       #"{"rows":[{"id":1,"title":"One"},{"id":3,"title":"Three"}],"lsn":"0/10"}"#,
       #"{"rows":[{"id":1,"title":"Fresh"}],"lsn":"0/40"}"#,
@@ -607,7 +609,11 @@ struct CircuitsSubsetSourceResumeTests {
     #expect(await eventually { await lease.state() == .live })
     #expect(await transport.count("POST", "/v1/subsets/query") == 1)
 
-    await lease.refresh(.snapshot)
+    if explicitMode {
+      await lease.refresh(.snapshot)
+    } else {
+      await lease.refresh()
+    }
 
     #expect(await eventually { await lease.state() == .live })
     #expect(await transport.count("POST", "/v1/subsets/query") == 2)

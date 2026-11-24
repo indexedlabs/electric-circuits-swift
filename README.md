@@ -108,9 +108,10 @@ there does not. Adapter authors must call it or their resumed demands remain `.c
 deletes release claims through the ordinary store `apply`. A session whose feed refuses the stored
 cursor throws `CollectionResumeInvalidated`: until the tail goes live, the same attempt snapshots
 instead, so no lease sees a failure. A transient failure fails the attempt, and the next acquire
-resumes again. A plain `refresh()` and `refresh(.resume)` also resume; use `refresh(.snapshot)` or
-`acquire(_:mode: .snapshot)` to re-read the source. A requested snapshot is owed until one commits,
-whatever mode a retry names. Stale revalidation always snapshots.
+resumes again. A plain `refresh()` always re-reads the source, as `refresh(.snapshot)` does;
+`refresh(.resume)` explicitly continues the stored copy from its cursor when the source can.
+`acquire(_:mode: .snapshot)` also requests a snapshot. A requested snapshot is owed until one
+commits, whatever mode a retry names. Stale revalidation always snapshots.
 
 `CircuitsSubsetSource` fences each snapshot with the feed's stream URL and the snapshot's
 transaction visibility (`subset-v2`), and resumes by re-joining the identical feed request under

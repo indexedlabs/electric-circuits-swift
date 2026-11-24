@@ -91,8 +91,8 @@ struct EngineLiveEnvelopeContractTests {
     #expect(await engine.count(.release) == 1)
     let settled = await engine.requests.count
 
-    // The default permits resume: the source's refused-batch record must force this snapshot.
-    await lease.refresh()
+    // Ask to resume: the source's refused-batch record must force this snapshot.
+    await lease.refresh(.resume)
 
     #expect(await contractEventually { await lease.state() == .live })
     #expect(await engine.count(.snapshotQuery) == 2)

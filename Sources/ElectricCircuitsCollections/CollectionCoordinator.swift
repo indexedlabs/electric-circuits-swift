@@ -24,12 +24,12 @@ public enum CollectionLoadState: Equatable, Sendable {
 public enum CollectionLoadMode: Equatable, Sendable {
   /// Continue the stored copy from its cursor when the source can
   /// (`CollectionSourceAdapter.resume`), and take a snapshot when it cannot. What
-  /// `CollectionCoordinator.acquire(_:)` and `CollectionLease.refresh()` do.
+  /// `CollectionCoordinator.acquire(_:)` and `CollectionLease.refresh(.resume)` do.
   case resume
   /// Take a new snapshot and replace the stored copy's rows with it, without asking the source
-  /// to resume. The demand owes that snapshot until one commits: an attempt that fails first is
-  /// followed by another snapshot, whatever mode asks for it. The debt ends with the demand's
-  /// last lease.
+  /// to resume, as a plain `CollectionLease.refresh()` does. The demand owes that snapshot until
+  /// one commits: an attempt that fails first is followed by another snapshot, whatever mode
+  /// asks for it. The debt ends with the demand's last lease.
   case snapshot
 }
 
@@ -68,9 +68,11 @@ public actor CollectionLease {
     return await stateAction(id)
   }
 
-  /// Replaces the demand's current attempt with a new one, as `refresh(.resume)` does.
+  /// Always re-reads the source by replacing the demand's current attempt with a new snapshot,
+  /// as `refresh(.snapshot)` does, for every lease that shares it. To continue from the stored
+  /// cursor instead, call `refresh(.resume)`.
   public func refresh() async {
-    await refresh(.resume)
+    await refresh(.snapshot)
   }
 
   /// Replaces the demand's current attempt with a new one, for every lease that shares it.
@@ -78,8 +80,8 @@ public actor CollectionLease {
   /// With `.resume` the new attempt continues the stored copy from its cursor when the source
   /// can and snapshots otherwise: the way to retry after a failure. With `.snapshot` it takes a
   /// new snapshot, which replaces the stored rows: the way to read the source again when the
-  /// stored rows are in doubt. A snapshot the demand still owes (`CollectionLoadMode.snapshot`)
-  /// is taken in either mode.
+  /// stored rows are in doubt, and the default for plain `refresh()`. A snapshot the demand
+  /// still owes (`CollectionLoadMode.snapshot`) is taken in either mode.
   public func refresh(_ mode: CollectionLoadMode) async {
     guard !released else { return }
     await refreshAction(id, mode)
@@ -709,7 +711,7 @@ public actor CollectionCoordinator<
   /// replaces the stored rows, as every acquire was before a source could resume. A lease that
   /// joins a demand another lease already holds shares that demand's attempt: `.snapshot`
   /// replaces an attempt that resumed, and leaves one that took its own snapshot, however long
-  /// ago, as it is. To read the source again regardless, call `refresh(.snapshot)` on the lease.
+  /// ago, as it is. To read the source again regardless, call `refresh()` on the lease.
   public func acquire(_ demand: CollectionDemand<Model>, mode: CollectionLoadMode)
     -> CollectionLease
   {
